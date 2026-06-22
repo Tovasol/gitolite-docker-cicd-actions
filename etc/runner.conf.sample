@@ -7,6 +7,10 @@ RUNNER_USER=cicd-runner
 RUNNER_BASE=/home/cicd-runner/runner          # queue/, runs/, cache/, envs/, slots/
 GIT_REPO_BASE=/home/git/repositories          # gitolite bare repos live here (<repo>.git)
 
+# user-local tool dir (sops, yq, age) — ABSOLUTE so the runner finds them under sudo
+# (sudo resets PATH to secure_path; the runner re-prepends this). No /usr/local, no root.
+LOCAL_BIN=/home/cicd-runner/.local/bin
+
 # --- secrets (sops + age) ---
 # The age private key, decrypted into ramfs by `unlock-ci` (cleared on reboot).
 SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt
@@ -23,25 +27,38 @@ DEFAULT_MEMORY=2g
 DEFAULT_PIDS=512
 DEFAULT_NETWORK=bridge                         # bridge | none
 
-# --- trust / caching ---
-# Space- or comma-separated branch globs allowed to WRITE the shared node_modules
-# result cache (the integrity-checked npm store is shared by all; see DESIGN §18).
-TRUSTED_BRANCHES="main release/*"
+# Per-container resource limits (--memory/--pids-limit) need cgroup v2 + systemd
+# under ROOTLESS docker. On OpenRC (no systemd) docker rootless CANNOT enforce them
+# (silently ignored). Set 0 so the runner omits those flags (avoids a false sense of
+# limits). cap-drop/no-new-privileges/network/timeout still apply. See DESIGN §29.
+RESOURCE_LIMITS=0                               # 0 = OpenRC rootless (no cgroups); 1 = systemd/rootful
+
+# --- dependency cache (ONE global, multi-ecosystem, content-addressed; DESIGN §32) ---
+# All package managers (npm/pnpm/yarn/bun/pip/poetry/uv/composer/go/cargo/ruby/nuget/
+# gradle/maven/deno/elixir) cache into the single $RUNNER_BASE/cache volume via a
+# static env block injected by the runner — automatic, no per-project wiring. The
+# prune-disk reaper age-evicts then size-caps it (the only formerly-unbounded vector).
+CACHE_MAX_AGE_DAYS=30          # delete cache entries untouched this long
+CACHE_MAX_GB=20                # then size-cap the whole cache (LRU eviction)
 
 # --- behavior ---
 CANCEL_IN_PROGRESS=0                           # 1 = a new push kills the running job; 0 = coalesce
 LOG_RETENTION_DAYS=30
 DELETE_SUPERSEDES=1                            # a branch-delete cancels/overrides a pending deploy
 
-# --- per-job retries + notification (DEFAULTS; each job may override in ci.yml) ---
-# A job may set `retries:`, `retry-delay:`, `notify:` (off|on-failure). Per-job
-# `retries` is CLAMPED to MAX_RETRIES (a typo/abuse like retries: 9999 can't pin
-# the box). A job that exhausts its retries fires NOTIFY_CMD (unless notify: off).
-# For teardown specifically, exhausting retries also KEEPS the preserve ref + env
-# state (no auto-retry; operator resolves via ci-teardown retry|abandon).
-DEFAULT_RETRIES=0             # retries after the first attempt when a job doesn't specify
-DEFAULT_RETRY_DELAY=15        # seconds between attempts
-MAX_RETRIES=5                 # hard cap on per-job retries
+# --- ephemeral-env reaper (archive-push: runner has no repo access, §31) ---
+# The git hook tears down on EVERY gitolite branch delete. reap-envs only catches the
+# rare env whose branch vanished WITHOUT a hook event; it can't check branch liveness
+# (no repo access), so it uses inactivity age.
+REPORT_STALE_DAYS=30                           # log envs idle this long as "verify + ci-teardown"
+AUTO_REAP_STALE_DAYS=0                          # 0 = report only; >0 = auto-teardown after N idle days
+
+# --- retries + notify are NOT runner concerns ---
+# They live in the ci/*.sh script via the mounted /cicd/lib.sh helpers
+# (retry, notify_success/error). The runner owns only the safety bounds
+# (timeout/memory/pids/network) + notify DELIVERY (below). See DESIGN §28.
+NOTIFY_BACKSTOP=1             # 1 = email on a job FAILURE that emitted no script notify
+                             #     (catches OOM/SIGKILL + scripts that forgot to notify)
 
 # --- docker context (rootless) ---
 # The CLI must target the rootless daemon. Set DOCKER_HOST for the cicd-runner user.

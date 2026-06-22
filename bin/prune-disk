@@ -16,6 +16,27 @@ docker container prune -f --filter until=1h >/dev/null 2>&1 || true
 find "$RUNNER_BASE/runs" -maxdepth 3 -type d -mtime "+${LOG_RETENTION_DAYS:-30}" \
   -name '20*' -exec rm -rf {} + 2>/dev/null || true
 
+# global dependency cache reaper (DESIGN §32): age-evict cache entries untouched for
+# CACHE_MAX_AGE_DAYS, then size-cap the whole /cache to CACHE_MAX_GB (delete oldest-
+# accessed files first). Content-addressed caches self-heal on the next miss.
+CACHE="$RUNNER_BASE/cache"
+if [ -d "$CACHE" ]; then
+  find "$CACHE" -type f -atime "+${CACHE_MAX_AGE_DAYS:-30}" -delete 2>/dev/null || true
+  find "$CACHE" -type d -empty -delete 2>/dev/null || true
+  cap=$(( ${CACHE_MAX_GB:-20} * 1024 * 1024 ))                 # KB
+  used="$(du -sk "$CACHE" 2>/dev/null | cut -f1)"; used="${used:-0}"
+  if [ "$used" -gt "$cap" ]; then
+    log "prune-disk: cache ${used}KB > cap ${cap}KB — evicting least-recently-used"
+    # delete oldest-accessed files until under cap
+    find "$CACHE" -type f -printf '%A@ %s %p\n' 2>/dev/null | sort -n | \
+    while read -r _ sz path; do
+      [ "$used" -le "$cap" ] && break
+      rm -f "$path" 2>/dev/null && used=$(( used - (sz + 1023) / 1024 ))
+    done
+    find "$CACHE" -type d -empty -delete 2>/dev/null || true
+  fi
+fi
+
 # emergency disk guard: if docker data dir > 90%, prune harder
 ddir="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)"; ddir="${ddir:-$HOME/.local/share/docker}"
 use="$(df --output=pcent "$ddir" 2>/dev/null | tail -1 | tr -dc '0-9')"

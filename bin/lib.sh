@@ -5,13 +5,23 @@
 
 # --- locate + load config -----------------------------------------------------
 cicd_load_config() {
+  # Search order: explicit CICD_CONF -> $CICD_BASE/etc (user-local, ABSOLUTE so it
+  # survives `sudo -u cicd-runner` where $HOME may still be git's) -> /etc (optional
+  # system-wide). No sudo / no /etc copy needed; the git hook is self-contained and
+  # never reads this.
   local c
-  for c in "${CICD_CONF:-}" /etc/cicd-runner/runner.conf \
-           "${RUNNER_BASE:-$HOME/runner}/etc/runner.conf"; do
+  for c in "${CICD_CONF:-}" "${CICD_BASE:-$HOME/runner}/etc/runner.conf" \
+           /etc/cicd-runner/runner.conf; do
     [ -n "$c" ] && [ -f "$c" ] && { # shellcheck disable=SC1090
-      . "$c"; CICD_CONF="$c"; return 0; }
+      . "$c"; CICD_CONF="$c"
+      # sudo resets PATH to secure_path, dropping ~/.local/bin where sops/yq live.
+      # Prepend the configured LOCAL_BIN so the runner finds them under sudo.
+      if [ -n "${LOCAL_BIN:-}" ]; then
+        case ":$PATH:" in *":$LOCAL_BIN:"*) ;; *) PATH="$LOCAL_BIN:$PATH"; export PATH ;; esac
+      fi
+      return 0; }
   done
-  echo "cicd-runner: no runner.conf found (set CICD_CONF or create /etc/cicd-runner/runner.conf)" >&2
+  echo "cicd-runner: no runner.conf found (looked in \$CICD_BASE/etc and /etc/cicd-runner)" >&2
   return 1
 }
 
@@ -96,15 +106,38 @@ yq_list() { yq -r "$2 // [] | join(\" \")" "$1" 2>/dev/null; }   # array -> spac
 yq_keys() { yq -r "$2 // {} | keys | .[]" "$1" 2>/dev/null; }
 
 # --- notify -------------------------------------------------------------------
-notify_failure() {
-  local group="$1" status="$2" logpath="$3" secenv="${4:-}"
-  log "FAILURE group=$group status=$status log=$logpath"
+# Deliver ONE notification host-side. level: info|success|error. The project's
+# decrypted secrets (secenv) let the notifier use repo-level SMTP creds; else host default.
+cicd_deliver() {  # cicd_deliver <level> <label> <message> <logpath> [secenv]
   [ -n "${NOTIFY_CMD:-}" ] || return 0
-  # Pass the project's decrypted secrets (dotenv) so the notifier can read repo-level
-  # SMTP creds (per-project notify). Falls back to the host default inside the notifier.
   # shellcheck disable=SC2086
-  CICD_NOTIFY_ENV="${secenv:-${CICD_NOTIFY_ENV:-/etc/cicd-runner/notify.env}}" \
-    $NOTIFY_CMD "$group" "$status" "$logpath" </dev/null >/dev/null 2>&1 || true
+  CICD_NOTIFY_ENV="${5:-${CICD_NOTIFY_ENV:-/etc/cicd-runner/notify.env}}" \
+    $NOTIFY_CMD "$2" "$1: $3" "$4" </dev/null >/dev/null 2>&1 || true
+}
+
+# Flush a job's outbox (script-emitted notify_* lines) after the container exits,
+# then apply the failure backstop (alert even if the script emitted nothing — e.g.
+# OOM/SIGKILL). Notifications are also copied into the run's output.log.
+cicd_flush_outbox() {  # cicd_flush_outbox <outboxfile> <rc> <logdir> <label> [secenv]
+  local box="$1" rc="$2" dir="$3" label="$4" secenv="${5:-}" had_terminal=0 line level msg
+  if [ -f "$box" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      level="$(printf '%s' "$line" | cut -f1)"; msg="$(printf '%s' "$line" | cut -f2-)"
+      echo "[notify:$level] $msg" >> "$dir/output.log"
+      case "$level" in success|error) had_terminal=1 ;; esac
+      cicd_deliver "$level" "$label" "$msg" "$dir/output.log" "$secenv"
+    done < "$box"
+  fi
+  if [ "$rc" -ne 0 ] && [ "$had_terminal" -eq 0 ] && [ "${NOTIFY_BACKSTOP:-1}" = "1" ]; then
+    cicd_deliver error "$label" "job failed (rc=$rc) with no script notification" "$dir/output.log" "$secenv"
+  fi
+}
+
+# Runner-originated failure alert (secrets-decrypt, teardown operator handoff).
+notify_failure() {  # notify_failure <label> <status> <logpath> [secenv]
+  log "FAILURE $1 $2 log=$3"
+  cicd_deliver error "$1" "$2" "$3" "${4:-}"
 }
 
 # --- global concurrency semaphore (flock on slot files) -----------------------

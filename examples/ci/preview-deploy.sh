@@ -3,14 +3,19 @@
 # Idempotent: safe to run on both `create` and every `push`.
 # Cloudflare Pages auto-creates a per-branch preview alias from --branch.
 set -eu
+. /cicd/lib.sh
+trap 'rc=$?; [ $rc -eq 0 ] && notify_success "preview up: ${CI_BRANCH} -> ${URL:-?}" \
+                          || notify_error "preview deploy FAILED (rc=$rc) ${CI_BRANCH}"' EXIT
 
 cd site/scaffold
-npm ci --prefer-offline
+step "install + build"
+retry -n 3 -d 10 -- npm ci --prefer-offline
 npm run build
 
 # deterministic per-branch alias from the slug the runner computed
 ALIAS="${CI_BRANCH_SLUG:-preview}"
-npx wrangler pages deploy dist --project-name=pipelineforge-site --branch="$ALIAS"
+step "deploy preview ($ALIAS)"
+retry -n 2 -d 15 -- npx wrangler pages deploy dist --project-name=pipelineforge-site --branch="$ALIAS"
 
 URL="https://${ALIAS}.pipelineforge-site.pages.dev"
 

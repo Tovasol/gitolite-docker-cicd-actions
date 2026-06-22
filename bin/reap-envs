@@ -1,42 +1,39 @@
 #!/usr/bin/env bash
-# reap-envs — cron (daily). Tear down ephemeral envs whose branch no longer exists
-# (a delete push was missed, or branch deleted server-side). DESIGN §14 GC.
+# reap-envs — cron (daily). The git hook tears down on EVERY gitolite branch delete
+# (archive-push, §31), so this only matters for the rare env whose branch vanished
+# WITHOUT a hook event (a ref deleted outside gitolite). The runner has NO repo access
+# now, so it can't check branch liveness — it uses inactivity age.
+# Default: REPORT only (never destroy a quiet-but-live preview). Opt in to auto-teardown
+# with AUTO_REAP_STALE_DAYS>0 in runner.conf.
 set -uo pipefail
 CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
 # shellcheck disable=SC1090
 . "$CICD_BASE/bin/lib.sh"; cicd_load_config
+ZERO=0000000000000000000000000000000000000000
 
 [ -d "$RUNNER_BASE/envs" ] || exit 0
+now="$(date -u +%s)"
+auto=$(( ${AUTO_REAP_STALE_DAYS:-0} * 86400 ))     # 0 = report only
+report=$(( ${REPORT_STALE_DAYS:-30} * 86400 ))
+
 find "$RUNNER_BASE/envs" -maxdepth 2 -mindepth 2 -type d 2>/dev/null | while read -r envdir; do
-  meta="$envdir/meta.json"; [ -f "$meta" ] || continue
-  repo="$(yq_str "$meta" '.repo')"; branch="$(yq_str "$meta" '.branch')"
-  bare="$GIT_REPO_BASE/$repo.git"
-  # still a live branch? leave it.
-  git --git-dir="$bare" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null && continue
-
-  # This is a MISSED-DELETE catcher (branch removed server-side, no hook event),
-  # NOT a retry mechanism. If a teardown already ran and FAILED, the operator owns
-  # it (notified) — do not auto-retry. Skip anything already marked failed.
-  [ -f "$envdir/teardown-failed" ] && continue
-
-  log "reap-envs: $repo/$branch is gone, no prior teardown — triggering teardown $envdir"
-  # write a delete target FIRST (cached teardown.cmd handles the zero oldrev), then run.
-  q="$RUNNER_BASE/queue/$repo/$branch"; mkdir -p "$q"
-  printf 'delete 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 reaper\n' > "$q/target.tmp"
-  mv -f "$q/target.tmp" "$q/target"
-  setsid "$CICD_BASE/bin/run-group.sh" "$repo" "$branch" </dev/null >>"$CICD_BASE/runner.log" 2>&1 &
+  rel="${envdir#"$RUNNER_BASE"/envs/}"; repo="${rel%/*}"
+  branch="$(cat "$envdir/branch" 2>/dev/null || echo '?')"
+  if [ -f "$envdir/teardown-failed" ]; then
+    log "reap-envs: $repo/$branch AWAITING OPERATOR (teardown-failed) — ci-teardown retry|abandon"
+    continue
+  fi
+  la="$(stat -c %Y "$envdir" 2>/dev/null || echo "$now")"   # last activity = env dir mtime
+  age=$(( now - la ))
+  if [ "$auto" -gt 0 ] && [ "$age" -gt "$auto" ]; then
+    log "reap-envs: AUTO teardown stale env $repo/$branch (idle ${age}s)"
+    q="$RUNNER_BASE/queue/$repo/$branch"; mkdir -p "$q"
+    printf 'delete %s %s reaper\n' "$ZERO" "$ZERO" > "$q/target.tmp"; mv -f "$q/target.tmp" "$q/target"
+    setsid "$CICD_BASE/bin/run-group.sh" "$repo" "$branch" </dev/null >>"$RUNNER_BASE/runner.log" 2>&1 &
+  elif [ "$age" -gt "$report" ]; then
+    log "reap-envs: STALE $repo/$branch idle ${age}s — if the branch is gone:  ci-teardown retry $repo $branch"
+  fi
 done
 
-# Sweep orphaned preservation refs: a refs/cicd/preserve/<slug> with no matching
-# env dir means teardown already succeeded (and ref-delete was missed) or the env
-# was removed out-of-band — either way the held objects can be released.
-find "$GIT_REPO_BASE" -type d -name '*.git' 2>/dev/null | while read -r bare; do
-  repo="${bare#"$GIT_REPO_BASE"/}"; repo="${repo%.git}"
-  git --git-dir="$bare" for-each-ref --format='%(refname)' refs/cicd/preserve/ 2>/dev/null \
-  | while read -r ref; do
-      slug="${ref#refs/cicd/preserve/}"
-      [ -d "$RUNNER_BASE/envs/$repo/$slug" ] && continue    # active env -> main loop handles it
-      git --git-dir="$bare" update-ref -d "$ref" 2>/dev/null || true
-      log "reap-envs: dropped orphan preserve ref $repo $ref"
-    done
-done
+# prune orphaned incoming tars (coalesce intermediates / abandoned transfers)
+find "$RUNNER_BASE/incoming" -type f \( -name '*.tar' -o -name '*.changed' \) -mmin +1440 -delete 2>/dev/null || true

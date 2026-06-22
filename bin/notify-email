@@ -43,10 +43,14 @@ FROM="$(read_var MAILER_EMAIL NOTIFY_FROM)"; FROM="${FROM:-$USER}"
 # scheme by port: 465 = implicit TLS (smtps); else STARTTLS on smtp:// (587/25)
 if [ "$PORT" = "465" ]; then url="smtps://$HOST:$PORT"; else url="smtp://$HOST:$PORT"; fi
 
+case "$status" in
+  success*|info*|ok*|OK*) tag="[CI OK]" ;;
+  *)                      tag="[CI FAIL]" ;;
+esac
 hn="$(hostname 2>/dev/null || echo vps)"
 tail_log="$(tail -n 30 "$logpath" 2>/dev/null)"
-msg="$(printf 'From: cicd-runner <%s>\r\nTo: %s\r\nSubject: [CI FAIL] %s (%s)\r\nDate: %s\r\n\r\nhost:   %s\ngroup:  %s\nstatus: %s\nlog:    %s\n\n--- last 30 log lines ---\n%s\r\n' \
-  "$FROM" "$TO" "$group" "$status" "$(date -R 2>/dev/null)" \
+msg="$(printf 'From: cicd-runner <%s>\r\nTo: %s\r\nSubject: %s %s (%s)\r\nDate: %s\r\n\r\nhost:   %s\ngroup:  %s\nstatus: %s\nlog:    %s\n\n--- last 30 log lines ---\n%s\r\n' \
+  "$FROM" "$TO" "$tag" "$group" "$status" "$(date -R 2>/dev/null)" \
   "$hn" "$group" "$status" "$logpath" "$tail_log")"
 
 curl --silent --show-error --max-time 25 --ssl-reqd \

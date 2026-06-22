@@ -23,12 +23,11 @@ jobs:
         paths: ["site/**"]
     image: node:20-alpine
     secrets: [cloudflare]
-    timeout: 900
+    timeout: 900            # runner-enforced wall-clock kill (safety). memory/pids/network too.
     network: bridge
-    retries: 2              # optional: auto-retry on failure (clamped to MAX_RETRIES). default 0
-    retry-delay: 20         # optional: seconds between attempts. default 15
-    notify: on-failure      # optional: on-failure (default) | off. emails via SMTP creds in secrets / host default
     run: sh ci/deploy-site.sh
+    # NOTE: retry + notify are NOT manifest fields. The script does them via
+    # /cicd/lib.sh:  retry -n 3 -- npm ci ;  notify_success/notify_error.
 
   # ── preview envs: every feature/experiment branch, on create AND push ────────
   preview:
@@ -49,9 +48,9 @@ jobs:
         branches: ["feat/*", "exp/*", "preview/**"]
     image: node:20-alpine
     secrets: [cloudflare]
-    retries: 1               # one retry for transient API errors; then operator (ci-teardown)
-    notify: on-failure
     run: sh ci/preview-teardown.sh   # full tree at /work (preserve ref), state at CI_ENV_DIR
+    # script retries the delete via `retry` from /cicd/lib.sh; on final failure the
+    # runner keeps the preserve ref + state for the operator (ci-teardown).
 
   # ── example of branches-ignore + paths-ignore (optional knobs) ───────────────
   # lint:

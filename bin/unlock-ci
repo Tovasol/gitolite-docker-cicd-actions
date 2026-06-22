@@ -1,21 +1,33 @@
 #!/usr/bin/env bash
-# unlock-ci — run once per reboot. Decrypts the GPG-protected age key into the
-# ramfs key dir (cleared on reboot). After this, CI decrypts unattended until
-# the next reboot. See DESIGN §25.
+# unlock-ci — load the runner's age key into the ramfs key file (cleared on reboot).
+# Run once per boot. Supply the key one of two ways:
+#   piped (recommended — never displayed, never in history):
+#       pass show ci/age-runner | ssh cicd-runner@vps unlock-ci
+#   gpg-encrypted file at rest (optional, §25):
+#       unlock-ci            # decrypts $CICD_AGE_ENC if present
 set -euo pipefail
 CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
 # shellcheck disable=SC1090
 . "$CICD_BASE/bin/lib.sh"; cicd_load_config
 
-ENC="${CICD_AGE_ENC:-/etc/ci/age-key.gpg}"
-DEST="$SOPS_AGE_KEY_FILE"
-DDIR="$(dirname "$DEST")"
+DEST="$SOPS_AGE_KEY_FILE"; DDIR="$(dirname "$DEST")"
+ENC="${CICD_AGE_ENC:-$CICD_BASE/etc/age-key.gpg}"   # optional gpg-at-rest blob
 
-[ -f "$ENC" ] || die "encrypted key not found: $ENC"
-mountpoint -q "$DDIR" || log "WARN: $DDIR is not a mountpoint (expected ramfs) — check /etc/fstab"
-
-export GPG_TTY="${GPG_TTY:-$(tty || true)}"
+[ -d "$DDIR" ] || install -d -m700 "$DDIR"
+mountpoint -q "$DDIR" 2>/dev/null || log "WARN: $DDIR is not a mountpoint (expected ramfs — see SOP §2.5)"
 umask 077
-gpg --decrypt "$ENC" > "$DEST"
+
+if [ ! -t 0 ]; then
+  cat > "$DEST"                                     # key piped on stdin (e.g. from pass)
+elif [ -f "$ENC" ]; then
+  export GPG_TTY="${GPG_TTY:-$(tty || true)}"
+  gpg --decrypt "$ENC" > "$DEST"
+else
+  die "no key supplied. pipe it:  pass show ci/age-runner | unlock-ci   (or set up $ENC)"
+fi
 chmod 600 "$DEST"
-log "age key loaded into $DEST (ramfs; clears on reboot)"
+
+# sanity: must be a valid age identity
+pub="$(age-keygen -y "$DEST" 2>/dev/null || true)"
+[ -n "$pub" ] || { rm -f "$DEST"; die "not a valid age key — nothing loaded"; }
+log "runner key loaded into $DEST  (pub: $pub)  — clears on reboot"

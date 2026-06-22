@@ -1,44 +1,58 @@
 #!/usr/bin/env bash
-# ci-teardown — manual control over stuck/quarantined teardowns.
+# ci-teardown — manual control over failed teardowns (archive-push model, §31).
 #   ci-teardown list
-#   ci-teardown retry   <repo> <branch>   # clear quarantine + backoff, trigger now
-#   ci-teardown abandon <repo> <branch>   # give up: force-release preserve ref + delete env state
+#   ci-teardown retry   <repo> <branch-or-slug>   # re-run from the kept source.tar
+#   ci-teardown abandon <repo> <branch-or-slug>   # give up: delete env state (NOT real resources)
+#
+# The EXACT branch passed to the teardown run always comes from the stored `branch`
+# file (source of truth), never from your CLI arg — so a mistype can't tear down the
+# wrong thing. You may pass the slug or the branch to identify the env.
 set -uo pipefail
 CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
 # shellcheck disable=SC1090
 . "$CICD_BASE/bin/lib.sh"; cicd_load_config
 
-cmd="${1:-list}"
+# resolve <repo> <branch-or-slug> -> env dir (try slug, then slugify(arg))
+resolve_env() {
+  local repo="$1" key="$2" e
+  for e in "$RUNNER_BASE/envs/$repo/$key" "$RUNNER_BASE/envs/$repo/$(slugify "$key")"; do
+    [ -d "$e" ] && { printf '%s' "$e"; return 0; }
+  done
+  return 1
+}
 
+cmd="${1:-list}"
 case "$cmd" in
   list)
     echo "failed teardowns (operator-owned):"
-    found=1
     find "$RUNNER_BASE/envs" -name teardown-failed 2>/dev/null | while read -r f; do
-      d="$(dirname "$f")"; echo "  ${d#"$RUNNER_BASE"/envs/}"; sed 's/^/      /' "$f"
+      d="$(dirname "$f")"
+      printf '  %s  (branch: %s)\n' "${d#"$RUNNER_BASE"/envs/}" "$(cat "$d/branch" 2>/dev/null || echo '?')"
+      sed 's/^/      /' "$f"
     done
     ;;
 
   retry)
-    repo="${2:?repo}"; branch="${3:?branch}"; slug="$(slugify "$branch")"
-    env="$RUNNER_BASE/envs/$repo/$slug"
-    [ -d "$env" ] || die "no env: $env"
-    rm -f "$env/teardown-failed"          # clear the failed marker so the runner will act
+    repo="${2:?repo}"; key="${3:?branch-or-slug}"
+    env="$(resolve_env "$repo" "$key")" || die "no env for $repo / $key"
+    branch="$(cat "$env/branch" 2>/dev/null)" || die "no stored branch in $env — cannot recover exact name"
+    [ -n "$branch" ] || die "empty branch file in $env"
+    rm -f "$env/teardown-failed"                 # clear the marker so the runner acts
     q="$RUNNER_BASE/queue/$repo/$branch"; mkdir -p "$q"
-    printf 'delete 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 manual\n' > "$q/target.tmp"
-    mv -f "$q/target.tmp" "$q/target"
-    setsid "$CICD_BASE/bin/run-group.sh" "$repo" "$branch" </dev/null >>"$CICD_BASE/runner.log" 2>&1 &
-    echo "retry triggered for $repo/$branch (slug=$slug) — watch: ci-status / runs/.../latest"
+    printf 'delete 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 manual\n' \
+      > "$q/target.tmp"; mv -f "$q/target.tmp" "$q/target"
+    setsid "$CICD_BASE/bin/run-group.sh" "$repo" "$branch" </dev/null >>"$RUNNER_BASE/runner.log" 2>&1 &
+    echo "retry triggered: $repo branch='$branch' — watch ci-status / runs/.../latest"
     ;;
 
   abandon)
-    repo="${2:?repo}"; branch="${3:?branch}"; slug="$(slugify "$branch")"
-    env="$RUNNER_BASE/envs/$repo/$slug"; bare="$GIT_REPO_BASE/$repo.git"
-    git --git-dir="$bare" update-ref -d "refs/cicd/preserve/$slug" 2>/dev/null || true
+    repo="${2:?repo}"; key="${3:?branch-or-slug}"
+    env="$(resolve_env "$repo" "$key")" || die "no env for $repo / $key"
+    branch="$(cat "$env/branch" 2>/dev/null || echo '?')"
     rm -rf "$env"
-    echo "ABANDONED $repo/$branch — preserve ref released, env state deleted."
-    echo "WARNING: any real resources this env provisioned are NOT cleaned — do that by hand."
+    echo "ABANDONED $repo branch='$branch' — env state + kept source deleted."
+    echo "WARNING: real resources this env provisioned are NOT cleaned — do that by hand."
     ;;
 
-  *) die "usage: ci-teardown {list|retry <repo> <branch>|abandon <repo> <branch>}" ;;
+  *) die "usage: ci-teardown {list | retry <repo> <branch-or-slug> | abandon <repo> <branch-or-slug>}" ;;
 esac

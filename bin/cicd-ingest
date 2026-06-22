@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# cicd-ingest <repo> <branch> <event> <newrev> <oldrev> <pusher>
+# The sudo target invoked by the git post-receive hook (ARCHIVE-PUSH, DESIGN §31).
+# Runs as cicd-runner. Reads a framed stream on stdin:
+#     line 1 : base64 of the newline-separated changed-file list  (computed by the hook)
+#     rest   : the raw `git archive` tar of the source tree
+# Stores them sha-keyed in incoming/, records the queue target, and triggers a
+# detached run-group — fast, so the push only blocks for the transfer.
+set -euo pipefail
+
+CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
+# shellcheck disable=SC1090
+. "$CICD_BASE/bin/lib.sh"; cicd_load_config || exit 1
+
+repo="$1"; branch="$2"; event="$3"; newrev="$4"; oldrev="$5"; pusher="${6:-unknown}"
+ZERO=0000000000000000000000000000000000000000
+[ "$event" = delete ] && srcsha="$oldrev" || srcsha="$newrev"
+
+Q="$RUNNER_BASE/queue/$repo/$branch"
+INC="$RUNNER_BASE/incoming/$repo/$branch"
+mkdir -p "$Q" "$INC"
+
+umask 077
+# line 1: base64(changed files); decode to <sha>.changed (empty ok for delete)
+IFS= read -r hdr || hdr=""
+if [ -n "$hdr" ]; then printf '%s' "$hdr" | base64 -d > "$INC/$srcsha.changed" 2>/dev/null || : > "$INC/$srcsha.changed"
+else : > "$INC/$srcsha.changed"; fi
+# rest of stdin: the tar
+cat > "$INC/$srcsha.tar.tmp" && mv -f "$INC/$srcsha.tar.tmp" "$INC/$srcsha.tar"
+
+# newest-wins target, then trigger the detached build
+printf '%s %s %s %s\n' "$event" "$newrev" "$oldrev" "$pusher" > "$Q/target.tmp"
+mv -f "$Q/target.tmp" "$Q/target"
+log "ingest $event $repo/$branch src=$srcsha bytes=$(wc -c < "$INC/$srcsha.tar")"
+
+setsid "$CICD_BASE/bin/run-group.sh" "$repo" "$branch" </dev/null >>"$RUNNER_BASE/runner.log" 2>&1 &
+exit 0

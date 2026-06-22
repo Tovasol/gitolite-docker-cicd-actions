@@ -632,7 +632,12 @@ reads `state`, destroys those named resources, exits 0. Then the runner
 > oldrev, set `git config gc.pruneExpire 2.weeks.ago` and/or
 > `receive.denyDeletes`-aware GC scheduling on the bare repo to widen the window.
 
-### The PRIMARY mechanism (implemented): a server-side preservation ref
+> **⚠ SUPERSEDED by §31 (archive-push).** The preserve-ref mechanism below is no
+> longer used — git now pushes the deleted branch's tree (`git archive oldrev`) to
+> the runner directly, so there's nothing to pin and nothing to clean in the bare
+> repo. Kept here for rationale/history. See §31 for the live model.
+
+### The PRIMARY mechanism (was implemented, now superseded by §31): a preservation ref
 persist-on-provision only saves `ci/` — insufficient if teardown logic needs other
 project parts (`infra/`, compose files, terraform, etc.). The robust fix gives
 teardown the **entire tree** of the deleted branch, without blocking the push:
@@ -913,6 +918,12 @@ deploy that single project. Scope the token; don't reuse a global one.
 ---
 
 ## 18. Dependency caching (fast installs, safely)
+
+> **⚠ SUPERSEDED by §32.** This section's per-repo npm cache + `nm/` result cache is
+> replaced by ONE global, multi-ecosystem, content-addressed cache (npm/pnpm/yarn/
+> bun/pip/poetry/uv/composer/go/cargo/ruby/nuget/gradle/maven/deno/elixir) injected
+> via a static default env block. The `nm/` result cache is DELETED (node_modules is
+> ephemeral). Kept below for the integrity-verification rationale, which still holds.
 
 Each job is a throwaway `docker run --rm`, so a naive `npm ci` re-downloads every
 time. Cache like GitHub Actions does — but note a safety subtlety GitHub glosses
@@ -1316,9 +1327,9 @@ GPG gates the boot; age does the unattended work — sidesteps the GPG timeout.
 #!/usr/bin/env bash
 set -euo pipefail
 export GPG_TTY=$(tty)                        # headless: pinentry-tty/curses over SSH
-install -d -m700 -o ci -g ci /run/ci-keys
-gpg --decrypt /etc/ci/age-key.gpg > /run/ci-keys/age-keys.txt   # or: pass show ci/age-runner >
-chown ci:ci /run/ci-keys/age-keys.txt; chmod 600 /run/ci-keys/age-keys.txt
+mkdir -p /run/ci-keys                        # ramfs mount-point (mounted once at setup, root)
+gpg --decrypt "$RUNNER_BASE/etc/age-key.gpg" > /run/ci-keys/age-keys.txt   # key file is cicd-runner-owned, no /etc
+chmod 600 /run/ci-keys/age-keys.txt
 ```
 Runner env: `SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt`. Decrypt on HOST, inject
 values into the container; never mount the RAM key dir into the build container.
@@ -1427,6 +1438,384 @@ Reaffirms §1 against scope creep (per-job retries + notify raised the question)
 
 ### Manifest fields recap (per job)
 `on:` (push/create/delete + branches/branches-ignore/paths/paths-ignore),
-`image`, `run`, `secrets`, `timeout`, `memory`, `pids`, `network`,
-`retries` (clamped to MAX_RETRIES), `retry-delay`, `notify` (on-failure|off).
-No dependency/ordering fields — by design.
+`image`, `run`, `secrets`, `timeout`, `memory`, `pids`, `network`.
+**No** `retries`/`notify`/dependency/ordering fields — retry+notify live in the
+script via `/cicd/lib.sh` (§28); ordering is the script's job. By design.
+
+---
+
+## 28. Mechanism vs policy: the runner/script division + /cicd/lib.sh
+
+The cleanest boundary (settled after the retry/notify discussion): **the runner
+owns mechanism & safety; the script owns policy & logic.** If branching belongs in
+the script, so do retry and notify.
+
+| Concern | Owner | Why |
+|---|---|---|
+| Trigger match, concurrency, sandbox, resource limits (timeout/memory/pids/caps/network) | **runner** | safety + isolation; a hung script can't bound itself |
+| Secret decrypt + inject; log/status; preserve-ref/teardown plumbing | **runner** | host-side mechanism |
+| Notify **delivery** (SMTP via curl + creds) | **runner** | needs curl + creds the container shouldn't have |
+| **Retry** (which command, how many times) | **script** | granular (retry one flaky call, not the whole job) |
+| **Notify intent** (when/what; success *and* error) | **script** | the script knows what success means |
+| Branching, fan-in/out, rollback, DAG | **script** | full shell power; §27 |
+
+### The bridge: `/cicd/lib.sh` (mounted into every job)
+The runner bind-mounts `lib/cicd.sh` read-only at `/cicd/lib.sh` and a writable
+outbox at `/cicd/out`. Scripts `. /cicd/lib.sh` and get:
+- `retry [-n N] [-d S] -- cmd…` — retry a single command.
+- `notify` / `notify_success` / `notify_error` — **do not send**; they append to
+  the outbox. Works in any image (just writes a file), no curl/creds in-container.
+- `wait_all <pid>…` — fan-in primitive (fail if any bg job failed).
+- `step`, `die`.
+
+### Why notify goes through an outbox (not in-container SMTP)
+1. **No image dependency** — `node:20-alpine` has no curl; the container only
+   writes a file, the runner (host) delivers.
+2. **Creds stay host-side** — SMTP password never enters the container env.
+3. **Survives hard kills** — after the container exits (even OOM/SIGKILL), the
+   runner flushes whatever the script wrote, copies it into `output.log`, and
+   delivers each. Plus a **backstop**: a failed job that emitted no terminal
+   notify still alerts (`NOTIFY_BACKSTOP=1`). So you never miss a hard failure.
+
+### Delivery + per-project creds
+`cicd_flush_outbox` (host) reads the outbox, calls `NOTIFY_CMD` (notify-email) per
+entry, passing the job's decrypted secrets so the notifier uses **per-project SMTP
+creds** (from the repo's sops `ci/secrets.enc.yaml`), falling back to the
+operator-global `/etc/cicd-runner/notify.env`. Success → `[CI OK]`, failure →
+`[CI FAIL]`.
+
+### Net effect
+Manifest shrank back to triggers + image + run + resource bounds. All retry/notify/
+branching is in `ci/*.sh` — see `examples/ci/pipeline-dag.sh` for a full
+fan-out/fan-in/retry/rollback/notify pipeline to copy from. The runner stays dumb;
+the script is as smart as the operator's bash.
+
+---
+
+## 29. Resource limits under rootless docker on OpenRC (the cgroup warning)
+
+`dockerd-rootless.sh` on OpenRC logs: *"Running in rootless-mode without cgroups.
+Systemd is required to enable cgroups in rootless-mode."* This is **expected and
+not fixable** — Docker rootless enforces `--memory`/`--pids-limit`/`--cpus` only
+with cgroup v2 **+ systemd** (to delegate a user slice). No systemd → no cgroup
+limits, full stop.
+
+**Correction:** the manual cgroup-delegation chown trick (Gentoo Podman wiki) is a
+**Podman** capability (crun + cgroupfs manager). It does NOT make Docker rootless
+honor limits. Don't apply it for Docker.
+
+**What's lost vs kept:**
+- ❌ per-container resource *quotas* (`--memory`, `--pids-limit`, `--cpus`)
+- ✅ everything security-relevant: rootless/userns, `--cap-drop ALL`,
+  `no-new-privileges`, seccomp, `--network`, and the runner's wall-clock `timeout`.
+
+For a single-tenant CI box running its own code, that's acceptable: cgroup quotas
+matter most for multi-tenant fairness/anti-DoS; here the **wall-clock timeout**
+(hangs) + **host OOM-killer** (memory blowups) are the backstop.
+
+**Runner behavior:** `RESOURCE_LIMITS=0` (runner.conf) makes the runner OMIT the
+`--memory`/`--pids-limit` flags so there's no false impression of enforcement.
+Set `1` only on systemd or rootful docker.
+
+**If you truly need per-container caps on OpenRC:** switch the runtime to **Podman
+rootless** (supports cgroup v2 delegation without systemd) — mostly docker-CLI
+compatible. Otherwise: accept it. Recommended: accept.
+
+---
+
+## 30. The git → cicd-runner trigger bridge
+
+> **Updated by §31:** Option B (sudo) is still the bridge, but the hook now *also
+> carries the source* through it (archive-push) — so the cicd-runner→gitolite read
+> access discussed below (UMASK/group/ssh-identity/mirror) is **no longer needed**.
+> The runner has zero repo access. Read §31 for the live source-delivery model; the
+> bridge mechanics (sudo, `!requiretty`, detached) below still apply.
+
+
+The hook runs as **git** (the SCM authority); the runner + rootless docker run as
+**cicd-runner** (the CI executor). git has no access to cicd-runner's rootless
+socket — by design (§16, supply-chain blast-radius containment). So the hook must
+HAND OFF across the user boundary. Two mechanisms:
+
+### Option B — sudo (IMPLEMENTED, default)
+- One sudoers grant: `git ALL=(cicd-runner) NOPASSWD: …/run-group.sh` (+`!requiretty`).
+- The self-contained hook (runs as git) classifies the event, pins the preserve-ref
+  on delete (git owns the repo), then:
+  `setsid sudo -n -u cicd-runner run-group.sh <repo> <branch> <event> <new> <old> <pusher>`
+- run-group, now AS cicd-runner, writes its own queue target from those args and
+  processes it. git never writes cicd-runner's dirs nor touches the docker socket.
+- Cost: one sudoers line. No long-running listener. Synchronous handoff, detached.
+
+### Option A — shared spool + a listener service (alternative)
+git drops a job file in a shared dir; a cicd-runner **listener** consumes it. No
+sudo. The question "how does cicd-runner *listen*?" — four mechanisms:
+
+1. **inotify (recommended)** — `inotifywait` (inotify-tools) blocks in the kernel
+   until a file event fires, then wakes. Event-driven, ~instant, ~0 idle cost:
+   ```sh
+   # cicd-watch (runs as cicd-runner, supervised by OpenRC alongside dockerd)
+   inotifywait -m -e close_write,moved_to /var/lib/cicd/inbox |
+   while read -r dir ev file; do
+     job="$dir$file"
+     read -r repo branch event new old pusher < "$job"
+     mv -f "$job" "$job.taking" 2>/dev/null || continue   # claim it
+     setsid "$CICD_BASE/bin/run-group.sh" "$repo" "$branch" "$event" "$new" "$old" "$pusher" \
+       </dev/null >>"$CICD_BASE/runner.log" 2>&1 &
+     rm -f "$job.taking"
+   done
+   ```
+2. **polling** — `while :; do for f in inbox/*; do …; done; sleep 2; done`. No
+   dependency, simple, up to N-seconds latency. Fine if you don't want inotify-tools.
+3. **named pipe (FIFO)** — git writes a line to `mkfifo`'d pipe; the listener
+   `read`s (blocks). Event-driven, no file cleanup, but single-reader + framing
+   caveats and it drops data if no reader is attached.
+4. **unix socket** — listener binds a socket (`socat`/`ncat`/small daemon); git
+   connects + writes. Robust framing, but the most code.
+
+Shared spool perms (the "how git writes where cicd-runner reads"):
+`/var/lib/cicd/inbox` owned `cicd-runner:cicd`, mode `0730` (git in group `cicd`
+can write + traverse but not read others' jobs), or `0770`. git's hook just
+`printf '…' > inbox/<ts>-<rand>`. The listener (cicd-runner) reads + runs.
+
+### B vs A
+| | Option B (sudo) | Option A (listener) |
+|---|---|---|
+| Moving parts | 1 sudoers line | a supervised listener service + shared spool |
+| sudo capability for git | yes (narrow: one script) | none |
+| Coupling | hook waits on sudo (detached) | fully async via the spool |
+| Latency | immediate | inotify immediate / poll ~Ns |
+| Failure if runner busy | new sudo proc queues at flock | files buffer in spool |
+
+Both keep git off the docker socket and out of cicd-runner's dirs. B is fewer
+parts (chosen). A avoids sudo and is more decoupled (pick it if you'd rather not
+grant git any sudo, or want the spool as a durable buffer). The runner side is
+identical — run-group takes the same args either way.
+
+### Why B was chosen: no liveness dependency, can't miss the trigger
+- **git guarantees the hook fires** synchronously inside receive-pack on every
+  push. No separate component's liveness to ensure; the push can't occur without
+  firing the trigger. Stateless, self-healing.
+- **A's listener has a silent miss-window:** inotify only delivers to a *running*
+  watcher — events arriving while it's down (crash/restart/deploy) are LOST unless
+  the listener also scans existing spool files on startup. So A isn't just "a
+  service that can crash" but "a service that drops events during downtime unless
+  carefully coded." Polling avoids the miss at the cost of latency + constant wakeups.
+- B's only true gap: a push while dockerd-rootless itself is down → that run fails
+  (+ notifies); re-push/re-run. dockerd is supervised → rare. A detached run-group
+  dying mid-work is covered by `ci-recover` (target/last markers). Net: **stateless
+  guaranteed trigger + minimal on-disk state + recovery sweep, no daemon to
+  babysit** — fits the no-blackbox ethos.
+
+---
+
+## 31. Source delivery: ARCHIVE-PUSH (supersedes bare-repo read + preserve-ref)
+
+**Decision (replaces §14's preserve-ref mechanism and the cicd-runner→gitolite read
+access of §30):** the runner never reads any repo. **git produces the source and
+pushes it** through the existing sudo bridge. The runner is a pure sink with **zero
+repo access** — no filesystem perms (§A `UMASK`/group), no gitolite ssh identity
+(§B), no mirror.
+
+### Why
+- **Dissolves the access problem.** Repos stay `0077`, git-only. Nothing else can
+  read them.
+- **Tightest least-privilege.** A reads all repos; B reads granted repos; archive-
+  push = the runner sees only **the exact tree git handed it for an active build**,
+  nothing else, ever.
+- **Symmetric with the bridge.** git already `sudo`s into the runner to invoke it;
+  now it also carries the payload. The runner is a sink.
+
+### Mechanics (create / push)
+The hook (runs as git, full repo access) computes the changed-file list and pipes a
+framed stream through sudo:
+```
+# post-receive (git):
+changed="$(git diff --name-only "$old" "$new")"          # or ls-tree -r for create
+{ printf '%s\n' "$(printf '%s' "$changed" | base64 -w0)"  # line 1: base64(changed list)
+  git archive --format=tar "$new"; }                      # rest: the tar (raw)
+| sudo -n -u cicd-runner "$CICD_BASE/bin/cicd-ingest" "$repo" "$branch" "$event" "$new" "$old" "$pusher"
+```
+Framing: **line 1 = base64 of the newline-separated changed-file list** (single
+line, so `read -r` consumes exactly it); **the remainder of stdin = the raw tar**.
+`cicd-ingest` (as cicd-runner):
+1. `read -r hdr` → `base64 -d` → `incoming/<sha>.changed`
+2. `cat > incoming/<sha>.tar` (the rest)
+3. write the queue target (`event sha old pusher`), `setsid run-group` detached, exit
+   fast → the push blocks only for the *transfer*, not the build.
+
+`run-group` coalesce loop: read newest target's sha → extract `incoming/<sha>.tar`
+into the workspace → path-filter using `incoming/<sha>.changed` → build → delete the
+tar/changed/workspace after.
+
+**Changed files come from the hook**, because the runner has no repo to `git diff`
+against (it only has the one tree). The hook has git access and computes it; the
+runner just filters with the manifest globs (it has yq; the hook doesn't).
+
+### Teardown (delete) — no preserve-ref
+On delete the hook archives `oldrev` (objects still alive — gc runs after hooks) and
+pushes that tree as the teardown source:
+```
+git archive --format=tar "$oldrev" | sudo … cicd-ingest "$repo" "$branch" delete "$ZERO" "$oldrev" "$pusher"
+```
+No `refs/cicd/preserve/*`, no ref pinning, nothing written in the bare repo. The
+delivered tree is stored in the env dir as `source.tar`.
+
+### Branch-name preservation (REQUIRED — infra keys off it)
+The **slug is one-way** (lossy); the exact branch must be recoverable, including
+slashes. So: **dir name = slug** (flat, filesystem-safe); the **exact branch is
+stored as data** in the env dir:
+```
+envs/<repo>/<slug>/
+    branch          # exact branch verbatim — "feat/foo/bar"  (one line, bash-trivial)
+    meta.json       # {repo, branch, slug, first_seen, last_event}
+    state           # provisioned resource IDs/URLs (written by the deploy script)
+    source.tar      # latest provisioned tree (kept for teardown + retry)
+    teardown-failed # marker on failure (+ exit/log)
+```
+`CI_BRANCH` reaches the teardown script exact in all three cases:
+1. provision → hook arg → written to `branch`/`meta.json`
+2. hook-driven delete → hook arg
+3. operator retry (`ci-teardown retry`) → read back from the stored `branch` file
+**The stored `branch` file is the source of truth for retry — never operator input.**
+So even a mistyped CLI arg can't run teardown against the wrong branch. `CI_BRANCH_
+SLUG` is recomputed deterministically from the stored branch (stable → matches what
+was provisioned). Infra teardown can key off either with confidence.
+
+### Failure / retry (answers "what re-triggers", "how cleaned up")
+- On teardown failure: KEEP `source.tar` + `branch` + `state` + write `teardown-
+  failed`. **Nothing auto-re-triggers** (human-gated, per §28-era decision; the in-
+  script `retry` lib covers transient blips within one run).
+- Operator runs **`ci-teardown retry <repo> <branch-or-slug>`** → re-extracts the
+  kept `source.tar`, reads `CI_BRANCH` from the stored `branch` file, re-runs.
+- **Cleanup:** there are **no preserve-refs** → nothing accumulates in the bare repo;
+  the preserve-ref orphan-sweep is DELETED. Failed teardowns are just env dirs,
+  cleaned by success / `ci-teardown abandon` / `reap-envs` (orphaned env whose branch
+  is gone). Multiple failed-then-fixed deletes = independent env dirs; fixing one
+  removes only that dir.
+- **Missed delete** (branch removed server-side, no hook → no delivered tar):
+  `reap-envs` uses the **persisted `source.tar`** (kept on every provision) for a
+  minimal-mode teardown. So a tree is always available.
+
+### Trade-offs
+- Full source tarball per push: trivial for normal/site repos (ms); heavier for a
+  giant monorepo (full tree each push vs an incremental fetch). Acceptable here.
+- No `.git` in the workspace — identical to the prior design (it already did
+  `git archive | tar -x`). Zero regression. If a build ever needs git metadata,
+  that's a separate feature for any model.
+- The hook does `git archive` synchronously → push blocks for the *transfer* only;
+  the build stays detached.
+
+### What this removes
+- `refs/cicd/preserve/*` pinning in `post-receive`; the preserve-ref archive/fallback
+  in `run_teardown`; the orphan-ref sweep in `reap-envs`.
+- All cicd-runner→gitolite read-access setup (UMASK/group/ACL/ssh-identity/mirror).
+
+### Components
+- `bin/cicd-ingest` (NEW, the sudo target): receive framed stream → store sha-keyed
+  tar + changed list → trigger detached run-group.
+- `bin/post-receive`: archive-push (create/push → `git archive newrev`; delete →
+  `git archive oldrev`); deliver changed-files header; drop preserve-ref.
+- `bin/run-group.sh`: source from `incoming/<sha>.tar`; path-filter from `incoming/
+  <sha>.changed`; persist `branch`/`source.tar` per provision; teardown keeps
+  source on failure.
+- `bin/reap-envs`: drop ref sweep; minimal teardown from persisted `source.tar`.
+- `bin/ci-teardown`: `retry` reads `CI_BRANCH` from the stored `branch` file.
+- sudoers grant: `cicd-ingest` (not `run-group.sh`).
+
+---
+
+## 32. Global multi-ecosystem cache (supersedes §18's per-repo npm cache)
+
+**Decision (replaces §18's per-repo npm cache + the `nm/` result cache):** ONE
+global cache volume, shared across all repos, with a static default env block that
+points every common package manager's cache into it. Default-on, tool-agnostic,
+storage-optimal.
+
+### Two corrections to §18
+1. **node_modules never bloats** — it lives in the throwaway workspace (`$work`),
+   `rm -rf`'d after each run. The persistent grower is the *package download cache*.
+2. **Drop the `nm/` result cache** (the node_modules tarball-per-lockfile). It was
+   the bloat (~80–200 MB each) AND the only poison-prone cache (plain files, not
+   integrity-verified). node_modules is ephemeral and the download cache already
+   makes installs fast. Gone.
+
+### Global, not per-repo — safe + huge dedup
+The package caches below are **content-addressed + integrity-verified** (npm
+cacache, pnpm store, cargo registry, go modcache, etc.). A package fetched by repo
+A serves repo B **only if** the integrity hash matches B's lockfile → identical
+bytes. Cross-repo poisoning is impossible by construction (you can't store evil
+bytes under a hash that is *of* the content). So a **single global cache** is safe
+and collapses the footprint from `repos × deps` (~105 GB at 300 repos) to the
+**deduped union of distinct deps** (~5–20 GB) — sub-linear in repo count.
+
+### Generalized = env conventions, NOT logic
+The runner mounts one `/cache` and injects a **static block of conventional cache
+env vars**. No tool detection, no branching, no per-tool code. A tool that isn't
+used ignores its var; an unknown future tool uses `XDG_CACHE_HOME` or
+`CI_CACHE_DIR`. Adding an ecosystem = one more `-e` line (config, not code).
+
+### The default cache env block (verified 2026; all → subdirs of the one /cache)
+```
+CI_CACHE_DIR=/cache                                    # universal fallback
+XDG_CACHE_HOME=/cache/xdg                              # catch-all: pip, poetry, uv, go-build,
+XDG_DATA_HOME=/cache/xdg-data                          #   composer, deno (Linux) — for free
+# Node
+npm_config_cache=/cache/npm
+YARN_CACHE_FOLDER=/cache/yarn                          # v1 AND berry (berry defaults project-local; force it)
+pnpm_config_store_dir=/cache/pnpm/store                # pnpm v11+ (v≤10: npm_config_store_dir)
+pnpm_config_cache_dir=/cache/pnpm/cache
+BUN_INSTALL_CACHE_DIR=/cache/bun
+# Python
+PIP_CACHE_DIR=/cache/pip
+POETRY_CACHE_DIR=/cache/poetry
+UV_CACHE_DIR=/cache/uv
+PIPENV_CACHE_DIR=/cache/pipenv                         # also relies on PIP_CACHE_DIR (delegates to pip)
+# PHP
+COMPOSER_CACHE_DIR=/cache/composer
+# Go
+GOMODCACHE=/cache/go/mod
+GOCACHE=/cache/go/build
+# Rust
+CARGO_HOME=/cache/cargo                                # registry cache under $CARGO_HOME/registry
+# Ruby
+BUNDLE_PATH=/cache/bundle
+BUNDLE_USER_CACHE=/cache/bundle/cache
+# .NET
+NUGET_PACKAGES=/cache/nuget
+# JVM
+GRADLE_USER_HOME=/cache/gradle
+MAVEN_ARGS=-Dmaven.repo.local=/cache/maven             # Maven 3.9+/4 (no dedicated env var)
+# Deno / Elixir
+DENO_DIR=/cache/deno
+MIX_HOME=/cache/mix
+HEX_HOME=/cache/hex
+```
+Notes: npm/yarn/pnpm/bun/cargo/nuget/gradle/maven/ruby/GOMODCACHE do **not** respect
+XDG — hence the explicit vars. pip/poetry/uv/GOCACHE/composer/deno do (XDG_CACHE_HOME
+covers them, explicit vars are belt-and-suspenders). `CARGO_HOME` is a *home* (also
+holds the toolchain/bin) but the registry cache lives under it — fine to point at
+the shared volume.
+
+### One caveat: build artifacts vs download cache
+A few vars relocate more than the download cache: `GOCACHE` (build outputs),
+`GRADLE_USER_HOME` (build caches), `CARGO_HOME` (also toolchain). Sharing build
+caches globally is still safe (content-addressed/keyed) and beneficial, but they
+grow faster than pure download caches — the reaper (below) bounds them.
+
+### Eviction — one reaper on one volume
+Replaces §18's fiddly per-repo pruning. A single daily job caps the global cache:
+size-cap (LRU evict least-recently-used entries beyond N GB) and/or age (evict
+entries untouched for N days), per top-level subdir. Plus each package manager's
+own GC where cheap (`npm cache verify`, `go clean -cache`, etc.). One volume, one
+policy. Tracked as the cache-reaper action item (the §-scaling top gap, now small).
+
+### Net effect on scaling (see CI-RUNNER-SCALING.md)
+The ~105 GB unbounded per-repo cache becomes a ~5–20 GB globally-deduped volume
+with trivial bounded eviction. The "#1 scaling risk" largely dissolves.
+
+### Components
+- `run-group.sh`: mount global `$RUNNER_BASE/cache` → `/cache`; inject the env block;
+  drop per-repo cache dir + `nm/` logic.
+- `prune-disk`: add the global-cache reaper (size/age cap).
+- examples: install scripts may stay vanilla (`npm ci`) — caching is automatic via
+  the injected env; no per-project cache wiring needed.

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# run-group.sh <repo> <branch>
-# Per-group serialized runner. Reads the newest queued target, runs matching jobs
-# from <repo>'s .gitolite/ci.yml, with concurrency throttling, wall-clock timeout,
-# hardened rootless docker run, dependency caching, sops secret injection, and
-# ephemeral-env create/update/teardown.
-set -uo pipefail   # NOT -e: we handle errors explicitly so one job can't abort the loop
+# run-group.sh <repo> <branch> [event newrev oldrev pusher]
+# Per-group serialized runner, runs as the CICD-RUNNER user. ARCHIVE-PUSH model
+# (DESIGN §31): the git hook delivers the source tree as a tar via cicd-ingest; the
+# runner has ZERO repo access. Source comes from incoming/<sha>.tar; changed-file
+# list (for path filters) from incoming/<sha>.changed (computed by the hook).
+# Concurrency throttling, wall-clock timeout, hardened rootless docker run, dependency
+# caching, sops secrets, ephemeral-env create/update/teardown. No preserve-ref.
+set -uo pipefail   # NOT -e: errors handled explicitly so one job can't abort the loop
 
 CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
 # shellcheck disable=SC1090
@@ -16,39 +18,56 @@ slug="$(slugify "$branch")"
 Q="$RUNNER_BASE/queue/$group"
 RUNS="$RUNNER_BASE/runs/$group"
 ENVS="$RUNNER_BASE/envs/$repo/$slug"
-CACHE="$RUNNER_BASE/cache/$repo"
-BARE="$GIT_REPO_BASE/$repo.git"
+CACHE="$RUNNER_BASE/cache"                    # GLOBAL cache, shared all repos (content-addressed dedup, §32)
+INC="$RUNNER_BASE/incoming/$group"           # cicd-ingest drops <sha>.tar + <sha>.changed here
+ZERO=0000000000000000000000000000000000000000
 export SOPS_AGE_KEY_FILE
 [ -n "${DOCKER_HOST:-}" ] && export DOCKER_HOST
 
-mkdir -p "$Q" "$RUNS" "$CACHE/npm" "$CACHE/nm"
+# detached (no tty, via the hook's setsid+sudo) -> log to the runner log
+[ -t 1 ] || exec >>"$RUNNER_BASE/runner.log" 2>&1
+
+mkdir -p "$Q" "$RUNS" "$CACHE"
+
+# Static default cache env block (DESIGN §32): points every common package manager's
+# cache into the one global /cache mount. NOT logic — just conventional env names; a
+# tool that isn't used ignores its var; unknown tools use XDG_CACHE_HOME / CI_CACHE_DIR.
+CACHE_ENV=(
+  -e CI_CACHE_DIR=/cache
+  -e XDG_CACHE_HOME=/cache/xdg -e XDG_DATA_HOME=/cache/xdg-data
+  -e npm_config_cache=/cache/npm
+  -e YARN_CACHE_FOLDER=/cache/yarn
+  -e pnpm_config_store_dir=/cache/pnpm/store -e pnpm_config_cache_dir=/cache/pnpm/cache
+  -e BUN_INSTALL_CACHE_DIR=/cache/bun
+  -e PIP_CACHE_DIR=/cache/pip -e POETRY_CACHE_DIR=/cache/poetry
+  -e UV_CACHE_DIR=/cache/uv -e PIPENV_CACHE_DIR=/cache/pipenv
+  -e COMPOSER_CACHE_DIR=/cache/composer
+  -e GOMODCACHE=/cache/go/mod -e GOCACHE=/cache/go/build
+  -e CARGO_HOME=/cache/cargo
+  -e BUNDLE_PATH=/cache/bundle -e BUNDLE_USER_CACHE=/cache/bundle/cache
+  -e NUGET_PACKAGES=/cache/nuget
+  -e GRADLE_USER_HOME=/cache/gradle -e "MAVEN_ARGS=-Dmaven.repo.local=/cache/maven"
+  -e DENO_DIR=/cache/deno -e MIX_HOME=/cache/mix -e HEX_HOME=/cache/hex
+)
+
+# called with event args (reap-envs / ci-recover / ci-teardown)? record the target.
+if [ -n "${3:-}" ]; then
+  printf '%s %s %s %s\n' "$3" "${4:-}" "${5:-}" "${6:-unknown}" > "$Q/target.tmp"
+  mv -f "$Q/target.tmp" "$Q/target"
+fi
 
 # ---- per-group lock: if another run-group holds it, exit (it will coalesce) ----
 exec 9>>"$Q/group.lock"
 flock -n 9 || { log "$group already running; exit"; exit 0; }
+acquire_slot                                  # global slot, held until process exits
+trap ':' EXIT                                 # slot/lock fds auto-release on exit
 
-# ---- global slot (held until this process exits) ----
-acquire_slot
-
-cleanup() { :; }   # slot/lock fds auto-release on exit
-trap cleanup EXIT
-
-# ---- helpers ----------------------------------------------------------------
-
-git_changed() {  # git_changed <event> <newrev> <oldrev>  -> newline list of paths
-  local ev="$1" new="$2" old="$3" ZERO=0000000000000000000000000000000000000000
-  if [ "$ev" = "create" ] || [ "$old" = "$ZERO" ]; then
-    git --git-dir="$BARE" ls-tree -r --name-only "$new" 2>/dev/null
-  else
-    git --git-dir="$BARE" diff --name-only "$old" "$new" 2>/dev/null
-  fi
-}
+src_sha() { [ "$1" = delete ] && printf '%s' "$3" || printf '%s' "$2"; }  # event new old
 
 # Run one matched job inside a hardened, throwaway container.
-execute_job() {  # execute_job <job> <event> <newrev> <pusher> <workdir> <manifest>
+execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   local job="$1" event="$2" newrev="$3" pusher="$4" work="$5" manifest="$6"
-  local image timeout mem pids network runcmd ts dir name envfile rc
-  local retries rdelay notify try max
+  local image timeout mem pids network runcmd ts dir name envfile rc outdir status_word
   image="$(yq_str "$manifest" ".jobs.\"$job\".image")";     image="${image:-$DEFAULT_IMAGE}"
   timeout="$(yq_str "$manifest" ".jobs.\"$job\".timeout")"; timeout="${timeout:-$DEFAULT_TIMEOUT}"
   mem="$(yq_str "$manifest" ".jobs.\"$job\".memory")";      mem="${mem:-$DEFAULT_MEMORY}"
@@ -56,12 +75,9 @@ execute_job() {  # execute_job <job> <event> <newrev> <pusher> <workdir> <manife
   network="$(yq_str "$manifest" ".jobs.\"$job\".network")"; network="${network:-$DEFAULT_NETWORK}"
   runcmd="$(yq_str "$manifest" ".jobs.\"$job\".run")"
   [ -n "$runcmd" ] || { log "$group/$job: no run: command, skip"; return 0; }
-  # per-job retry + notify (clamped to MAX_RETRIES so a typo can't pin the box)
-  retries="$(yq_str "$manifest" ".jobs.\"$job\".retries")"; retries="${retries:-${DEFAULT_RETRIES:-0}}"
-  retries="$(clamp_int "$retries" 0 "${MAX_RETRIES:-5}")"
-  rdelay="$(yq_str "$manifest" ".jobs.\"$job\".\"retry-delay\"")"; rdelay="${rdelay:-${DEFAULT_RETRY_DELAY:-15}}"
-  notify="$(yq_str "$manifest" ".jobs.\"$job\".notify")"; notify="${notify:-on-failure}"
-  max=$(( 1 + retries ))
+  local limits=()
+  [ "${RESOURCE_LIMITS:-1}" = "1" ] && limits=(--pids-limit "$pids" --memory "$mem")
+  # retry + notify live in the script via /cicd/lib.sh; runner owns safety + delivery.
 
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   dir="$RUNS/$ts-${newrev:0:8}-$job"; mkdir -p "$dir"
@@ -70,13 +86,11 @@ execute_job() {  # execute_job <job> <event> <newrev> <pusher> <workdir> <manife
     "$group" "$job" "$event" "$newrev" "$branch" "$pusher" "$(_ts)" > "$dir/meta.json"
   echo running > "$dir/status"
 
-  # --- secrets: decrypt repo's ci/secrets.enc.yaml to a tmpfs dotenv (if present) ---
   envfile=""
   if [ -f "$work/ci/secrets.enc.yaml" ]; then
     envfile="$(mktemp -p "${SHM_DIR:-/dev/shm}" cicd.env.XXXXXX)"
     if ! sops -d --output-type dotenv "$work/ci/secrets.enc.yaml" > "$envfile" 2>"$dir/secrets.err"; then
-      echo "exit:secrets-decrypt-failed" > "$dir/status"
-      rm -f "$envfile"
+      echo "exit:secrets-decrypt-failed" > "$dir/status"; rm -f "$envfile"
       notify_failure "$group/$job" secrets "$dir/output.log"
       log "$group/$job: secret decrypt failed (key loaded? run unlock-ci) — see $dir/secrets.err"
       return 1
@@ -84,80 +98,60 @@ execute_job() {  # execute_job <job> <event> <newrev> <pusher> <workdir> <manife
     rm -f "$dir/secrets.err"
   fi
 
-  # --- the exact invocation, recorded for hand-reproduction ---
+  outdir="$dir/cicd-out"; mkdir -p "$outdir"
   {
     echo "# event=$event sha=$newrev branch=$branch"
-    echo "timeout --kill-after=30 $timeout docker run --rm --init --name $name \\"
-    echo "  --cap-drop ALL --security-opt no-new-privileges --pids-limit $pids --memory $mem \\"
-    echo "  --network $network --label cicd=1 --label cicd.group=$group \\"
-    echo "  -e CI_EVENT=$event -e CI_REPO=$repo -e CI_BRANCH=$branch -e CI_BRANCH_SLUG=$slug \\"
-    echo "  -e CI_SHA=$newrev -e CI_PUSHER=$pusher -e CI_CACHE_DIR=/cache -e npm_config_cache=/cache/npm \\"
-    echo "  -v $CACHE:/cache -v $work:/work -w /work ${envfile:+--env-file <decrypted>} \\"
-    echo "  $image sh -c '$runcmd'"
+    echo "docker run --rm --init --name $name --cap-drop ALL --security-opt no-new-privileges \\"
+    echo "  --network $network -e CI_BRANCH=$branch -e CI_BRANCH_SLUG=$slug -e CI_SHA=$newrev \\"
+    echo "  -v <workspace>:/work -w /work ${envfile:+--env-file <decrypted>} $image sh -c '$runcmd'"
   } > "$dir/cmd"
 
-  log "$group/$job: start image=$image timeout=$timeout net=$network retries=$retries"
-  local status_word
-  for try in $(seq 1 "$max"); do
-    [ "$try" -gt 1 ] && { echo "=== retry $try/$max $(_ts) ===" >> "$dir/output.log"; }
-    timeout --kill-after=30 "$timeout" \
-      docker run --rm --init --name "${name}-$try" \
-        --cap-drop ALL --security-opt no-new-privileges \
-        --pids-limit "$pids" --memory "$mem" --network "$network" \
-        --label cicd=1 --label "cicd.group=$group" \
-        -e CI_EVENT="$event" -e CI_REPO="$repo" -e CI_BRANCH="$branch" \
-        -e CI_BRANCH_SLUG="$slug" -e CI_SHA="$newrev" -e CI_PUSHER="$pusher" \
-        -e CI_CACHE_DIR=/cache -e npm_config_cache=/cache/npm \
-        -e CI_ENV_DIR=/envstate -v "$ENVS:/envstate" \
-        -v "$CACHE:/cache" -v "$work:/work" -w /work \
-        ${envfile:+--env-file "$envfile"} \
-        "$image" sh -c "$runcmd" \
-        >>"$dir/output.log" 2>&1
-    rc=$?
-    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "${name}-$try" >/dev/null 2>&1 || true; rc=124; fi
-    [ "$rc" -eq 0 ] && break
-    if [ "$try" -lt "$max" ]; then
-      log "$group/$job: attempt $try failed (rc=$rc) — retry $((try+1))/$max in ${rdelay}s"
-      sleep "$rdelay"
-    fi
-  done
-
+  log "$group/$job: start image=$image timeout=$timeout net=$network"
+  timeout --kill-after=30 "$timeout" \
+    docker run --rm --init --name "$name" \
+      --cap-drop ALL --security-opt no-new-privileges \
+      "${limits[@]}" --network "$network" \
+      --label cicd=1 --label "cicd.group=$group" \
+      -e CI_EVENT="$event" -e CI_REPO="$repo" -e CI_BRANCH="$branch" \
+      -e CI_BRANCH_SLUG="$slug" -e CI_SHA="$newrev" -e CI_PUSHER="$pusher" \
+      "${CACHE_ENV[@]}" \
+      -e CI_ENV_DIR=/envstate -v "$ENVS:/envstate" \
+      -e CI_OUTBOX=/cicd/out/notify \
+      -v "$RUNNER_BASE/lib/cicd.sh:/cicd/lib.sh:ro" -v "$outdir:/cicd/out" \
+      -v "$CACHE:/cache" -v "$work:/work" -w /work \
+      ${envfile:+--env-file "$envfile"} \
+      "$image" sh -c "$runcmd" \
+      >>"$dir/output.log" 2>&1
+  rc=$?
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; rc=124; fi
   if [ "$rc" -eq 124 ]; then status_word=timeout; else status_word="exit:$rc"; fi
-  echo "$status_word" > "$dir/status"
-  ln -sfn "$dir" "$RUNS/latest"
-  if [ "$rc" -ne 0 ]; then
-    # pass the decrypted secrets so the notifier can use repo-level SMTP creds
-    [ "$notify" != "off" ] && notify_failure "$group/$job" "$status_word after $max attempt(s)" "$dir/output.log" "$envfile"
-    log "$group/$job: FAILED $status_word after $max attempt(s)"
-  else
-    log "$group/$job: done (attempt $try/$max)"
-  fi
-  [ -n "$envfile" ] && rm -f "$envfile"     # decrypted secrets gone after notify
+  echo "$status_word" > "$dir/status"; ln -sfn "$dir" "$RUNS/latest"
+  cicd_flush_outbox "$outdir/notify" "$rc" "$dir" "$group/$job" "$envfile"
+  [ "$rc" -eq 0 ] && log "$group/$job: done" || log "$group/$job: FAILED $status_word"
+  [ -n "$envfile" ] && rm -f "$envfile"
   return "$rc"
 }
 
-# Persist the teardown plan so branch-deletion can tear down without the ref (DESIGN §14).
-persist_env_for_teardown() {  # <work> <manifest>
-  local work="$1" manifest="$2" tjob tscript timage
-  # find the first job with an on.delete trigger
+# Persist what teardown needs, so a delete (hook OR reaper) can run without repo access.
+persist_env_for_teardown() {  # <work> <manifest> <srctar>
+  local work="$1" manifest="$2" srctar="$3" tjob tscript timage
   for tjob in $(yq_keys "$manifest" ".jobs"); do
-    local del; del="$(yq_str "$manifest" ".jobs.\"$tjob\".on.delete")"
-    [ -n "$del" ] || continue
+    [ -n "$(yq_str "$manifest" ".jobs.\"$tjob\".on.delete")" ] || continue
     tscript="$(yq_str "$manifest" ".jobs.\"$tjob\".run")"
     timage="$(yq_str "$manifest" ".jobs.\"$tjob\".image")"; timage="${timage:-$DEFAULT_IMAGE}"
     mkdir -p "$ENVS"
-    # copy whatever the teardown run references (script path under ci/) if it exists
-    [ -d "$work/ci" ] && cp -a "$work/ci/." "$ENVS/ci/" 2>/dev/null || true
+    printf '%s' "$branch"  > "$ENVS/branch"         # EXACT branch (recoverable; §31)
     printf '%s\n' "$tscript" > "$ENVS/teardown.cmd"
     printf '%s\n' "$timage"  > "$ENVS/teardown.image"
     printf '{"repo":"%s","branch":"%s","slug":"%s","saved":"%s"}\n' \
       "$repo" "$branch" "$slug" "$(_ts)" > "$ENVS/meta.json"
+    [ -n "$srctar" ] && [ -f "$srctar" ] && cp -f "$srctar" "$ENVS/source.tar"  # latest tree for teardown
     log "$group: persisted teardown plan for $slug (job=$tjob)"
     return 0
   done
 }
 
-find_delete_job() {  # find_delete_job <manifest> -> prints first job whose on.delete matches $branch
+find_delete_job() {  # <manifest> -> first job whose on.delete matches $branch
   local manifest="$1" job inc ign
   for job in $(yq_keys "$manifest" ".jobs"); do
     [ -n "$(yq_str "$manifest" ".jobs.\"$job\".on.delete")" ] || continue
@@ -169,121 +163,104 @@ find_delete_job() {  # find_delete_job <manifest> -> prints first job whose on.d
   return 1
 }
 
-run_teardown() {  # run_teardown <oldrev> <pusher>
+run_teardown() {  # <oldrev> <pusher>
   local oldrev="$1" pusher="$2" ts dir name envfile rc
-  local ZERO=0000000000000000000000000000000000000000
-  local preserve="refs/cicd/preserve/$slug"
-  local work="" manifest="" tjob="" image runcmd mountwork wd
-  local retries="${DEFAULT_RETRIES:-0}" rdelay="${DEFAULT_RETRY_DELAY:-15}" notify="on-failure"
+  local work="" manifest="" tjob="" image runcmd mountwork outdir srctar secsrc
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   dir="$RUNS/$ts-teardown"; mkdir -p "$dir"; echo running > "$dir/status"
   name="cicd-teardown-$(printf '%s' "$group" | tr -c 'a-zA-Z0-9_.-' '-')-$ts"
 
-  # --- 1) get the FULL tree: preserve ref (primary) -> oldrev objects (gc window) ---
-  if git --git-dir="$BARE" show-ref --verify --quiet "$preserve"; then
-    work="$(mktemp -d)"; git --git-dir="$BARE" archive "$preserve" | tar -x -C "$work" 2>/dev/null || rm -rf "$work" work=""
-  elif [ "$oldrev" != "$ZERO" ] && git --git-dir="$BARE" cat-file -e "$oldrev^{commit}" 2>/dev/null; then
-    work="$(mktemp -d)"; git --git-dir="$BARE" archive "$oldrev" | tar -x -C "$work" 2>/dev/null || rm -rf "$work" work=""
+  # --- source tree: hook-delivered incoming/<oldrev>.tar -> else persisted env source.tar ---
+  srctar=""
+  [ "$oldrev" != "$ZERO" ] && [ -f "$INC/$oldrev.tar" ] && srctar="$INC/$oldrev.tar"
+  [ -z "$srctar" ] && [ -f "$ENVS/source.tar" ] && srctar="$ENVS/source.tar"
+  if [ -n "$srctar" ]; then
+    work="$(mktemp -d)"; tar -x -C "$work" -f "$srctar" 2>/dev/null || { rm -rf "$work"; work=""; }
   fi
 
-  # --- 2) choose full-tree mode (have tree + manifest) or minimal fallback ---
   if [ -n "$work" ] && [ -f "$work/.gitolite/ci.yml" ]; then
     manifest="$work/.gitolite/ci.yml"
     if tjob="$(find_delete_job "$manifest")"; then
       image="$(yq_str "$manifest" ".jobs.\"$tjob\".image")"; image="${image:-$DEFAULT_IMAGE}"
       runcmd="$(yq_str "$manifest" ".jobs.\"$tjob\".run")"
-      mountwork=(-v "$work:/work" -w /work); wd="$work"     # full project at /work, state at /envstate
-      # per-job retry/notify from the delete job (clamped)
-      retries="$(yq_str "$manifest" ".jobs.\"$tjob\".retries")"; retries="${retries:-${DEFAULT_RETRIES:-0}}"
-      retries="$(clamp_int "$retries" 0 "${MAX_RETRIES:-5}")"
-      rdelay="$(yq_str "$manifest" ".jobs.\"$tjob\".\"retry-delay\"")"; rdelay="${rdelay:-${DEFAULT_RETRY_DELAY:-15}}"
-      notify="$(yq_str "$manifest" ".jobs.\"$tjob\".notify")"; notify="${notify:-on-failure}"
+      mountwork=(-v "$work:/work" -w /work)
     fi
   fi
-  if [ -z "${runcmd:-}" ] && [ -f "$ENVS/teardown.cmd" ]; then   # minimal fallback (reaper / no ref)
+  if [ -z "${runcmd:-}" ] && [ -f "$ENVS/teardown.cmd" ]; then   # minimal fallback
     image="$(cat "$ENVS/teardown.image" 2>/dev/null)"; image="${image:-$DEFAULT_IMAGE}"
     runcmd="$(cat "$ENVS/teardown.cmd")"
-    mountwork=(-w /envstate)                                  # only persisted ci/ + state present
+    mountwork=(-w /envstate)
   fi
   if [ -z "${runcmd:-}" ]; then
-    echo "exit:0" > "$dir/status"
-    git --git-dir="$BARE" update-ref -d "$preserve" 2>/dev/null || true
-    [ -n "$work" ] && rm -rf "$work"
+    echo "exit:0" > "$dir/status"; [ -n "$work" ] && rm -rf "$work"
     log "$group: nothing to tear down for $slug"; return 0
   fi
 
-  # --- 3) secrets: prefer the tree's secrets file, else the persisted copy ---
-  envfile=""
-  local secsrc=""
+  secsrc=""
   [ -n "$work" ] && [ -f "$work/ci/secrets.enc.yaml" ] && secsrc="$work/ci/secrets.enc.yaml"
-  [ -z "$secsrc" ] && [ -f "$ENVS/ci/secrets.enc.yaml" ] && secsrc="$ENVS/ci/secrets.enc.yaml"
+  envfile=""
   if [ -n "$secsrc" ]; then
     envfile="$(mktemp -p "${SHM_DIR:-/dev/shm}" cicd.env.XXXXXX)"
     sops -d --output-type dotenv "$secsrc" > "$envfile" 2>/dev/null || { rm -f "$envfile"; envfile=""; }
   fi
 
-  # Retry per the delete job's `retries:` (default DEFAULT_RETRIES) — guards against
-  # intermittent network blips. After that it's the operator's problem: notify (unless
-  # notify: off) + KEEP ref/state, NO further auto-retry (reap-envs skips teardown-failed).
-  mkdir -p "$ENVS"
-  local max=$(( 1 + retries )) try rc
-  for try in $(seq 1 "$max"); do
-    log "$group: teardown $slug (mode=$([ -n "$work" ] && echo full-tree || echo minimal) attempt=$try/$max)"
-    { echo "=== teardown attempt $try/$max $(_ts) ==="; } >> "$dir/output.log"
-    date -u +%s > "$ENVS/last_attempt"
-    timeout --kill-after=30 "${DEFAULT_TIMEOUT}" \
-      docker run --rm --init --name "${name}-$try" \
-        --cap-drop ALL --security-opt no-new-privileges \
-        --pids-limit "$DEFAULT_PIDS" --memory "$DEFAULT_MEMORY" --network "$DEFAULT_NETWORK" \
-        --label cicd=1 --label "cicd.group=$group" \
-        -e CI_EVENT=delete -e CI_REPO="$repo" -e CI_BRANCH="$branch" \
-        -e CI_BRANCH_SLUG="$slug" -e CI_PUSHER="$pusher" \
-        -e CI_ENV_DIR=/envstate -v "$ENVS:/envstate" \
-        "${mountwork[@]}" \
-        ${envfile:+--env-file "$envfile"} \
-        "$image" sh -c "$runcmd" \
-        >>"$dir/output.log" 2>&1
-    rc=$?
-    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "${name}-$try" >/dev/null 2>&1 || true; rc=1; fi
-    [ "$rc" -eq 0 ] && break
-    if [ "$try" -lt "$max" ]; then
-      log "$group: teardown attempt $try failed (exit $rc) — retry $((try+1))/$max in ${rdelay}s"
-      sleep "$rdelay"
-    fi
-  done
+  mkdir -p "$ENVS"; outdir="$dir/cicd-out"; mkdir -p "$outdir"
+  date -u +%s > "$ENVS/last_attempt"
+  local tlimits=()
+  [ "${RESOURCE_LIMITS:-1}" = "1" ] && tlimits=(--pids-limit "$DEFAULT_PIDS" --memory "$DEFAULT_MEMORY")
+  log "$group: teardown $slug (mode=$([ -n "$work" ] && echo full-tree || echo minimal))"
+  timeout --kill-after=30 "${DEFAULT_TIMEOUT}" \
+    docker run --rm --init --name "$name" \
+      --cap-drop ALL --security-opt no-new-privileges \
+      "${tlimits[@]}" --network "$DEFAULT_NETWORK" \
+      --label cicd=1 --label "cicd.group=$group" \
+      -e CI_EVENT=delete -e CI_REPO="$repo" -e CI_BRANCH="$branch" \
+      -e CI_BRANCH_SLUG="$slug" -e CI_PUSHER="$pusher" \
+      -e CI_ENV_DIR=/envstate -v "$ENVS:/envstate" \
+      -e CI_OUTBOX=/cicd/out/notify \
+      -v "$RUNNER_BASE/lib/cicd.sh:/cicd/lib.sh:ro" -v "$outdir:/cicd/out" \
+      "${mountwork[@]}" \
+      ${envfile:+--env-file "$envfile"} \
+      "$image" sh -c "$runcmd" \
+      >>"$dir/output.log" 2>&1
+  rc=$?
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; rc=1; fi
   echo "exit:$rc" > "$dir/status"; ln -sfn "$dir" "$RUNS/latest"
 
   if [ "$rc" -eq 0 ]; then
-    git --git-dir="$BARE" update-ref -d "$preserve" 2>/dev/null || true   # release objects -> gc may reclaim
-    rm -rf "$ENVS"                                                        # env destroyed; clear state + cache
+    cicd_flush_outbox "$outdir/notify" 0 "$dir" "$group teardown" "$envfile"
+    rm -rf "$ENVS"                                    # env destroyed; state + source.tar gone
+    [ -n "$srctar" ] && [ "$srctar" = "$INC/$oldrev.tar" ] && rm -f "$INC/$oldrev.tar" "$INC/$oldrev.changed"
     log "$group: teardown done"
   else
-    # exhausted retries -> hand to the operator. KEEP preserve ref + env state.
-    printf 'exit:%s after %s attempt(s) @ %s\nlog: %s\n' "$rc" "$max" "$(_ts)" "$dir/output.log" \
-      > "$ENVS/teardown-failed"
-    [ "$notify" != "off" ] && notify_failure "$group teardown" "FAILED after $max attempt(s) — NEEDS OPERATOR (ci-teardown retry|abandon)" "$dir/output.log" "$envfile"
-    log "$group: teardown FAILED after $max attempt(s) — ref+state KEPT, no auto-retry"
+    # KEEP the tree + state for operator retry — copy the delivered tar into the env dir.
+    [ -n "$srctar" ] && cp -f "$srctar" "$ENVS/source.tar" 2>/dev/null || true
+    printf '%s' "$branch" > "$ENVS/branch"
+    printf 'exit:%s @ %s\nlog: %s\n' "$rc" "$(_ts)" "$dir/output.log" > "$ENVS/teardown-failed"
+    cicd_flush_outbox "$outdir/notify" "$rc" "$dir" "$group teardown NEEDS OPERATOR (ci-teardown)" "$envfile"
+    log "$group: teardown FAILED ($rc) — source+state KEPT, no auto-retry"
   fi
   [ -n "$envfile" ] && rm -f "$envfile"
   [ -n "$work" ] && rm -rf "$work"
   return "$rc"
 }
 
-# Process one create/push target: checkout, match jobs, run them.
+# Process one create/push target from the delivered tar.
 process_build() {  # <event> <newrev> <oldrev> <pusher>
   local event="$1" newrev="$2" oldrev="$3" pusher="$4"
-  local work manifest changed any=1
+  local work manifest changed any=1 srctar
+  srctar="$INC/$newrev.tar"
+  [ -f "$srctar" ] || { log "$group: no delivered source for $newrev (incoming missing)"; return 1; }
   work="$(mktemp -d)"
-  if ! git --git-dir="$BARE" archive "$newrev" | tar -x -C "$work" 2>/dev/null; then
-    log "$group: checkout $newrev failed"; rm -rf "$work"; return 1
+  if ! tar -x -C "$work" -f "$srctar" 2>/dev/null; then
+    log "$group: extract $srctar failed"; rm -rf "$work"; return 1
   fi
   manifest="$work/.gitolite/ci.yml"
   [ -f "$manifest" ] || { log "$group: no .gitolite/ci.yml at $newrev"; rm -rf "$work"; return 0; }
-  changed="$(git_changed "$event" "$newrev" "$oldrev")"
+  changed="$(cat "$INC/$newrev.changed" 2>/dev/null)"   # computed by the hook (git side)
 
   local job inc ign pinc pign
   for job in $(yq_keys "$manifest" ".jobs"); do
-    # does this job declare the current event?
     [ -n "$(yq_str "$manifest" ".jobs.\"$job\".on.$event")" ] || continue
     inc="$(yq_list "$manifest" ".jobs.\"$job\".on.$event.branches")"
     ign="$(yq_list "$manifest" ".jobs.\"$job\".on.$event.\"branches-ignore\"")"
@@ -299,10 +276,10 @@ process_build() {  # <event> <newrev> <oldrev> <pusher>
     execute_job "$job" "$event" "$newrev" "$pusher" "$work" "$manifest"
   done
 
-  # persist teardown plan (so a future branch-delete can tear this env down)
-  persist_env_for_teardown "$work" "$manifest"
+  persist_env_for_teardown "$work" "$manifest" "$srctar"   # branch + source.tar for future teardown
   [ "$any" -ne 0 ] && log "$group: no jobs matched $event on $branch"
   rm -rf "$work"
+  rm -f "$INC/$newrev.tar" "$INC/$newrev.changed"          # consumed
   return 0
 }
 
@@ -311,29 +288,27 @@ last=""
 while :; do
   [ -f "$Q/target" ] || break
   target="$(cat "$Q/target")"
-  [ "$target" = "$last" ] && break          # nothing new -> done
+  [ "$target" = "$last" ] && break
   read -r event newrev oldrev pusher <<< "$target"
   pusher="${pusher:-unknown}"
 
   case "$event" in
-    delete)
-      run_teardown "$oldrev" "$pusher"
-      ;;
+    delete) run_teardown "$oldrev" "$pusher" ;;
     create|push)
-      # delete-supersedes: if a delete landed while we were about to build, skip to it
       if [ "${DELETE_SUPERSEDES:-1}" = "1" ]; then
         nxt="$(cat "$Q/target")"; read -r nev _ _ _ <<< "$nxt"
         [ "$nev" = "delete" ] && { last=""; continue; }
       fi
-      process_build "$event" "$newrev" "$oldrev" "$pusher"
-      ;;
-    *) log "$group: unknown event '$event'";;
+      process_build "$event" "$newrev" "$oldrev" "$pusher" ;;
+    *) log "$group: unknown event '$event'" ;;
   esac
 
   last="$target"
-  # coalesce: loop re-reads target; if a newer push arrived during the run, run newest,
-  # skipping intermediates. Stable target -> loop exits at the top.
 done
 
-printf '%s\n' "$last" > "$Q/last"   # crash-recovery marker (ci-recover compares to target)
+# prune stale incoming tars for this group (intermediates skipped by coalesce)
+find "$INC" -maxdepth 1 -type f -name '*.tar' -mmin +60 -delete 2>/dev/null || true
+find "$INC" -maxdepth 1 -type f -name '*.changed' -mmin +60 -delete 2>/dev/null || true
+
+printf '%s\n' "$last" > "$Q/last"
 log "$group: idle"
