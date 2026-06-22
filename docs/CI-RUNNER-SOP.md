@@ -24,20 +24,25 @@ If a deploy "silently didn't happen," first check: did the box reboot? → run
 
 ## 1. Conventions — where everything lives
 
+> **Authoritative source:** the scripts + paths live in the repo `cicd-runner/`
+> and are laid down by `cicd-runner/install.sh` (which reads `runner.conf`).
+> User = **`cicd-runner`**, base = **`/home/cicd-runner/runner`**.
+
 | Thing | Path |
 |---|---|
-| Runner user | `ci` (home `/home/ci`) |
-| Runner base | `/home/ci/ci/` |
-| Job queue | `/home/ci/ci/queue/<repo>/<branch>/` |
-| Run logs/history | `/home/ci/ci/runs/<repo>/<branch>/<ts>-<sha>/` |
-| Per-repo dep cache | `/home/ci/ci/cache/<repo>/` |
-| Ephemeral env state | `/home/ci/ci/envs/<repo>/<slug>/` |
+| Runner user | `cicd-runner` (home `/home/cicd-runner`) |
+| Runner base | `/home/cicd-runner/runner/` (= `$RUNNER_BASE`) |
+| Job queue | `$RUNNER_BASE/queue/<repo>/<branch>/` |
+| Run logs/history | `$RUNNER_BASE/runs/<repo>/<branch>/<ts>-<sha>-<job>/` |
+| Per-repo dep cache | `$RUNNER_BASE/cache/<repo>/` (`npm/`, `nm/`) |
+| Ephemeral env state | `$RUNNER_BASE/envs/<repo>/<slug>/` |
 | **Encrypted runner key (at rest)** | `/etc/ci/age-key.gpg` |
 | **Decrypted runner key (RAM only)** | `/run/ci-keys/age-keys.txt` (ramfs) |
+| Config | `/etc/cicd-runner/runner.conf` (hook reads this) or `$RUNNER_BASE/etc/runner.conf` |
 | Per-repo secrets (in git) | `<repo>/ci/secrets.enc.yaml` |
 | sops recipients config (in git) | `<repo>/.sops.yaml` |
 | Hook (gitolite) | `~git/local/hooks/common/post-receive` |
-| Runner scripts | `/home/ci/ci/bin/` (`run-group.sh`, `unlock-ci`, `ci-status`) |
+| Runner scripts | `$RUNNER_BASE/bin/` (`run-group.sh`, `unlock-ci`, `ci-status`, reapers…) |
 
 Key fact: **decrypt happens on the host; only decrypted VALUES enter the
 container.** The age key never enters a build container.
@@ -50,11 +55,14 @@ Do this once per VPS. Order matters.
 
 ### 2.1 Packages (Gentoo, as root)
 ```bash
-emerge --ask app-crypt/age app-crypt/gnupg
+emerge --ask app-crypt/age app-crypt/gnupg sys-apps/util-linux   # age, gpg, flock
 # sops: pin static binary (not in main tree)
 curl -LO https://github.com/getsops/sops/releases/download/v3.13.1/sops-v3.13.1.linux.amd64
 install -m755 sops-v3.13.1.linux.amd64 /usr/local/bin/sops
-sops --version && age --version
+# yq (mikefarah v4): pin static binary (manifest parsing)
+curl -L -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+chmod +x /usr/local/bin/yq
+sops --version && age --version && yq --version && flock --version
 ```
 
 ### 2.2 Runner user + rootless docker
@@ -78,13 +86,19 @@ mount /run/ci-keys
 chown ci:ci /run/ci-keys && chmod 700 /run/ci-keys
 ```
 
-### 2.4 Runner directories + scripts
+### 2.4 Runner directories + scripts (via install.sh)
 ```bash
-sudo -iu ci mkdir -p ~/ci/{queue,runs,cache,envs,secrets,slots,bin}
-# copy run-group.sh, unlock-ci, ci-status into ~ci/ci/bin and chmod +x
-# create N slot files for the global concurrency cap:
-sudo -iu ci bash -c 'for i in $(seq 1 4); do : > ~/ci/slots/$i; done'
+# as the cicd-runner user, after rootless docker works:
+sudo -iu cicd-runner bash -lc '
+  git clone <this-repo> ~/src && cd ~/src/cicd-runner && ./install.sh
+'
+# review the generated config, then make it readable by the git user (the hook runs as git):
+sudo -iu cicd-runner sh -c 'cat ~/runner/etc/runner.conf'
+install -Dm644 /home/cicd-runner/runner/etc/runner.conf /etc/cicd-runner/runner.conf
 ```
+`install.sh` creates `queue/ runs/ cache/ envs/ slots/ bin/`, copies all scripts,
+seeds the concurrency slot files (`MAX_JOBS`), fills `DOCKER_HOST` with the user's
+UID, and runs a dependency preflight (yq/sops/age/docker/flock).
 
 ### 2.5 Generate THIS host's runner age key (see §7 for the encrypt+enroll flow)
 ```bash
@@ -99,10 +113,14 @@ Then add the new `age1vps...` pubkey to each repo's `.sops.yaml` and run
 ### 2.6 gitolite hook
 ```bash
 # enable LOCAL_CODE in ~git/.gitolite.rc:  LOCAL_CODE => "$ENV{HOME}/local",
-# place post-receive in ~git/local/hooks/common/  (guards on $GL_REPO + ci.yml)
-chmod +x ~git/local/hooks/common/post-receive
+install -Dm755 /home/cicd-runner/runner/bin/post-receive ~git/local/hooks/common/post-receive
+# the hook (runs as the git user) must find the runner; it defaults to
+# /home/cicd-runner/runner. Override if RUNNER_BASE differs by exporting CICD_BASE
+# for the git user's environment (e.g. in ~git/.bashrc or a gitolite ENV passthrough).
 sudo -iu git gitolite setup --hooks-only
 ```
+The hook reads `/etc/cicd-runner/runner.conf` (step 2.4) — ensure it's world-readable
+or at least readable by the git user (it contains no secrets, only paths/limits).
 
 ### 2.7 Maintenance crons (§9)
 Install the reaper + prune + orphaned-env crons. See §9.
@@ -274,20 +292,20 @@ key after reboot is the #1 cause of "nothing happened."
 
 ## 9. Routine maintenance (crons — set once, verify occasionally)
 
+Install the bundled crontab (as `cicd-runner`):
 ```bash
-# container reaper (every 10 min): kill leaked/dead containers, free slots
-*/10 * * * * docker ps -aq --filter label=ci=1 --filter status=exited --filter status=dead | xargs -r docker rm --volumes
-
-# disk guard + prune (daily): never let /var/lib/docker fill
-0 4 * * * docker builder prune --keep-storage 10g --filter until=48h -f; docker image prune -f
-
-# orphaned ephemeral envs (daily): tear down envs whose branch is gone (§14)
-0 5 * * * /home/ci/ci/bin/reap-envs.sh
-
-# run-log retention (daily): keep history bounded
-0 5 * * * find /home/ci/ci/runs -maxdepth 3 -type d -mtime +30 -exec rm -rf {} +
+crontab /home/cicd-runner/src/cicd-runner/crontab.sample
+crontab -l        # verify
 ```
-Verify quarterly: `docker system df`, `df -h /var/lib/docker`, crons still listed.
+It wires the named scripts (each sources `runner.conf`):
+- `*/10 * * * * reap-containers` — kill leaked/dead/runaway containers, free slots
+- `0 4 * * * prune-disk` — docker prune (capped) + run-log retention + disk guard
+- `0 5 * * * reap-envs` — tear down ephemeral envs whose branch is gone (§14)
+- `@reboot ci-recover` — re-run targets never processed (note: secret-using jobs
+  fail until `unlock-ci`)
+
+Verify quarterly: `docker system df`, `df -h $(docker info -f '{{.DockerRootDir}}')`,
+`crontab -l`.
 
 ---
 
@@ -360,10 +378,22 @@ ls -l /usr/bin/newuidmap                          # expect -rwsr-xr-x
 # 3. subuid/subgid
 usermod --add-subuids 100000-165535 --add-subgids 100000-165535 ci
 
-# 4. Disable any system docker + sysctl
-rm -f /var/run/docker.sock
+# 4. sysctl
 printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/90-rootless-docker.conf && sysctl --system
 ```
+
+> **Rootful + rootless side by side is supported** — separate daemons, sockets,
+> storage, network. Disabling the system docker (the `rm -f /var/run/docker.sock`
+> + `systemctl disable`/`rc-update del docker` in the variants below) is OPTIONAL
+> — do it only for a dedicated rootless-only box. If you keep rootful for other
+> workloads, leave it running.
+>
+> **CRITICAL SECURITY RULE when both run:** the `ci` user must reach ONLY the
+> rootless socket. **Never add `ci` to the `docker` group** (= access to the root
+> daemon's socket = root-equivalent, defeats rootless). Keep `ci`'s `DOCKER_HOST`
+> on `/run/user/<uid>/docker.sock`. Toggle which daemon the CLI targets with
+> `docker context use rootless` / `docker context use default`. Run §9 prune
+> crons against BOTH contexts (each has its own image store).
 
 ### Variant A — systemd
 ```bash
@@ -415,6 +445,33 @@ rc-update add docker-rootless-ci default && rc-service docker-rootless-ci start
 (elogind alternative: `emerge sys-auth/elogind`, `rc-update add elogind boot`, then
 a per-user OpenRC 0.60 user service — but the system-level service above needs no
 elogind and no user session.)
+
+### elogind activation (only if you chose the elogind route, not Variant B)
+`XDG_RUNTIME_DIR` is set by `pam_elogind.so` at session-open, which also creates
+`/run/user/<uid>`. Requires ALL three: elogind running + `pam_elogind` in the PAM
+stack + a FRESH login. The current shell never gets it retroactively.
+
+**Silent gotcha:** `pam_elogind` is only wired in if `sys-libs/pambase` was built
+with the `elogind` USE flag. If you emerged elogind AFTER pambase, the session
+line is missing → `XDG_RUNTIME_DIR` never sets, no matter how often you re-login.
+```bash
+rc-update add dbus default && rc-service dbus start          # elogind needs dbus
+grep -rl pam_elogind /etc/pam.d/ || {                        # ensure pambase has it
+  echo 'sys-libs/pambase elogind' >> /etc/portage/package.use/elogind
+  emerge -1 sys-libs/pambase; }
+rc-update add elogind boot && rc-service elogind start
+# then LOG OUT + back in (fresh SSH session), or reboot (cleanest on a fresh VPS):
+echo $XDG_RUNTIME_DIR        # → /run/user/<uid>;  loginctl  → lists session
+```
+
+**For the `ci` service user (never logs in interactively):** a fresh login won't
+happen, and `sudo -iu ci` isn't a reliable elogind session. So either:
+- `loginctl enable-linger ci` → elogind creates + PERSISTS `/run/user/<uid>` at
+  boot without any login (`ls -ld /run/user/$(id -u ci)` to confirm), OR
+- **use Variant B**, which pre-creates `/run/user/<uid>` (`/etc/local.d`) and sets
+  `XDG_RUNTIME_DIR` in the service args — no elogind needed at all.
+
+Rule of thumb: Variant B = no elogind. elogind route = must `enable-linger ci`.
 
 ### Optional — cgroup v2 delegation (enables --memory/--pids-limit under rootless OpenRC)
 ```bash

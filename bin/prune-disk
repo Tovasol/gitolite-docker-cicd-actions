@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# prune-disk — cron (daily). Keep /var/lib (rootless: ~/.local/share/docker) and
+# run-log history from filling the box. DESIGN §10.3. Never `system prune -a`.
+set -uo pipefail
+CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
+# shellcheck disable=SC1090
+. "$CICD_BASE/bin/lib.sh"; cicd_load_config
+[ -n "${DOCKER_HOST:-}" ] && export DOCKER_HOST
+
+# build cache (capped) + dangling images + stopped containers
+docker builder prune --keep-storage 10g --filter until=48h -f >/dev/null 2>&1 || true
+docker image prune -f >/dev/null 2>&1 || true
+docker container prune -f --filter until=1h >/dev/null 2>&1 || true
+
+# run-log retention
+find "$RUNNER_BASE/runs" -maxdepth 3 -type d -mtime "+${LOG_RETENTION_DAYS:-30}" \
+  -name '20*' -exec rm -rf {} + 2>/dev/null || true
+
+# emergency disk guard: if docker data dir > 90%, prune harder
+ddir="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)"; ddir="${ddir:-$HOME/.local/share/docker}"
+use="$(df --output=pcent "$ddir" 2>/dev/null | tail -1 | tr -dc '0-9')"
+if [ -n "$use" ] && [ "$use" -gt 90 ]; then
+  log "prune-disk: $ddir at ${use}% — aggressive prune"
+  docker image prune -af --filter until=24h >/dev/null 2>&1 || true
+  docker builder prune --keep-storage 3g -f >/dev/null 2>&1 || true
+fi

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# unlock-ci — run once per reboot. Decrypts the GPG-protected age key into the
+# ramfs key dir (cleared on reboot). After this, CI decrypts unattended until
+# the next reboot. See DESIGN §25.
+set -euo pipefail
+CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
+# shellcheck disable=SC1090
+. "$CICD_BASE/bin/lib.sh"; cicd_load_config
+
+ENC="${CICD_AGE_ENC:-/etc/ci/age-key.gpg}"
+DEST="$SOPS_AGE_KEY_FILE"
+DDIR="$(dirname "$DEST")"
+
+[ -f "$ENC" ] || die "encrypted key not found: $ENC"
+mountpoint -q "$DDIR" || log "WARN: $DDIR is not a mountpoint (expected ramfs) — check /etc/fstab"
+
+export GPG_TTY="${GPG_TTY:-$(tty || true)}"
+umask 077
+gpg --decrypt "$ENC" > "$DEST"
+chmod 600 "$DEST"
+log "age key loaded into $DEST (ramfs; clears on reboot)"

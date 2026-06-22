@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# reap-envs — cron (daily). Tear down ephemeral envs whose branch no longer exists
+# (a delete push was missed, or branch deleted server-side). DESIGN §14 GC.
+set -uo pipefail
+CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
+# shellcheck disable=SC1090
+. "$CICD_BASE/bin/lib.sh"; cicd_load_config
+
+[ -d "$RUNNER_BASE/envs" ] || exit 0
+find "$RUNNER_BASE/envs" -maxdepth 2 -mindepth 2 -type d 2>/dev/null | while read -r envdir; do
+  meta="$envdir/meta.json"; [ -f "$meta" ] || continue
+  repo="$(yq_str "$meta" '.repo')"; branch="$(yq_str "$meta" '.branch')"
+  bare="$GIT_REPO_BASE/$repo.git"
+  # still a live branch? leave it.
+  git --git-dir="$bare" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null && continue
+
+  # This is a MISSED-DELETE catcher (branch removed server-side, no hook event),
+  # NOT a retry mechanism. If a teardown already ran and FAILED, the operator owns
+  # it (notified) — do not auto-retry. Skip anything already marked failed.
+  [ -f "$envdir/teardown-failed" ] && continue
+
+  log "reap-envs: $repo/$branch is gone, no prior teardown — triggering teardown $envdir"
+  # write a delete target FIRST (cached teardown.cmd handles the zero oldrev), then run.
+  q="$RUNNER_BASE/queue/$repo/$branch"; mkdir -p "$q"
+  printf 'delete 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 reaper\n' > "$q/target.tmp"
+  mv -f "$q/target.tmp" "$q/target"
+  setsid "$CICD_BASE/bin/run-group.sh" "$repo" "$branch" </dev/null >>"$CICD_BASE/runner.log" 2>&1 &
+done
+
+# Sweep orphaned preservation refs: a refs/cicd/preserve/<slug> with no matching
+# env dir means teardown already succeeded (and ref-delete was missed) or the env
+# was removed out-of-band — either way the held objects can be released.
+find "$GIT_REPO_BASE" -type d -name '*.git' 2>/dev/null | while read -r bare; do
+  repo="${bare#"$GIT_REPO_BASE"/}"; repo="${repo%.git}"
+  git --git-dir="$bare" for-each-ref --format='%(refname)' refs/cicd/preserve/ 2>/dev/null \
+  | while read -r ref; do
+      slug="${ref#refs/cicd/preserve/}"
+      [ -d "$RUNNER_BASE/envs/$repo/$slug" ] && continue    # active env -> main loop handles it
+      git --git-dir="$bare" update-ref -d "$ref" 2>/dev/null || true
+      log "reap-envs: dropped orphan preserve ref $repo $ref"
+    done
+done

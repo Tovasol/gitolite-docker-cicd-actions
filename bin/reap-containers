@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# reap-containers — cron (every ~10 min). Remove leaked/dead cicd containers and
+# any that outlived the max timeout (runner crash backstop). DESIGN §10.1.
+set -uo pipefail
+CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
+# shellcheck disable=SC1090
+. "$CICD_BASE/bin/lib.sh"; cicd_load_config
+[ -n "${DOCKER_HOST:-}" ] && export DOCKER_HOST
+
+# exited + dead (OOM-killed) labelled containers
+docker ps -aq --filter label=cicd=1 --filter status=exited \
+  | xargs -r docker rm --volumes >/dev/null 2>&1 || true
+docker ps -aq --filter label=cicd=1 --filter status=dead \
+  | xargs -r docker rm --volumes >/dev/null 2>&1 || true
+
+# still-running but older than (max timeout + grace): runaway -> force kill
+max=$(( ${DEFAULT_TIMEOUT:-900} + 120 ))
+now=$(date +%s)
+for cid in $(docker ps -q --filter label=cicd=1 2>/dev/null); do
+  started=$(docker inspect -f '{{.State.StartedAt}}' "$cid" 2>/dev/null) || continue
+  s=$(date -d "$started" +%s 2>/dev/null) || continue
+  [ $(( now - s )) -gt "$max" ] && { docker rm -f "$cid" >/dev/null 2>&1 || true; log "reaped runaway $cid"; }
+done

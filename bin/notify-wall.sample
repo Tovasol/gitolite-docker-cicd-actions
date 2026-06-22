@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Sample NOTIFY_CMD. Args: <group> <status> <logpath>. Wire via runner.conf:
+#   NOTIFY_CMD="/home/cicd-runner/runner/bin/notify-wall.sample"
+# Replace with email/webhook/ntfy as desired. Must exit 0 and never block.
+group="$1"; status="$2"; logpath="$3"
+printf 'CI FAILURE: %s [%s]\n  log: %s\n  tail:\n%s\n' \
+  "$group" "$status" "$logpath" "$(tail -n 15 "$logpath" 2>/dev/null)" | wall 2>/dev/null
+exit 0

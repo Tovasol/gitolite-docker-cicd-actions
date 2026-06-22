@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# notify-email — NOTIFY_CMD handler: emails CI failures via Gmail SMTP using curl
+# (no extra packages). Args: <group> <status> <logpath>.
+#
+# Per-project OR operator-global, with per-variable precedence:
+#   1) the project's decrypted secrets (CICD_NOTIFY_ENV, set by the runner from the
+#      repo's sops ci/secrets.enc.yaml)  -- repo carries its own email config
+#   2) the host default /etc/cicd-runner/notify.env                  -- operator fallback
+# Reads the SAME var names Plausible CE uses (so you can reuse that config):
+#   SMTP_HOST_ADDR / SMTP_HOST_PORT / SMTP_USER_NAME / SMTP_USER_PWD / MAILER_EMAIL
+# Generic aliases also accepted: SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / NOTIFY_TO
+# A project opts in simply by including these keys in its encrypted secrets (+ notify:
+# on-failure in ci.yml). Must never block or fail the runner — short timeout, exit 0.
+set -uo pipefail
+
+group="${1:-?}"; status="${2:-?}"; logpath="${3:-}"
+PROJ="${CICD_NOTIFY_ENV:-}"
+HOST_DEF="/etc/cicd-runner/notify.env"
+
+# getval KEY FILE — extract KEY=val from a dotenv/KEY=VAL file (no sourcing; quote-safe)
+getval() {
+  [ -n "$2" ] && [ -f "$2" ] || return 0
+  grep -m1 -E "^[[:space:]]*$1=" "$2" 2>/dev/null \
+    | sed -E "s/^[[:space:]]*$1=//; s/^[\"']//; s/[\"']$//"
+}
+# read_var KEY [ALIAS] — project file first, then host default, trying KEY then ALIAS
+read_var() {
+  local v
+  for f in "$PROJ" "$HOST_DEF"; do
+    v="$(getval "$1" "$f")"; [ -n "$v" ] && { printf '%s' "$v"; return; }
+    [ -n "${2:-}" ] && { v="$(getval "$2" "$f")"; [ -n "$v" ] && { printf '%s' "$v"; return; }; }
+  done
+}
+
+HOST="$(read_var SMTP_HOST_ADDR SMTP_HOST)"; HOST="${HOST:-smtp.gmail.com}"
+PORT="$(read_var SMTP_HOST_PORT SMTP_PORT)"; PORT="${PORT:-587}"
+USER="$(read_var SMTP_USER_NAME SMTP_USER)"
+PASS="$(read_var SMTP_USER_PWD  SMTP_PASS)"
+TO="$(read_var NOTIFY_TO MAILER_EMAIL)"; [ -z "$TO" ] && TO="$USER"
+FROM="$(read_var MAILER_EMAIL NOTIFY_FROM)"; FROM="${FROM:-$USER}"
+[ -n "$USER" ] && [ -n "$PASS" ] && [ -n "$TO" ] || exit 0   # not configured -> skip silently
+
+# scheme by port: 465 = implicit TLS (smtps); else STARTTLS on smtp:// (587/25)
+if [ "$PORT" = "465" ]; then url="smtps://$HOST:$PORT"; else url="smtp://$HOST:$PORT"; fi
+
+hn="$(hostname 2>/dev/null || echo vps)"
+tail_log="$(tail -n 30 "$logpath" 2>/dev/null)"
+msg="$(printf 'From: cicd-runner <%s>\r\nTo: %s\r\nSubject: [CI FAIL] %s (%s)\r\nDate: %s\r\n\r\nhost:   %s\ngroup:  %s\nstatus: %s\nlog:    %s\n\n--- last 30 log lines ---\n%s\r\n' \
+  "$FROM" "$TO" "$group" "$status" "$(date -R 2>/dev/null)" \
+  "$hn" "$group" "$status" "$logpath" "$tail_log")"
+
+curl --silent --show-error --max-time 25 --ssl-reqd \
+  --url "$url" --user "$USER:$PASS" \
+  --mail-from "$FROM" --mail-rcpt "$TO" \
+  --upload-file <(printf '%s' "$msg") >/dev/null 2>&1 || true
+exit 0

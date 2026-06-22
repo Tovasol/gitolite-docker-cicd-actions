@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# ci-recover — startup sweep. Re-trigger any group whose newest target was never
+# processed (runner died after enqueue but before/after the run). Run at boot AND
+# right after unlock-ci. See DESIGN §10.6.
+set -uo pipefail
+CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
+# shellcheck disable=SC1090
+. "$CICD_BASE/bin/lib.sh"; cicd_load_config
+
+find "$RUNNER_BASE/queue" -name target 2>/dev/null | while read -r t; do
+  g="$(dirname "$t")"; group="${g#$RUNNER_BASE/queue/}"
+  [ "$(cat "$t" 2>/dev/null)" = "$(cat "$g/last" 2>/dev/null)" ] && continue
+  repo="${group%/*}"; branch="${group##*/}"
+  log "recover: re-triggering $group"
+  setsid "$CICD_BASE/bin/run-group.sh" "$repo" "$branch" </dev/null >>"$CICD_BASE/runner.log" 2>&1 &
+done

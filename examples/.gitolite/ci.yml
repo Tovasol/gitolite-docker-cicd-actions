@@ -1,0 +1,63 @@
+# cicd-runner pipeline manifest — drop at the repo root as .gitolite/ci.yml.
+# Presence of this file = opt-in. Branch/path filtering mirrors GitHub Actions
+# `on:` semantics: `*` matches within a path/branch segment, `**` across `/`.
+#
+# Events:
+#   push    -> commits pushed to an existing branch   (newrev/oldrev real)
+#   create  -> a new branch first appears             (oldrev = 000…)
+#   delete  -> a branch is deleted                     (newrev = 000…) -> teardown
+#
+# Injected into every job (env vars): CI_EVENT, CI_REPO, CI_BRANCH,
+# CI_BRANCH_SLUG (DNS-safe), CI_SHA, CI_PUSHER, CI_CACHE_DIR, CI_ENV_DIR.
+# Secrets: this repo's ci/secrets.enc.yaml is sops-decrypted and injected as env.
+
+version: 1
+
+jobs:
+
+  # ── production: deploy only when site/ changes on main ───────────────────────
+  deploy-site:
+    on:
+      push:
+        branches: [main]
+        paths: ["site/**"]
+    image: node:20-alpine
+    secrets: [cloudflare]
+    timeout: 900
+    network: bridge
+    retries: 2              # optional: auto-retry on failure (clamped to MAX_RETRIES). default 0
+    retry-delay: 20         # optional: seconds between attempts. default 15
+    notify: on-failure      # optional: on-failure (default) | off. emails via SMTP creds in secrets / host default
+    run: sh ci/deploy-site.sh
+
+  # ── preview envs: every feature/experiment branch, on create AND push ────────
+  preview:
+    on:
+      create:
+        branches: ["feat/*", "exp/*", "preview/**"]
+      push:
+        branches: ["feat/*", "exp/*", "preview/**"]
+        paths: ["site/**"]
+    image: node:20-alpine
+    secrets: [cloudflare]
+    run: sh ci/preview-deploy.sh     # idempotent create-or-update; names resources off CI_BRANCH_SLUG
+
+  # ── teardown: when one of those branches is deleted ──────────────────────────
+  preview-teardown:
+    on:
+      delete:
+        branches: ["feat/*", "exp/*", "preview/**"]
+    image: node:20-alpine
+    secrets: [cloudflare]
+    retries: 1               # one retry for transient API errors; then operator (ci-teardown)
+    notify: on-failure
+    run: sh ci/preview-teardown.sh   # full tree at /work (preserve ref), state at CI_ENV_DIR
+
+  # ── example of branches-ignore + paths-ignore (optional knobs) ───────────────
+  # lint:
+  #   on:
+  #     push:
+  #       branches-ignore: ["wip/**"]
+  #       paths-ignore: ["**/*.md", "docs/**"]
+  #   image: node:20-alpine
+  #   run: sh ci/lint.sh

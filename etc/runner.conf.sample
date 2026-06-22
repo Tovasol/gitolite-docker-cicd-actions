@@ -1,0 +1,55 @@
+# cicd-runner configuration — copy to /etc/cicd-runner/runner.conf (or
+# $RUNNER_BASE/etc/runner.conf) and edit. Sourced by every script.
+# Plain shell; no spaces around '='.
+
+# --- identity / paths ---
+RUNNER_USER=cicd-runner
+RUNNER_BASE=/home/cicd-runner/runner          # queue/, runs/, cache/, envs/, slots/
+GIT_REPO_BASE=/home/git/repositories          # gitolite bare repos live here (<repo>.git)
+
+# --- secrets (sops + age) ---
+# The age private key, decrypted into ramfs by `unlock-ci` (cleared on reboot).
+SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt
+SHM_DIR=/dev/shm                              # tmpfs for transient decrypted env-files
+
+# --- concurrency ---
+MAX_JOBS=4                                     # global cap on simultaneous docker runs
+SLOT_WAIT_SECS=2                               # poll interval while waiting for a slot
+
+# --- defaults (overridable per-job in .gitolite/ci.yml) ---
+DEFAULT_IMAGE=node:20-alpine
+DEFAULT_TIMEOUT=900                            # seconds; wall-clock kill
+DEFAULT_MEMORY=2g
+DEFAULT_PIDS=512
+DEFAULT_NETWORK=bridge                         # bridge | none
+
+# --- trust / caching ---
+# Space- or comma-separated branch globs allowed to WRITE the shared node_modules
+# result cache (the integrity-checked npm store is shared by all; see DESIGN §18).
+TRUSTED_BRANCHES="main release/*"
+
+# --- behavior ---
+CANCEL_IN_PROGRESS=0                           # 1 = a new push kills the running job; 0 = coalesce
+LOG_RETENTION_DAYS=30
+DELETE_SUPERSEDES=1                            # a branch-delete cancels/overrides a pending deploy
+
+# --- per-job retries + notification (DEFAULTS; each job may override in ci.yml) ---
+# A job may set `retries:`, `retry-delay:`, `notify:` (off|on-failure). Per-job
+# `retries` is CLAMPED to MAX_RETRIES (a typo/abuse like retries: 9999 can't pin
+# the box). A job that exhausts its retries fires NOTIFY_CMD (unless notify: off).
+# For teardown specifically, exhausting retries also KEEPS the preserve ref + env
+# state (no auto-retry; operator resolves via ci-teardown retry|abandon).
+DEFAULT_RETRIES=0             # retries after the first attempt when a job doesn't specify
+DEFAULT_RETRY_DELAY=15        # seconds between attempts
+MAX_RETRIES=5                 # hard cap on per-job retries
+
+# --- docker context (rootless) ---
+# The CLI must target the rootless daemon. Set DOCKER_HOST for the cicd-runner user.
+DOCKER_HOST=unix:///run/user/__UID__/docker.sock   # install.sh fills __UID__
+
+# --- notifications ---
+# Command run on a job's FINAL failure (after retries); args: <group> <status> <logpath>.
+# The runner also passes the job's decrypted secrets so the notifier can use
+# PER-PROJECT SMTP creds (from the repo's sops ci/secrets.enc.yaml), falling back to
+# the operator-global /etc/cicd-runner/notify.env. Handlers: notify-email, notify-wall.
+NOTIFY_CMD="/home/cicd-runner/runner/bin/notify-email"

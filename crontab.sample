@@ -1,0 +1,18 @@
+# cicd-runner crontab — install for the cicd-runner user:  crontab crontab.sample
+# Adjust the path if RUNNER_BASE differs. All scripts source runner.conf themselves.
+SHELL=/bin/bash
+CICD_BASE=/home/cicd-runner/runner
+
+# reap leaked/dead/runaway containers, free slots
+*/10 * * * * $CICD_BASE/bin/reap-containers
+
+# prune docker storage + trim old run logs (never system prune -a)
+0 4 * * *    $CICD_BASE/bin/prune-disk
+
+# tear down ephemeral envs whose branch no longer exists
+0 5 * * *    $CICD_BASE/bin/reap-envs
+
+# crash-recovery sweep at boot (re-run targets that were never processed).
+# NOTE: secrets only decrypt AFTER `unlock-ci`; @reboot recovery of secret-using
+# jobs will fail until you unlock. That's intentional (human-gated boot, §25).
+@reboot      $CICD_BASE/bin/ci-recover

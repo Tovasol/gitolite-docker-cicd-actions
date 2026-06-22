@@ -632,6 +632,67 @@ reads `state`, destroys those named resources, exits 0. Then the runner
 > oldrev, set `git config gc.pruneExpire 2.weeks.ago` and/or
 > `receive.denyDeletes`-aware GC scheduling on the bare repo to widen the window.
 
+### The PRIMARY mechanism (implemented): a server-side preservation ref
+persist-on-provision only saves `ci/` — insufficient if teardown logic needs other
+project parts (`infra/`, compose files, terraform, etc.). The robust fix gives
+teardown the **entire tree** of the deleted branch, without blocking the push:
+
+When `post-receive` fires on a delete, **the branch ref is gone but the objects
+still exist** — git auto-gc runs only *after* hooks, never mid-hook. So the hook
+instantly pins the tip under a hidden ref (no copy, ~40 bytes, invisible to normal
+clients — `refs/cicd/*` is outside `refs/heads`):
+```sh
+git update-ref refs/cicd/preserve/<slug> <oldrev>   # in post-receive, on delete
+```
+This keeps the FULL tree reachable past gc. The push returns immediately (the hook
+only pins + enqueues; teardown runs async). The runner's teardown then:
+```sh
+git archive refs/cicd/preserve/<slug> | tar -x -C $work   # whole project tree
+# run the on.delete job from $work (/work) with the state dir at /envstate
+git update-ref -d refs/cicd/preserve/<slug>               # release → gc may reclaim
+```
+
+**Two things survive a delete, two ways:**
+- **Code** (full tree) → the preserve ref (git-native, no copy).
+- **Runtime state** (provisioned URLs/IDs/ports — NOT in git) → written by the
+  deploy script to `envs/<slug>/state` on the runner. Teardown gets both: tree at
+  `/work`, state at `/envstate`.
+
+**Fallback chain (run_teardown):**
+1. preserve ref → full tree (normal `git push --delete`). ✅ primary
+2. no ref but `oldrev` objects present (gc window) → archive oldrev → full tree.
+3. neither (reap-envs for a branch deleted server-side bypassing hooks) → minimal
+   mode: persisted `ci/` + `state` only (teardown script must work from state).
+4. nothing → exit 0 + log.
+
+**Failure handling:** if teardown exits non-zero, the preserve ref AND env state
+are KEPT (not deleted) so it can be retried; success deletes both. So a failed
+teardown never strands you without the code.
+
+### Stuck-teardown lifecycle (a teardown that fails)
+Deliberately **minimal automation**: one retry for transient blips, then the
+operator owns it. No quarantine ladder, no daily auto-retry loop.
+
+1. **One automatic retry** — `run_teardown` runs the teardown up to
+   `1 + TEARDOWN_RETRIES` times (default 2 total), `TEARDOWN_RETRY_DELAY` apart.
+   Catches intermittent network errors (Cloudflare API hiccup, DNS blip).
+2. **Then: notify + stop** — if it still fails, the runner writes
+   `envs/<slug>/teardown-failed` (exit code, time, log path), fires
+   `notify_failure` (→ operator), and KEEPS the preserve ref + env state. **No
+   further automatic retry.** The full tree + runtime state stay intact for the
+   human.
+3. **`reap-envs` is a missed-delete catcher, not a retry loop** — it triggers a
+   *first* teardown only for branches deleted server-side bypassing the hook; it
+   **skips** any env already marked `teardown-failed`.
+4. **Operator resolves** — `ci-status` lists failed teardowns; `ci-teardown
+   retry <repo> <branch>` clears the marker and fires again; `ci-teardown abandon
+   <repo> <branch>` force-releases the ref + deletes env state (warning: real
+   provisioned resources are NOT auto-cleaned).
+
+So: a transient failure self-heals via the single retry; anything real lands in
+the operator's inbox and waits — the preserve ref is never auto-released, so the
+human always has the full tree to finish the job.
+
 ### Concurrency: delete supersedes deploy
 A `delete` for a group is **terminal** and must win over any in-flight or queued
 deploy for that same group:
@@ -1338,3 +1399,34 @@ The clean answer: keep Mode A and build images with **Buildah/Kaniko** — they 
 no daemon to nest, dissolving the problem rather than working around it. (Earlier
 drafts said "run docker build as a host-level step" while assuming Mode A — that
 was contradictory; host-level build = Mode B = job not containerized.)
+
+---
+
+## 27. Boundary: no job-graph — branching lives in the script
+
+Reaffirms §1 against scope creep (per-job retries + notify raised the question).
+
+- **Notify-on-failure / retries are NOT a DAG.** They're terminal per-job
+  behavior (a side-effect + an attempt loop), not job-to-job dependencies. Keep.
+- **No `on_success:` / `on_failure:` / `needs:` job fields.** Those create a job
+  graph (scheduling, dependents, fan-in, failure propagation) = a DAG = §1's
+  explicit non-goal. Do not add.
+- **Success/failure BRANCHING belongs inside the job script**, which already has
+  full shell power:
+  ```sh
+  set -e
+  if deploy_main; then smoke_test || { rollback; exit 1; }
+  else rollback; exit 1; fi
+  ```
+- **Rule:** runner = trigger → run ONE script per matched job (retries/timeout/
+  notify/secrets) → record. Any branching/chaining = inside `ci/*.sh`. A true
+  cross-job DAG (first-class job B depends on job A, B has its own dependents) →
+  adopt a real engine (§2 Laminar/forge), don't rebuild a scheduler.
+- **Test when tempted to add a job dependency:** "can this be two steps in one
+  script?" Almost always yes → do that, keep the runner dumb.
+
+### Manifest fields recap (per job)
+`on:` (push/create/delete + branches/branches-ignore/paths/paths-ignore),
+`image`, `run`, `secrets`, `timeout`, `memory`, `pids`, `network`,
+`retries` (clamped to MAX_RETRIES), `retry-delay`, `notify` (on-failure|off).
+No dependency/ordering fields — by design.

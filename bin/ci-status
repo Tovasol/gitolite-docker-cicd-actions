@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# ci-status — health check + recent runs. First thing to run when "nothing happened".
+set -uo pipefail
+CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
+# shellcheck disable=SC1090
+. "$CICD_BASE/bin/lib.sh"; cicd_load_config
+
+ok() { printf '  [ok]   %s\n' "$*"; }
+no() { printf '  [FAIL] %s\n' "$*"; }
+
+echo "cicd-runner status @ $(_ts)"
+
+# 1. key loaded?
+if [ -s "$SOPS_AGE_KEY_FILE" ]; then ok "age key loaded ($SOPS_AGE_KEY_FILE)"
+else no "age key NOT loaded — run: unlock-ci   (did the box reboot?)"; fi
+
+# 2. docker reachable (rootless)?
+[ -n "${DOCKER_HOST:-}" ] && export DOCKER_HOST
+if docker info >/dev/null 2>&1; then
+  ok "docker reachable ($(docker info --format '{{.Name}} rootless={{.SecurityOptions}}' 2>/dev/null | grep -o rootless || echo rootful?))"
+else no "docker not reachable (DOCKER_HOST=$DOCKER_HOST) — is rootless dockerd running?"; fi
+
+# 3. test decrypt against any repo's secrets (proves the key actually works)
+sample="$(find "$RUNNER_BASE/runs" -maxdepth 0 2>/dev/null)"
+echo "  base: $RUNNER_BASE   slots: $(ls "$RUNNER_BASE/slots" 2>/dev/null | wc -l)/${MAX_JOBS}"
+
+# 4. recent runs
+echo "recent runs:"
+find "$RUNNER_BASE/runs" -maxdepth 3 -name status -printf '%T@ %p\n' 2>/dev/null \
+  | sort -rn | head -10 | while read -r _ s; do
+      d="$(dirname "$s")"; printf '  %-10s %s\n' "$(cat "$s")" "${d#$RUNNER_BASE/runs/}"
+    done
+
+# 5. queued-but-unprocessed (crash recovery hint)
+echo "pending (target != last):"
+find "$RUNNER_BASE/queue" -name target 2>/dev/null | while read -r t; do
+  g="$(dirname "$t")"; [ "$(cat "$t" 2>/dev/null)" != "$(cat "$g/last" 2>/dev/null)" ] && \
+    printf '  %s -> %s\n' "${g#$RUNNER_BASE/queue/}" "$(cat "$t")"
+done
+
+# 6. failed teardowns awaiting operator action
+echo "FAILED teardowns (need operator — ci-teardown retry|abandon):"
+find "$RUNNER_BASE/envs" -name teardown-failed 2>/dev/null | while read -r f; do
+  d="$(dirname "$f")"
+  printf '  %s\n' "${d#"$RUNNER_BASE"/envs/}"
+  sed 's/^/      /' "$f"
+done

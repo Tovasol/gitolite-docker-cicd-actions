@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# gitolite common post-receive hook (deploy to ~git/local/hooks/common/post-receive).
+# Fast + non-blocking: classify each pushed ref, enqueue newest target, wake runner.
+# Opt-in: only repos that contain .gitolite/ci.yml are processed.
+set -euo pipefail
+
+# Resolve runner install (override with CICD_BASE in the gitolite environment).
+CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
+CICD_CONF="${CICD_CONF:-/etc/cicd-runner/runner.conf}"
+# shellcheck disable=SC1090
+. "$CICD_BASE/bin/lib.sh"; cicd_load_config
+
+[ -n "${GL_REPO:-}" ] || exit 0          # not invoked by gitolite -> nothing to do
+BARE="$PWD"                              # gitolite sets cwd to the bare repo
+ZERO=0000000000000000000000000000000000000000
+PUSHER="${GL_USER:-unknown}"
+
+# cheap opt-in gate: does ANY pushed ref's tree contain .gitolite/ci.yml?
+have_ci_marker() {  # have_ci_marker <sha>
+  [ "$1" = "$ZERO" ] && return 1
+  git --git-dir="$BARE" cat-file -e "$1:.gitolite/ci.yml" 2>/dev/null
+}
+
+while read -r oldrev newrev refname; do
+  case "$refname" in refs/heads/*) ;; *) continue ;; esac    # branches only
+  branch="${refname#refs/heads/}"
+
+  if   [ "$oldrev" = "$ZERO" ]; then event=create; marker="$newrev"
+  elif [ "$newrev" = "$ZERO" ]; then event=delete; marker="$oldrev"   # ref gone -> check oldrev
+  else                                event=push;   marker="$newrev"
+  fi
+
+  # delete always allowed through (teardown decision happens in the runner against
+  # the persisted env cache); create/push require the marker on the pushed tip.
+  if [ "$event" != "delete" ] && ! have_ci_marker "$marker"; then
+    continue
+  fi
+
+  # On delete: PIN the deleted tip under a hidden ref so the FULL tree survives gc
+  # for teardown (objects still exist now; git auto-gc runs only AFTER hooks).
+  # Instant + non-blocking — the push returns immediately.
+  if [ "$event" = "delete" ] && [ "$oldrev" != "$ZERO" ]; then
+    git --git-dir="$BARE" update-ref "refs/cicd/preserve/$(slugify "$branch")" "$oldrev" \
+      2>/dev/null || true
+  fi
+
+  group="$GL_REPO/$branch"
+  qdir="$CICD_BASE/queue/$group"
+  mkdir -p "$qdir"
+  # atomic newest-wins target: "event newrev oldrev pusher"
+  printf '%s %s %s %s\n' "$event" "$newrev" "$oldrev" "$PUSHER" > "$qdir/target.tmp"
+  mv -f "$qdir/target.tmp" "$qdir/target"
+
+  log "queued $event $group ($PUSHER) new=$newrev old=$oldrev"
+
+  # wake the per-group runner, detached so the push returns immediately.
+  setsid "$CICD_BASE/bin/run-group.sh" "$GL_REPO" "$branch" \
+    </dev/null >>"$CICD_BASE/runner.log" 2>&1 &
+done
+
+exit 0

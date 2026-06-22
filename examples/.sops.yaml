@@ -1,0 +1,7 @@
+# sops recipients for this repo. Humans decrypt via GPG (pass/YubiKey); the CI
+# runner decrypts via its passphraseless age key (unattended). Either decrypts.
+# Replace the placeholders. Add a recipient -> `sops updatekeys ci/secrets.enc.yaml`.
+creation_rules:
+  - path_regex: \.enc\.(ya?ml|json|env)$
+    pgp: "REPLACE_WITH_YOUR_GPG_FINGERPRINT"
+    age: "age1replace_with_cicd_runner_public_key"
