@@ -35,13 +35,12 @@ Staged so each layer is verifiable. Detail in §2. Prereq: rootless docker runni
 as `cicd-runner` (`docker info` shows rootless).
 
 ```bash
-# ── A. install the runner — bootstrap from the bare repo (admin sudo, no root login) ──
-# archive the runner code out of gitolite into cicd-runner (the archive-push principle,
-# by hand). Code's already there from the push that made the bare repo. INSTALL-time op
-# (privileged); NOT the runtime git→cicd-runner grant (which stays cicd-ingest-only).
+# ── A. install the runner — bootstrap from the bare repo (as ROOT; install is root's job) ──
+# archive the runner code out of gitolite into cicd-runner (archive-push principle, by hand).
+# Code's already there from the push that made the bare repo. NOT the runtime grant.
 RUNNER_REPO=/home/git/repositories/<runner-repo>.git
-sudo -iu cicd-runner mkdir -p ~/src
-sudo -u git git --git-dir="$RUNNER_REPO" archive HEAD cicd-runner | sudo -u cicd-runner tar -x --strip-components=1 -C /home/cicd-runner/src
+sudo -u cicd-runner mkdir -p /home/cicd-runner/src
+git --git-dir="$RUNNER_REPO" archive HEAD cicd-runner | sudo -u cicd-runner tar -x --strip-components=1 -C /home/cicd-runner/src
 sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh'
 
 # ── B. point config at your socket (as cicd-runner; user-local, no sudo) ──────
@@ -159,13 +158,13 @@ by archiving it out of the bare repo into cicd-runner — the **same archive-pus
 principle** the system uses, run once by hand. No rsync, no Mac round-trip, no repo
 access grant for cicd-runner.
 ```bash
-# (a) PRIMARY — admin `sudo` (no root login): git reads the bare repo, cicd-runner writes.
-#   This is an INSTALL-time op (privileged by nature), NOT the runtime git→cicd-runner
-#   grant — that grant stays narrow (cicd-ingest only); never broaden it to allow this.
+# (a) PRIMARY — as ROOT (install ops are root's job; a separated admin can't reach
+#   git's dirs — good). root reads the bare repo, cicd-runner writes. This is an
+#   INSTALL-time op, NOT the runtime git→cicd-runner grant (which stays cicd-ingest-only).
 RUNNER_REPO=/home/git/repositories/<runner-repo>.git
-sudo -iu cicd-runner mkdir -p ~/src
-sudo -u git    git --git-dir="$RUNNER_REPO" archive HEAD cicd-runner \
-| sudo -u cicd-runner tar -x --strip-components=1 -C /home/cicd-runner/src
+sudo -u cicd-runner mkdir -p /home/cicd-runner/src
+git --git-dir="$RUNNER_REPO" archive HEAD cicd-runner \
+  | sudo -u cicd-runner tar -x --strip-components=1 -C /home/cicd-runner/src
 #   (own repo, not a cicd-runner/ subdir? drop the path + --strip-components)
 sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh'
 # update later: re-run the pipe (latest HEAD) + ./install.sh — or dogfood it via CI.
