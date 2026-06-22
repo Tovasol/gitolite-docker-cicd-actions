@@ -38,9 +38,10 @@ as `cicd-runner` (`docker info` shows rootless).
 # ── A. install the runner — bootstrap from the bare repo (as ROOT; install is root's job) ──
 # archive the runner code out of gitolite into cicd-runner (archive-push principle, by hand).
 # Code's already there from the push that made the bare repo. NOT the runtime grant.
-RUNNER_REPO=/home/git/repositories/<runner-repo>.git
+GIT_HOME=$(getent passwd git | cut -d: -f6)          # /var/lib/gitolite or /home/git
+RUNNER_REPO=$GIT_HOME/repositories/<runner-repo>.git
 sudo -u cicd-runner mkdir -p /home/cicd-runner/src
-git --git-dir="$RUNNER_REPO" archive HEAD cicd-runner | sudo -u cicd-runner tar -x --strip-components=1 -C /home/cicd-runner/src
+git --git-dir="$RUNNER_REPO" archive main cicd-runner | sudo -u cicd-runner tar -x --strip-components=1 -C /home/cicd-runner/src
 sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh'
 
 # ── B. point config at your socket (as cicd-runner; user-local, no sudo) ──────
@@ -161,9 +162,11 @@ access grant for cicd-runner.
 # (a) PRIMARY — as ROOT (install ops are root's job; a separated admin can't reach
 #   git's dirs — good). root reads the bare repo, cicd-runner writes. This is an
 #   INSTALL-time op, NOT the runtime git→cicd-runner grant (which stays cicd-ingest-only).
-RUNNER_REPO=/home/git/repositories/<runner-repo>.git
+GIT_HOME=$(getent passwd git | cut -d: -f6)          # /var/lib/gitolite or /home/git — varies
+RUNNER_REPO=$GIT_HOME/repositories/<runner-repo>.git
 sudo -u cicd-runner mkdir -p /home/cicd-runner/src
-git --git-dir="$RUNNER_REPO" archive HEAD cicd-runner \
+# use the real default branch (gitolite's HEAD may be 'master' while you pushed 'main'):
+git --git-dir="$RUNNER_REPO" archive main cicd-runner \
   | sudo -u cicd-runner tar -x --strip-components=1 -C /home/cicd-runner/src
 #   (own repo, not a cicd-runner/ subdir? drop the path + --strip-components)
 sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh'
