@@ -41,6 +41,11 @@ esac
 echo "Fetching user-local tools into $LOCAL_BIN …"
 LOCAL_BIN="$LOCAL_BIN" "$SRC/bin/fetch-tools.sh" || echo "  (fetch-tools failed — install sops/yq/age into $LOCAL_BIN manually)"
 
+# put the runner's OWN scripts (ci-status/unlock-ci/ci-teardown…) on PATH too
+grep -qs "$BASE/bin" ~/.bash_profile 2>/dev/null || \
+  echo "export PATH=\"$BASE/bin:\$PATH\"" >> ~/.bash_profile
+export PATH="$BASE/bin:$PATH"
+
 # preflight
 echo "--- preflight ---"
 command -v yq    >/dev/null && echo "yq:    $(command -v yq)"      || echo "MISSING: yq    — run $SRC/bin/fetch-tools.sh"

@@ -134,15 +134,18 @@ are never system-wide.
 
 ### 2.2 Runner user + rootless docker
 ```bash
-useradd -m -s /bin/bash ci
+useradd -m -s /bin/bash cicd-runner
 ```
 Then set up rootless docker — **see Appendix A** for the full verified Gentoo
 procedure (packages, subuid/subgid, kernel `CONFIG_USER_NS`, and the systemd-vs-
 OpenRC autostart fork). Do NOT just `loginctl enable-linger` — that's the systemd
 path and fails on pure OpenRC. Verify at the end:
 ```bash
-sudo -iu ci bash -lc 'docker info | grep -i rootless'   # → "rootless"
+sudo -iu cicd-runner bash -lc 'docker info | grep -i rootless'   # → "rootless"
 ```
+> **Note:** Appendix A writes the runner user as `ci` purely for line-width — it's
+> a placeholder. The real user is **`cicd-runner`**; read every `ci`/`/home/ci/`/
+> `id -u ci` there as `cicd-runner`/`/home/cicd-runner/`/`id -u cicd-runner`.
 
 ### 2.3 Runner age key (simple path — default, no root)
 A passphraseless age key sops finds automatically. Protected by file perms + the
@@ -245,7 +248,7 @@ Notes:
   cicd-runner). It only needs the *path string* + the sudo grant. It reads no
   secrets and sources no runner files.
 - Verify the grant is active (no side effects):
-  `sudo -u git sudo -n -l -u cicd-runner | grep cicd-ingest`  → should list cicd-ingest.
+  `sudo -l -U git | grep cicd-ingest`  → prints: (cicd-runner) NOPASSWD: …/cicd-ingest
   Then any push exercises it for real (watch `tail -f ~cicd-runner/runner/runner.log`).
 
 ### 2.7 Maintenance crons (§9)
