@@ -35,9 +35,14 @@ Staged so each layer is verifiable. Detail in §2. Prereq: rootless docker runni
 as `cicd-runner` (`docker info` shows rootless).
 
 ```bash
-# ── A. install the runner (as cicd-runner) ───────────────────────────────────
-rsync -av ~/…/agent-forge/cicd-runner/  you@vps:/tmp/cicd-runner/     # from your Mac
-su - cicd-runner && cp -r /tmp/cicd-runner ~/src && cd ~/src && ./install.sh
+# ── A. install the runner — bootstrap from the bare repo (admin sudo, no root login) ──
+# archive the runner code out of gitolite into cicd-runner (the archive-push principle,
+# by hand). Code's already there from the push that made the bare repo. INSTALL-time op
+# (privileged); NOT the runtime git→cicd-runner grant (which stays cicd-ingest-only).
+RUNNER_REPO=/home/git/repositories/<runner-repo>.git
+sudo -iu cicd-runner mkdir -p ~/src
+sudo -u git git --git-dir="$RUNNER_REPO" archive HEAD cicd-runner | sudo -u cicd-runner tar -x --strip-components=1 -C /home/cicd-runner/src
+sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh'
 
 # ── B. point config at your socket (as cicd-runner; user-local, no sudo) ──────
 echo "$DOCKER_HOST"                       # the value that makes `docker info` work
@@ -149,16 +154,25 @@ No backup needed: if the VPS dies, regen + re-add the pubkey to `.sops.yaml` +
 `sops updatekeys`; your human key (the 2nd recipient) keeps you from lockout.
 
 ### 2.4 Runner directories + scripts (via install.sh)
-Archive-push (§31) gives cicd-runner **zero repo access**, so it can't clone the
-bare repo locally. Get the code over one of these ways:
+The runner code is already in gitolite (your push created the bare repo). Bootstrap
+by archiving it out of the bare repo into cicd-runner — the **same archive-push
+principle** the system uses, run once by hand. No rsync, no Mac round-trip, no repo
+access grant for cicd-runner.
 ```bash
-# (a) rsync from your Mac (simplest — no repo access needed):
-rsync -av ~/…/agent-forge/cicd-runner/  you@vps:/tmp/cicd-runner/
-sudo -iu cicd-runner bash -lc 'cp -r /tmp/cicd-runner ~/src && cd ~/src && ./install.sh'
+# (a) PRIMARY — admin `sudo` (no root login): git reads the bare repo, cicd-runner writes.
+#   This is an INSTALL-time op (privileged by nature), NOT the runtime git→cicd-runner
+#   grant — that grant stays narrow (cicd-ingest only); never broaden it to allow this.
+RUNNER_REPO=/home/git/repositories/<runner-repo>.git
+sudo -iu cicd-runner mkdir -p ~/src
+sudo -u git    git --git-dir="$RUNNER_REPO" archive HEAD cicd-runner \
+| sudo -u cicd-runner tar -x --strip-components=1 -C /home/cicd-runner/src
+#   (own repo, not a cicd-runner/ subdir? drop the path + --strip-components)
+sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh'
+# update later: re-run the pipe (latest HEAD) + ./install.sh — or dogfood it via CI.
 
-# (b) OR ssh-clone via gitolite as YOUR identity (you have push access), then hand off:
-#   git clone git@vps:<runner-repo> /tmp/rr && sudo cp -r /tmp/rr/cicd-runner ~cicd-runner/src
-#   sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh'
+# (b) FALLBACK — only if the code isn't in gitolite yet: rsync from your Mac
+#   rsync -av ~/…/agent-forge/cicd-runner/ you@vps:/tmp/cicd-runner/
+#   sudo -iu cicd-runner bash -lc 'cp -r /tmp/cicd-runner ~/src && cd ~/src && ./install.sh'
 ```
 `install.sh` fetches yq/sops/age into `~/.local/bin`, lays down all dirs (incl.
 `incoming/` + the global `cache/`), seeds slots, writes `runner.conf`. Then review it:
