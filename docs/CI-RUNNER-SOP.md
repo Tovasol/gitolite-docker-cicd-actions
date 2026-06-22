@@ -50,8 +50,13 @@ vi ~/runner/etc/runner.conf               # DOCKER_HOST=<that>  RESOURCE_LIMITS=
                                           # SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt  (ramfs)
 
 # ── C. hook + sudo bridge (as root) ──────────────────────────────────────────
-install -Dm755 /home/cicd-runner/runner/bin/post-receive ~git/local/hooks/common/post-receive
-# ~git/.gitolite.rc needs:  LOCAL_CODE => "$ENV{HOME}/local",
+# LOCAL_CODE is already set in most gitolite installs — ask gitolite where it resolves
+# (don't assume ~git/local; some installs use $GL_ADMIN_BASE/local).
+LOCAL_CODE=$(sudo -u git gitolite query-rc LOCAL_CODE)        # e.g. /var/lib/gitolite/.gitolite/local
+install -Dm755 /home/cicd-runner/runner/bin/post-receive "$LOCAL_CODE/hooks/common/post-receive"
+chown -R git:git "$LOCAL_CODE"
+# (if LOCAL_CODE printed empty, add to %RC in $(getent passwd git|cut -d: -f6)/.gitolite.rc:
+#    LOCAL_CODE => "$ENV{HOME}/local",   then re-run query-rc)
 cat > /etc/sudoers.d/cicd-runner <<'EOF'
 git ALL=(cicd-runner) NOPASSWD: /home/cicd-runner/runner/bin/cicd-ingest
 Defaults!/home/cicd-runner/runner/bin/cicd-ingest !requiretty
@@ -89,7 +94,7 @@ First-timer gotchas: **`DOCKER_HOST` mismatch** (every job fails instantly) and
 | Runner base | `/home/cicd-runner/runner/` (= `$RUNNER_BASE`) |
 | Job queue | `$RUNNER_BASE/queue/<repo>/<branch>/` |
 | Run logs/history | `$RUNNER_BASE/runs/<repo>/<branch>/<ts>-<sha>-<job>/` |
-| Per-repo dep cache | `$RUNNER_BASE/cache/<repo>/` (`npm/`, `nm/`) |
+| Global dep cache (§32) | `$RUNNER_BASE/cache/` (one volume, all repos, all ecosystems) |
 | Ephemeral env state | `$RUNNER_BASE/envs/<repo>/<slug>/` |
 | Runner age key (simple, default) | `~cicd-runner/.config/sops/age/keys.txt` (600, no root) |
 | Runner key encrypted-at-rest (optional §25) | `$RUNNER_BASE/etc/age-key.gpg` (cicd-runner-owned, no root) |
@@ -97,7 +102,7 @@ First-timer gotchas: **`DOCKER_HOST` mismatch** (every job fails instantly) and
 | Config | `$RUNNER_BASE/etc/runner.conf` (user-local; found via $CICD_BASE, sudo-safe). `/etc/cicd-runner/runner.conf` optional fallback only. Hook does NOT read it. |
 | Per-repo secrets (in git) | `<repo>/ci/secrets.enc.yaml` |
 | sops recipients config (in git) | `<repo>/.sops.yaml` |
-| Hook (gitolite) | `~git/local/hooks/common/post-receive` |
+| Hook (gitolite) | `$LOCAL_CODE/hooks/common/post-receive` (find via `gitolite query-rc LOCAL_CODE`) |
 | Runner scripts | `$RUNNER_BASE/bin/` (`run-group.sh`, `unlock-ci`, `ci-status`, reapers…) |
 
 Key fact: **decrypt happens on the host; only decrypted VALUES enter the
@@ -213,15 +218,17 @@ needed to guarantee no-swap when swap is on.
 
 ### 2.6 gitolite hook + the sudo bridge (git → cicd-runner)
 The hook runs as **git**; the runner + rootless docker run as **cicd-runner**
-(separate trust domains — DESIGN §30). The hook is self-contained and hands off via
-`sudo -n -u cicd-runner run-group.sh …`. Set up the one-line sudo grant:
+(separate trust domains — DESIGN §30/§31). The hook `git archive`s the tree and pipes
+it via `sudo -n -u cicd-runner cicd-ingest …` (archive-push). Set up the grant:
 
 ```bash
-# 1) install the hook (git-owned dir)
-install -Dm755 /home/cicd-runner/runner/bin/post-receive ~git/local/hooks/common/post-receive
+# 1) install the hook where gitolite's LOCAL_CODE resolves (don't assume the path)
+LOCAL_CODE=$(sudo -u git gitolite query-rc LOCAL_CODE)
+install -Dm755 /home/cicd-runner/runner/bin/post-receive "$LOCAL_CODE/hooks/common/post-receive"
+chown -R git:git "$LOCAL_CODE"
 sudo -iu git gitolite setup --hooks-only
 
-# 2) the sudo bridge — git may run ONLY run-group.sh as cicd-runner, no password
+# 2) the sudo bridge — git may run ONLY cicd-ingest as cicd-runner, no password
 cat > /etc/sudoers.d/cicd-runner <<'EOF'
 git ALL=(cicd-runner) NOPASSWD: /home/cicd-runner/runner/bin/cicd-ingest
 Defaults!/home/cicd-runner/runner/bin/cicd-ingest !requiretty
@@ -230,15 +237,15 @@ chmod 440 /etc/sudoers.d/cicd-runner
 visudo -cf /etc/sudoers.d/cicd-runner          # validate
 ```
 Notes:
-- **No chmod needed on cicd-runner's home.** `sudo -u cicd-runner run-group.sh`
+- **No chmod needed on cicd-runner's home.** `sudo -u cicd-runner cicd-ingest`
   execs AS cicd-runner, who owns and can traverse its own 700 home; sudo's pre-exec
   stat runs as root (bypasses perms). git never reads/traverses the path itself.
 - `!requiretty` is required — the hook runs with no tty; without it `sudo -n` fails.
-- The hook needs no read access to the runner (sudo executes run-group AS
+- The hook needs no read access to the runner (sudo executes cicd-ingest AS
   cicd-runner). It only needs the *path string* + the sudo grant. It reads no
   secrets and sources no runner files.
 - Verify the grant is active (no side effects):
-  `sudo -u git sudo -n -l -u cicd-runner | grep run-group`  → should list run-group.sh.
+  `sudo -u git sudo -n -l -u cicd-runner | grep cicd-ingest`  → should list cicd-ingest.
   Then any push exercises it for real (watch `tail -f ~cicd-runner/runner/runner.log`).
 
 ### 2.7 Maintenance crons (§9)
@@ -382,19 +389,20 @@ git commit -am "ci: rotate runner key" && git push
 
 ```bash
 # latest run for a repo/branch:
-ls -t /home/ci/ci/runs/<repo>/<branch>/ | head
-cd /home/ci/ci/runs/<repo>/<branch>/<ts>-<sha>/
+ls -t /home/cicd-runner/runner/runs/<repo>/<branch>/ | head
+cd /home/cicd-runner/runner/runs/<repo>/<branch>/<ts>-<sha>/
 cat status           # running | exit:<n> | timeout | cancelled
 cat output.log       # full stdout+stderr
 cat cmd              # exact docker run — paste to reproduce the failed container by hand
 cat meta.json        # who pushed, branch, sha, timings
 
 # follow a live run:
-tail -f /home/ci/ci/runs/<repo>/<branch>/latest/output.log
+tail -f /home/cicd-runner/runner/runs/<repo>/<branch>/latest/output.log
 
-# manually re-trigger (re-run the last sha): re-push, or:
-printf 'push <sha>\n' > /home/ci/ci/queue/<repo>/<branch>/target
-/home/ci/ci/bin/run-group.sh <repo>/<branch> <repo> ~git/repositories/<repo>.git <branch>
+# re-trigger: just RE-PUSH from your Mac — the hook re-archives + re-delivers the
+# source (archive-push). The runner has no repo access, so it can't reconstruct the
+# tree on its own; a re-push is the clean way. (git push --force-with-lease or an
+# empty commit both work.) For a FAILED teardown: `ci-teardown retry <repo> <branch>`.
 ```
 First debugging question is always: **is the key loaded?** `ci-status`. A missing
 key after reboot is the #1 cause of "nothing happened."
@@ -432,13 +440,13 @@ Verify quarterly: `docker system df`, `df -h $(docker info -f '{{.DockerRootDir}
 ```bash
 docker system df; df -h /var/lib/docker
 docker builder prune --keep-storage 5g -f; docker image prune -af --filter until=24h
-find /home/ci/ci/runs -mtime +14 -type d -exec rm -rf {} +    # trim logs
+find /home/cicd-runner/runner/runs -mtime +14 -type d -exec rm -rf {} +    # trim logs
 ```
 Never `docker system prune -a` casually — nukes the layer cache, slows all builds.
 
 ### "Stuck / hung job"
 ```bash
-docker ps --filter label=ci=1                 # find it
+docker ps --filter label=cicd=1                 # find it
 docker rm -f <name>                            # kill; runner marks status + frees slot
 ```
 Wall-clock timeout (§8 design) should catch these automatically; this is the
