@@ -21,6 +21,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then _CICD_MAIN=1; else _CICD_MAIN=0; fi
 repo="" branch="" group="" slug="" Q="" RUNS="" ENVS="" INC="" CACHE="${CICD_BASE}/cache"
 ZERO=0000000000000000000000000000000000000000
 META_repo="" META_branch="" META_job="" META_event="" META_sha="" META_pusher="" META_start="" META_startns=0
+APT_HARDEN=()   # populated in the main-init block; placeholder so sourced tests stay set -u-safe
 
 if [ "$_CICD_MAIN" = 1 ]; then
   cicd_load_config || exit 1
@@ -39,6 +40,33 @@ if [ "$_CICD_MAIN" = 1 ]; then
   # detached (no tty, via the hook's setsid+sudo) -> log to the runner log
   [ -t 1 ] || exec >>"$RUNNER_BASE/runner.log" 2>&1
   mkdir -p "$Q" "$RUNS" "$CACHE"
+
+  # --- apt under the hardened rootless runner (DESIGN §35) ---------------------------
+  # Make `apt-get install …` work in ANY job container (any repo, any future workflow),
+  # without the job needing to know it runs under a hardened rootless runner. Two
+  # image-agnostic fixes are injected into every `docker run` below via APT_HARDEN:
+  #   1) APT::Sandbox::User "root" — under --security-opt no-new-privileges apt cannot
+  #      setgroups/seteuid down to the `_apt` sandbox user ("setgroups … Operation not
+  #      permitted; http method died"), so it stays root. Download is still confined by
+  #      cap-drop ALL + ephemeral container; the dropped sandbox is marginal here.
+  #   2) tmpfs at apt's archive + lists dirs — the image's `_apt`-owned /var/cache/apt and
+  #      /var/lib/apt/lists are NOT writable by the userns-remapped container root (their
+  #      uid falls outside the subuid map -> "chmod … Operation not permitted" / "Could
+  #      not open file … Permission denied"). A fresh tmpfs is root-owned + in-namespace
+  #      (writable), and the mountpoint existing lets apt create its own `partial/` subdir.
+  # NOT cached across runs by design: the Debian/Ubuntu base images ship an apt `docker-clean`
+  # hook (DPkg::Post-Invoke purges archives/*.deb after every install) — persisting .deb files
+  # would mean overriding that hook per-image (fragile) for a few MB of savings, while the
+  # EXPENSIVE caches (npm/pip/cargo/go/maven/…) already persist on /cache via CACHE_ENV (§32).
+  # So apt re-fetches its handful of debs each run; an apt-heavy job can opt into its own
+  # /cache archives dir if it ever matters. Non-apt images just ignore the conf + unused tmpfs.
+  APT_CONF="$RUNNER_BASE/etc/apt-rootless.conf"
+  mkdir -p "$RUNNER_BASE/etc"
+  printf 'APT::Sandbox::User "root";\n' > "$APT_CONF"
+  APT_HARDEN=(
+    --tmpfs /var/cache/apt/archives --tmpfs /var/lib/apt/lists
+    -v "$APT_CONF:/etc/apt/apt.conf.d/99cicd-rootless:ro"
+  )
 fi
 
 # Static default cache env block (DESIGN §32): points every common package manager's
@@ -168,6 +196,7 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   timeout --kill-after=30 "$timeout" \
     docker run --rm --init --name "$name" \
       --cap-drop ALL --security-opt no-new-privileges \
+      "${APT_HARDEN[@]}" \
       "${limits[@]}" --network "$network" \
       --label cicd=1 --label "cicd.group=$group" \
       -e CI_EVENT="$event" -e CI_REPO="$repo" -e CI_BRANCH="$branch" \
@@ -283,6 +312,7 @@ run_teardown() {  # <oldrev> <pusher>
   timeout --kill-after=30 "${DEFAULT_TIMEOUT}" \
     docker run --rm --init --name "$name" \
       --cap-drop ALL --security-opt no-new-privileges \
+      "${APT_HARDEN[@]}" \
       "${tlimits[@]}" --network "$DEFAULT_NETWORK" \
       --label cicd=1 --label "cicd.group=$group" \
       -e CI_EVENT=delete -e CI_REPO="$repo" -e CI_BRANCH="$branch" \
