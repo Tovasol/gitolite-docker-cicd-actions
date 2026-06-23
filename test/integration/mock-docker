@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# mock docker for integration tests. The CONTROL PLANE (gitolite -> hook -> cicd-ingest
+# -> run-group -> queue -> meta -> ci-job -> ci-status) is REAL; the container is a
+# trusted black box we do NOT execute or test here (its isolation is docker's job and
+# needs real DinD/a VM — out of scope for control-plane integration).
+#
+# Behavior is test-controllable via files in $MOCK_DIR (world-writable):
+#   info_rc   exit code for `docker info`  (default 0; set 1 to simulate docker DOWN)
+#   run_rc    exit code for `docker run`   (default 0; set N to simulate a failing job)
+MOCK="${MOCK_DIR:-/tmp/mockdocker}"
+rc() { cat "$MOCK/$1" 2>/dev/null || echo "${2:-0}"; }
+case "${1:-}" in
+  info)
+    exit "$(rc info_rc 0)" ;;
+  run)
+    # stdout here is what run-group redirects into the run's output.log.
+    echo "[mock-docker] container ran (isolation is a trusted black box in integration tests)"
+    exit "$(rc run_rc 0)" ;;
+  rm|stop|kill|ps|builder|image|container|system|version)
+    exit 0 ;;
+  *)
+    exit 0 ;;
+esac
