@@ -263,6 +263,55 @@ Install the reaper + prune + orphaned-env crons. See §9.
 unlock-ci && ci-status
 ```
 
+### 2.9 Updating the runner (after any code change)
+One command, run as **root**, updates *everything regardless of what changed* —
+scripts, crontab, gitolite hook, and the boot/init file:
+```bash
+sudo /home/cicd-runner/src/update-runner.sh <runner-repo-name>
+#   add --restart ONLY when init/*.openrc changed (bounces docker, kills builds)
+```
+`update-runner.sh` (ships in `cicd-runner/`) is idempotent, never clobbers
+`runner.conf`, needs no key re-post (the live ramfs key survives — only **reboot**
+wipes it, §3), and drains deferred work (`ci-recover`) at the end. In-flight builds
+survive (`install` swaps inodes; a running `run-group.sh` keeps its copy).
+
+It takes a single input — the bare repo name (or a full path). Override the defaults
+via env if your setup differs: `RUNNER_USER`, `GIT_USER`, `BRANCH` (default `main`).
+
+> **First time / bootstrapping the script itself:** if `~cicd-runner/src/update-runner.sh`
+> isn't there yet, refresh the source once by hand (step 1 below), then use the
+> one-liner above for every update after.
+
+What it does, as the equivalent manual block (run as **root**) — useful for audit or
+if you'd rather not use the wrapper:
+```bash
+GIT_HOME=$(getent passwd git | cut -d: -f6)
+RUNNER_REPO=$GIT_HOME/repositories/<runner-repo>.git     # <-- your repo name
+RUN=/home/cicd-runner
+# 1) source ← gitolite (same archive-push the system itself uses)
+git --git-dir="$RUNNER_REPO" archive main cicd-runner \
+  | sudo -u cicd-runner tar -x --strip-components=1 -C "$RUN/src" \
+&& \
+# 2) scripts + dirs (guards runner.conf, seeds slots)
+sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh' \
+&& \
+# 3) crontab (new schedules, e.g. the */10 ci-recover backstop)
+sudo -iu cicd-runner bash -lc 'crontab ~/src/crontab.sample' \
+&& \
+# 4) gitolite post-receive hook
+LOCAL_CODE=$(sudo -u git gitolite query-rc LOCAL_CODE) \
+&& install -Dm755 "$RUN/runner/bin/post-receive" "$LOCAL_CODE/hooks/common/post-receive" \
+&& chown -R git:git "$LOCAL_CODE" \
+&& sudo -u git gitolite setup --hooks-only \
+&& \
+# 5) boot/init service FILE (copy only — restart separate)
+install -m755 "$RUN/src/init/docker-rootless-cicd-runner.openrc" \
+        /etc/init.d/docker-rootless-cicd-runner \
+&& echo "UPDATE OK"
+# init changed? apply it (bounces docker, kills in-flight builds):
+#   rc-service docker-rootless-cicd-runner restart
+```
+
 > **Server move checklist:** repeat 2.1–2.8 on the new box. Because each host has
 > its OWN runner key, generate a fresh one (2.5) and enroll it; do NOT copy the
 > old host's key. Decommission the old host by removing its `age1vps...` line from
