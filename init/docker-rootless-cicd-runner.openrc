@@ -1,0 +1,39 @@
+#!/sbin/openrc-run
+# Rootless Docker daemon for the cicd-runner user — boot-managed + crash-restarted.
+# Reboot survival, DESIGN §33. OpenRC/Gentoo; port the intent to systemd elsewhere.
+#
+# Install:
+#   install -m755 docker-rootless-cicd-runner.openrc /etc/init.d/docker-rootless-cicd-runner
+#   rc-update add docker-rootless-cicd-runner default
+#   rc-service docker-rootless-cicd-runner start
+#
+# Prereqs:
+#   - rootless docker set up for the user (dockerd-rootless-setuptool.sh install)
+# NOTE: do NOT put /run/ci-keys in /etc/fstab. /run is tmpfs (wiped each boot), so the
+# mountpoint dir doesn't persist → an fstab mount fails at boot (no mountpoint) and can
+# break localmount. start_pre owns it instead: (re)create the dir, mount ramfs, chown.
+
+RUNNER_USER="${RUNNER_USER:-cicd-runner}"
+_uid="$(id -u "$RUNNER_USER" 2>/dev/null)"
+
+description="Rootless Docker daemon for $RUNNER_USER (boot-managed)"
+supervisor="supervise-daemon"
+command="/usr/bin/dockerd-rootless.sh"          # path may differ on non-Gentoo
+command_user="$RUNNER_USER"
+supervise_daemon_args=" -e PATH=/usr/bin:/usr/sbin:/bin:/sbin -e HOME=/home/$RUNNER_USER -e XDG_RUNTIME_DIR=/run/user/$_uid"
+
+depend() {
+    need net localmount                         # localmount mounts the ramfs from fstab first
+}
+
+start_pre() {
+    # 1) user runtime dir for the rootless socket
+    checkpath -d -m 0755 -o root:root /run/user
+    checkpath -d -m 0700 -o "$RUNNER_USER:$RUNNER_USER" "/run/user/$_uid"
+    # 2) ramfs key dir: /run is tmpfs (wiped each boot) so (re)create the mountpoint
+    #    HERE, then mount ramfs over it (never swappable tmpfs), then chown so unlock-ci
+    #    (running as the user) can write the key.
+    checkpath -d -m 0700 /run/ci-keys
+    mountpoint -q /run/ci-keys || mount -t ramfs ramfs /run/ci-keys
+    chown "$RUNNER_USER:$RUNNER_USER" /run/ci-keys && chmod 700 /run/ci-keys
+}

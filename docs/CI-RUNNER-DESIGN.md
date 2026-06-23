@@ -1819,3 +1819,67 @@ with trivial bounded eviction. The "#1 scaling risk" largely dissolves.
 - `prune-disk`: add the global-cache reaper (size/age cap).
 - examples: install scripts may stay vanilla (`npm ci`) — caching is automatic via
   the injected env; no per-project cache wiring needed.
+
+---
+
+## 33. Reboot survival (boot-time bring-up)
+
+A reboot must restore the runner with one deliberate human step. The model is
+**3 auto-restore + 1 human gate** — and the guiding principle is **verify state,
+don't trust ordering.** The concrete commands are OpenRC/Gentoo (SOP Appendix A);
+the *intent* below ports to systemd/Debian and others.
+
+### What must come back, and how (intent → per-init mapping)
+1. **Rootless docker daemon** — auto-start at boot, restart on crash, as the
+   cicd-runner user, with its runtime dir (`/run/user/<uid>`) created + owned first.
+   - *OpenRC:* a system service using `supervise-daemon`, `command_user=cicd-runner`,
+     `start_pre` creating `/run/user/<uid>`, `need net localmount`.
+   - *systemd:* `loginctl enable-linger cicd-runner` + `systemctl --user enable
+     --now docker` (the rootless setuptool installs the user unit); linger creates
+     `/run/user/<uid>` automatically.
+   - *Intent:* supervised, boot-started, user-scoped, runtime-dir guaranteed.
+2. **ramfs key dir** — `/run/ci-keys` mounted as **ramfs** (never swappable tmpfs)
+   and owned by cicd-runner, BEFORE the key is posted.
+   - *OpenRC:* a boot hook (the docker service start_pre) that **creates the mountpoint, mounts ramfs
+     it's really mounted** and chowns it (folded into the docker service's
+     `start_pre`, or a dedicated `/etc/local.d` script).
+   - *systemd:* a `.mount` unit (`Type=ramfs`) + `tmpfiles.d` (or `ExecStartPre`)
+     for the chown.
+   - *Intent:* a RAM-only, cicd-runner-owned dir at a stable path, swap-proof.
+3. **Pending-run recovery** — re-process pushes that landed but couldn't run.
+   - `@reboot ci-recover` (cron/timer) re-runs queued targets once the env is ready.
+   - **Planned robustness (see §10.6 / below):** distinguish *environment-not-ready*
+     failures (docker down, key not loaded — transient) from *code* failures (build
+     errored — real). Env failures should DEFER (don't advance `last`), so they
+     auto-run when ready; code failures notify and don't loop.
+
+### The human gate (deliberate, not a gap)
+The **ramfs key itself cannot auto-restore** — it's RAM-only by design (§25). The
+operator re-posts it after every reboot (`pass show … | ssh … unlock-ci`). This is
+the chosen security trade: a cold/stolen disk reveals no key. "Auto-recover" means
+"auto-runs once the human re-posts the key," not fully unattended.
+
+### Principle: verify state, don't trust ordering
+`need localmount` (OpenRC) / `After=` (systemd) only orders the dependency *start* —
+it does NOT prove a *specific* mount applied. A missing/bad fstab line and the boot
+still "succeeds," after which a naive `mkdir`/chown silently lands on swappable
+`/run` tmpfs — defeating the no-swap guarantee, silently. So the boot hook must
+**check `mountpoint -q /run/ci-keys` and mount-if-not** before chowning. Applies to
+any init system: assert the filesystem is what you think before writing to it.
+
+### Colocation vs separation (a documented choice)
+The ramfs key-dir setup can ride the docker service's `start_pre` (fewer files,
+fine for a single-purpose box) OR live in a dedicated boot hook (cleaner separation
+of concerns). On a dedicated CI box, colocation is acceptable — noted so the coupling
+(key-dir setup tied to the docker service's lifecycle) is a conscious decision.
+
+### Boot order
+ramfs mountpoint+mount+chown (docker service start_pre) → rootless docker up →
+`@reboot ci-recover` → **operator posts the key** → deferred pushes run. The repo
+ships the OpenRC init template (`cicd-runner/init/`) so this is version-controlled,
+not just documented.
+
+### Status of the planned deferred-recovery
+Intent captured; not yet implemented in `run-group`. Until then: a push during a
+reboot window is processed-and-failed (docker/key down) and **not** auto-retried —
+re-push, or implement the env-vs-code deferral. Tracked so it isn't lost.

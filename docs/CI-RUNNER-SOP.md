@@ -20,12 +20,14 @@ ssh vps && sudo -iu cicd-runner ci-status     # key loaded? docker up? recent ru
 after a reboot** except make sure rootless dockerd is back up (it's a service). If a
 deploy "silently didn't happen", run `ci-status` and check `runner.log`.
 
-**Only if you chose the optional ramfs hardening (§2.5/§25):** the key is wiped on
-reboot, so after EVERY reboot CI is paused until you run:
+**ramfs key path — after EVERY reboot, re-post the key (CI is paused until you do).**
+From your **Mac** (key streams Mac→VPS RAM; never on disk, never in history):
 ```bash
-sudo -iu cicd-runner unlock-ci   # prompts for GPG passphrase, loads key into ramfs
-sudo -iu cicd-runner ci-status
+pass show <your-key-entry> | ssh <user>@vps 'sudo -n -u cicd-runner /home/cicd-runner/runner/bin/unlock-ci'
 ```
+Then confirm: `sudo -iu cicd-runner ci-status` → `age key loaded`.
+(GPG-at-rest variant instead: `sudo -iu cicd-runner unlock-ci` decrypts the on-VPS
+`age-key.gpg`, prompting for the GPG passphrase. Use whichever you set up.)
 
 ---
 
@@ -98,7 +100,7 @@ First-timer gotchas: **`DOCKER_HOST` mismatch** (every job fails instantly) and
 | Ephemeral env state | `$RUNNER_BASE/envs/<repo>/<slug>/` |
 | Runner age key (simple, default) | `~cicd-runner/.config/sops/age/keys.txt` (600, no root) |
 | Runner key encrypted-at-rest (optional §25) | `$RUNNER_BASE/etc/age-key.gpg` (cicd-runner-owned, no root) |
-| Decrypted key in RAM (optional §25) | `/run/ci-keys/age-keys.txt` (ramfs; fstab mount needs root) |
+| Decrypted key in RAM (optional §25) | `/run/ci-keys/age-keys.txt` (ramfs, created+mounted by the boot service start_pre) |
 | Config | `$RUNNER_BASE/etc/runner.conf` (user-local; found via $CICD_BASE, sudo-safe). `/etc/cicd-runner/runner.conf` optional fallback only. Hook does NOT read it. |
 | Per-repo secrets (in git) | `<repo>/ci/secrets.enc.yaml` |
 | sops recipients config (in git) | `<repo>/.sops.yaml` |
@@ -121,7 +123,7 @@ The CI tools (sops, yq, age) install into `~cicd-runner/.local/bin` — no root,
 su - cicd-runner
 mkdir -p ~/.local/bin
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bash_profile && . ~/.bash_profile
-~/src/cicd-runner/bin/fetch-tools.sh        # downloads sops, yq, age into ~/.local/bin (arch-aware)
+~/src/bin/fetch-tools.sh        # downloads sops, yq, age into ~/.local/bin (arch-aware)
 sops --version && yq --version && age-keygen --version
 ```
 The runner re-prepends `~/.local/bin` to PATH itself (config `LOCAL_BIN`) so it's
@@ -207,12 +209,14 @@ gpg --encrypt --recipient YOUR_GPG_FP --armor \
   -o ~/runner/etc/age-key.gpg < ~/.config/sops/age/keys.txt
 shred -u ~/.config/sops/age/keys.txt          # remove the plaintext on-disk copy
 
-# as root: ramfs mount for the decrypted key (never swaps). Only root step here.
-mkdir -p /run/ci-keys
-echo 'ramfs  /run/ci-keys  ramfs  nodev,nosuid,mode=0700  0 0' >> /etc/fstab
-mount /run/ci-keys && chown cicd-runner:cicd-runner /run/ci-keys && chmod 700 /run/ci-keys
+# as root: ramfs for the decrypted key (never swaps). NOT via fstab — /run is tmpfs
+# (wiped each boot) so the mountpoint won't persist + an fstab entry fails at boot.
+# The boot SERVICE's start_pre creates+mounts+chowns it (Appendix A "Reboot survival").
+# For a one-off now:
+mkdir -p /run/ci-keys && mount -t ramfs ramfs /run/ci-keys
+chown cicd-runner:cicd-runner /run/ci-keys && chmod 700 /run/ci-keys
 
-# point the runner at the ramfs path; unlock-ci decrypts age-key.gpg into it at boot:
+# point the runner at the ramfs path:
 #   runner.conf: SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt
 ```
 No-root alternative to ramfs (if the box has **no swap**): use a `700` subdir of
@@ -266,21 +270,27 @@ unlock-ci && ci-status
 
 ---
 
-## 3. After reboot — only if you chose the ramfs hardening (§2.5/§25)
+## 3. After reboot — re-post the ramfs key
 
-**Simple key path (default): nothing to do** — the key persists on disk. Just
-confirm rootless dockerd came back (its service) and `ci-status` is green.
+The ramfs key is wiped on reboot (RAM-only, by design — §25). Everything else comes
+back automatically (docker service, ramfs mount + chown via `/etc/local.d`,
+`@reboot ci-recover`). You re-supply the key.
 
-**Hardened ramfs path only:** the key is wiped on reboot, so:
+**Key-in-pass (your setup) — from the Mac, one line (key never on disk/history):**
 ```bash
-sudo -iu cicd-runner unlock-ci     # enter GPG passphrase when prompted
-sudo -iu cicd-runner ci-status     # must show: key loaded, test decrypt OK
+pass show <your-key-entry> | ssh <user>@vps 'sudo -n -u cicd-runner /home/cicd-runner/runner/bin/unlock-ci'
+# → "runner key loaded into /run/ci-keys/age-keys.txt (pub: age1…) — clears on reboot"
+sudo -iu cicd-runner ci-status     # confirm: age key loaded
 ```
-`unlock-ci` (the installed script): decrypts `$RUNNER_BASE/etc/age-key.gpg` →
-`$SOPS_AGE_KEY_FILE` (the ramfs path), `chmod 600`. No `/etc`, no root (only the
-one-time ramfs *mount* in §2.5 needed root). If `/run/ci-keys` is empty after
-reboot that's expected (ramfs wipes) — just run `unlock-ci`; if the mount itself is
-gone, `sudo mount /run/ci-keys`.
+`unlock-ci` reads the key on **stdin** (the piped value), validates it's a real age
+key, writes `600` into the ramfs file. No `-t` on the ssh (a tty breaks the pipe).
+
+**GPG-at-rest variant** (if you chose §2.5 instead): `sudo -iu cicd-runner unlock-ci`
+with no stdin → decrypts `$RUNNER_BASE/etc/age-key.gpg` (prompts GPG passphrase).
+
+If `/run/ci-keys` is empty after reboot that's expected (ramfs wipes) — just re-post.
+If the mount itself is gone: `sudo mount /run/ci-keys` (then the `/etc/local.d` chown,
+or `sudo chown cicd-runner:cicd-runner /run/ci-keys`).
 
 ---
 
@@ -416,7 +426,7 @@ key after reboot is the #1 cause of "nothing happened."
 
 Install the bundled crontab (as `cicd-runner`):
 ```bash
-crontab /home/cicd-runner/src/cicd-runner/crontab.sample
+crontab /home/cicd-runner/src/crontab.sample
 crontab -l        # verify
 ```
 It wires the named scripts (each sources `runner.conf`):
@@ -569,6 +579,48 @@ rc-update add docker-rootless-ci default && rc-service docker-rootless-ci start
 (elogind alternative: `emerge sys-auth/elogind`, `rc-update add elogind boot`, then
 a per-user OpenRC 0.60 user service — but the system-level service above needs no
 elogind and no user session.)
+
+### Reboot survival — the production boot service (§33)
+Use the **version-controlled init script** (`cicd-runner/init/docker-rootless-cicd-runner.openrc`)
+instead of the hand-rolled Variant B above — it adds the ramfs key-dir bring-up to
+`start_pre` (verify-mounted-as-ramfs + chown) and computes the uid, so docker AND the
+key dir come back together on every boot.
+
+**Do NOT put `/run/ci-keys` in `/etc/fstab`.** `/run` is tmpfs (wiped each boot), so
+the mountpoint dir doesn't persist → an fstab mount fails at boot (no mountpoint) and
+can break `localmount` (which docker `need`s → cascade). `start_pre` owns the ramfs
+bring-up instead: (re)create the dir → mount ramfs → chown.
+```bash
+# 1) (if you added it earlier) remove the broken fstab line
+sed -i '\#/run/ci-keys#d' /etc/fstab
+
+# 2) install the shipped init script + enable at boot
+install -m755 /home/cicd-runner/src/init/docker-rootless-cicd-runner.openrc \
+  /etc/init.d/docker-rootless-cicd-runner
+rc-update add docker-rootless-cicd-runner default
+
+# 3) stop any manual `setsid dockerd-rootless` first, then start the service
+sudo -iu cicd-runner pkill -f dockerd-rootless 2>/dev/null; sleep 2
+rc-service docker-rootless-cicd-runner start
+```
+`start_pre` does (DESIGN §33 — self-contained, no fstab):
+```sh
+checkpath -d -m 0755 -o root:root /run/user
+checkpath -d -m 0700 -o cicd-runner:cicd-runner /run/user/$(id -u cicd-runner)
+checkpath -d -m 0700 /run/ci-keys                    # mountpoint (wiped each boot)
+mountpoint -q /run/ci-keys || mount -t ramfs ramfs /run/ci-keys
+chown cicd-runner:cicd-runner /run/ci-keys && chmod 700 /run/ci-keys
+```
+- The mountpoint **must be created in `start_pre`** (it's on tmpfs `/run`, gone each
+  boot) — *then* the ramfs is mounted over it. No fstab involved.
+- `/etc/local.d/00-ci-keys.start` is **redundant** — `rm` it (or leave it; idempotent).
+- **Verify after start** (and after a real reboot):
+  ```bash
+  rc-service docker-rootless-cicd-runner status        # started
+  findmnt /run/ci-keys                                 # FSTYPE must be ramfs (NOT tmpfs)
+  sudo -iu cicd-runner sh -c 'docker info 2>/dev/null | grep -i rootless'
+  ```
+- The key itself does NOT auto-restore (RAM-only, §25) — re-post it after reboot (§3).
 
 ### elogind activation (only if you chose the elogind route, not Variant B)
 `XDG_RUNTIME_DIR` is set by `pam_elogind.so` at session-open, which also creates
