@@ -3,7 +3,7 @@
 # the SEAM between dumb run dirs and any query engine. Each meta.json is already a single
 # fat line, so concatenating them IS valid NDJSON. Pipe it anywhere:
 #
-#   ci-runs | sq sql 'SELECT job, count(*) FROM data GROUP BY job'
+#   ci-runs | jq -s 'group_by(.job)'      (or duckdb/sqlite over the stream)
 #   ci-runs | jq -s 'group_by(.job)'
 #   ci-runs tovasol/agent-forge | sqlite3 …          # optional repo-prefix scope (arg 1)
 #
@@ -19,11 +19,15 @@ root="$RUNNER_BASE/runs"
 [ -d "$root" ] || exit 0
 # Emit only well-formed single-line JSON objects, each enriched with its run dir as a
 # "dir" field (the path is otherwise a dumb bucket, absent from meta — but you need it
-# to find output.log/cmd). A meta.json half-written during a crash (truncated, no
-# closing brace) or any stray non-JSON is dropped, so the stream a consumer sees is
-# always clean — one corrupt run can't break a query. Run dirs are filesystem-safe
-# (no quotes/newlines) so the raw splice is valid JSON.
-find "$root" -type f -name meta.json 2>/dev/null | while IFS= read -r m; do
-  line="$(grep -m1 -E '^\{.*\}$' "$m" 2>/dev/null)" || continue
-  [ -n "$line" ] && printf '{"dir":"%s",%s\n' "${m%/meta.json}" "${line#\{}"
-done
+# to find output.log/cmd). A meta.json half-written during a crash (truncated, no closing
+# brace) or any non-JSON is dropped, so the stream a consumer sees is always clean — one
+# corrupt run can't break a query. Run dirs are filesystem-safe (no quotes/newlines).
+#
+# One awk over all files (FNR==1 = the single-line meta; FILENAME = its path) instead of
+# a grep+printf per file — O(1) processes, not O(runs). xargs batches the file list.
+find "$root" -type f -name meta.json -print0 2>/dev/null \
+  | xargs -0 -r awk '
+      FNR==1 && /^\{.*\}$/ {
+        d = FILENAME; sub(/\/meta\.json$/, "", d)
+        print "{\"dir\":\"" d "\"," substr($0, 2)
+      }'

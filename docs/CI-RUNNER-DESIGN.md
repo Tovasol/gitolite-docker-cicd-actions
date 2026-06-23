@@ -223,18 +223,23 @@ to stop encoding them in the path at all:
 - **No symlinks / no stored views.** "latest per job", "last green (rollback ref)",
   "by branch", "timings" are all **derived by query**, never maintained as state — so
   nothing dangles and no migration is needed when a new view is wanted.
-- **Query seam = NDJSON.** Each `meta.json` is one line, so `ci-runs`
-  (`find runs -name meta.json -exec cat {} +`) emits an NDJSON stream that `sq`,
-  `jq`, `sqlite3`, or `duckdb` all consume. `ci-status` runs SQL over it with **`sq`**
-  (`sq -H --tsv sql '… FROM data'`) — sq auto-ingests the stream and infers columns, so
-  there is no hand-rolled table/view to maintain; the queries are plain SQLite SQL
-  (window functions etc.). The seam is engine-agnostic, so any other tool drops in for
-  ad-hoc use. The shell health/pending/teardown layer needs no engine at all.
+- **Query engine = DuckDB, reading the files directly.** `ci-status` runs its SQL via
+  DuckDB's native multi-file reader —
+  `read_json('runs/**/meta.json', format='newline_delimited', filename=true, ignore_errors=true)`
+  — so there is **no concatenation, no cache file, no ingest step**: DuckDB globs +
+  parses the meta files in parallel (≈0.13s for 3 queries over 500 runs). `filename`
+  gives each run's dir; `ignore_errors` + a `WHERE schema IS NOT NULL` filter drop any
+  partial/corrupt meta. (Earlier iterations used `sq` over a concatenated NDJSON stream,
+  which can't cache stdin and needed a materialized file + `sq add` — DuckDB's
+  query-files-in-place model deleted all that plumbing.) `ci-runs` still emits the NDJSON
+  stream (`find runs -name meta.json … | grep '^{…}$'`) for ad-hoc `jq`/pipe use; the
+  shell health/pending/teardown layer needs no engine at all.
 - **Failure states.** `status:running` + no live container after a crash = orphaned;
   surfaced in `ci-status` (flagged stale >2h), pruned by retention; the recovery re-run
   (newer `start_ns`) is what "latest" resolves to, so the stale one never masks it.
 
-- **History** → `ls -t ~/ci/runs/<repo…>/` or `ci-runs <repo> | sq …`
+- **History** → `ls -t ~/ci/runs/<repo…>/`, `ci-status <repo>`, or ad-hoc DuckDB:
+  `duckdb -c "SELECT … FROM read_json('~/ci/runs/<repo>/**/meta.json', format='newline_delimited', filename=true)"`
 - **Logs** → `cat .../output.log`; find the latest via `ci-status <repo>`
 - **Debug** → the `cmd` file re-runs the exact failed container by hand
 - **Group** (queue/coalescing) is still `repo+branch` — a SEPARATE tree (`queue/`),

@@ -4,29 +4,50 @@
 # Two layers, deliberately split so the tool never gets fragile (DESIGN section 3):
 #   * BASICS (key/docker/slots/pending/teardowns) - pure shell + find. Always work.
 #   * ANALYTICS (per-job rollups, recent, orphaned) - SQL over the run meta NDJSON via
-#     `sq` (https://sq.io). If sq isn't installed, this layer is skipped with a hint;
-#     the basics still render.
+#     DuckDB (reads the run meta.json files directly via a native glob). If duckdb
+#     isn't installed, this layer is skipped with a hint; the basics still render.
 #
 # Usage: ci-status [repo-prefix]      # optional scope, e.g. ci-status tovasol/agent-forge
 set -uo pipefail
 CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
 # shellcheck disable=SC1090
 . "$CICD_BASE/bin/lib.sh"; cicd_load_config
-SCOPE="${1:-}"
-
 have() { command -v "$1" >/dev/null 2>&1; }
-# Color is tty-gated (ANSI escapes are ASCII-safe; green/red status is worth keeping).
-# Glyphs are ALWAYS plain ASCII - multibyte box-drawing bought nothing but breakage
-# (busybox watch, dumb terminals, the earlier '...' parse bug). Honors NO_COLOR/TERM=dumb.
-if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; then
-  cB=$'\033[1m'; c0=$'\033[0m'; cD=$'\033[2m'; cG=$'\033[32m'; cR=$'\033[31m'
+
+# args: [repo-scope] [--color|--no-color]
+SCOPE=""; force_color=auto
+for a in "$@"; do case "$a" in
+  --color)    force_color=on ;;
+  --no-color) force_color=off ;;
+  -*)         ;;                         # ignore unknown flags
+  *)          SCOPE="$a" ;;
+esac; done
+
+# Color decision (glyphs stay ASCII always — multibyte bought nothing but breakage).
+# Default auto: color on a real tty only. Force on with --color or CLICOLOR_FORCE (so
+# `watch --color 'ci-status --color'` shows color); off with --no-color or NO_COLOR.
+color=0
+case "$force_color" in
+  on)  color=1 ;;
+  off) color=0 ;;
+  *)   { [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; } && color=1 ;;
+esac
+[ -n "${CLICOLOR_FORCE:-}" ] && [ "$force_color" != off ] && color=1
+if [ "$color" = 1 ]; then
+  cB=$'\033[1m'; c0=$'\033[0m'; cD=$'\033[2m'; cG=$'\033[32m'; cR=$'\033[31m'; cY=$'\033[33m'
 else
-  cB=''; c0=''; cD=''; cG=''; cR=''
+  cB=''; c0=''; cD=''; cG=''; cR=''; cY=''
 fi
 gMid='|'; gArr='->'; bar='--------------------------------------'
 ok()   { printf '  %s[ok]%s   %s\n' "$cG" "$c0" "$*"; }
 no()   { printf '  %s[!!]%s   %s\n' "$cR" "$c0" "$*"; }
 rule() { printf '\n%s%s %s %s%s\n' "$cB" "${bar:0:2}" "$*" "$bar" "$c0"; }
+# cstatus <status> <width> -> width-padded + colored (pad first so escapes don't break
+# alignment): green exit:0, yellow running, red anything else (exit:N, timeout, …).
+cstatus() {
+  local c=""; case "$1" in exit:0) c="$cG" ;; running) c="$cY" ;; *) c="$cR" ;; esac
+  printf '%s%-*s%s' "$c" "$2" "$1" "$c0"
+}
 
 age_fmt() {  # <seconds-ago> -> compact age
   local s="${1:-}"; case "$s" in ''|*[!0-9]*) printf '?'; return ;; esac
@@ -46,21 +67,22 @@ iso_age() {  # <iso> -> seconds since (GNU date; '?' if unparseable)
   printf '%s' "$(( $(date +%s) - e ))"
 }
 
-# --- analytics engine: run a SELECT over the run-meta NDJSON via sq (which auto-ingests
-# + infers columns, so there's no hand-rolled table). ci-runs already filters to clean
-# JSON lines, so a partial/corrupt meta can't break the query. -----------------------
-ndjson() { "$CICD_BASE/bin/ci-runs" "$SCOPE" 2>/dev/null; }
-# Analytics engine: sq (https://sq.io) runs SQL directly over the NDJSON run stream. It
-# auto-ingests and infers columns from the JSON keys, so there is NO hand-rolled table /
-# view to maintain - piped data is the table `data`. `-H` drops the header row, `--tsv`
-# emits tab-separated rows (SQLite SQL underneath, so window functions etc. work). The
-# health/pending/teardown basics are pure shell, so they work with or without sq.
-ENGINE=none; have sq && ENGINE=sq
-runsql() { ndjson | sq -H --tsv sql "$1" 2>/dev/null; }  # <select-sql> -> TSV rows
+# --- analytics engine: DuckDB reads the run meta.json files DIRECTLY via a native glob —
+# no concatenation, no cache file, no ingest plumbing. `filename` yields each run's dir;
+# `ignore_errors` + the `schema` filter drop any partial/corrupt meta. DuckDB's parallel
+# JSON reader is fast (~3 queries over 500 runs ≈ 0.13s), so we just re-glob per query.
+# A query references the `data` CTE; runsql prepends it. read_json over an empty glob
+# errors (suppressed) -> empty output -> the sections show "(no runs yet)".
+ENGINE=none; have duckdb && ENGINE=duckdb
+RUNS_GLOB="$RUNNER_BASE/runs/${SCOPE:+$SCOPE/}**/meta.json"
+DATA_CTE="WITH data AS (SELECT *, regexp_replace(filename,'/meta\.json\$','') AS dir
+  FROM read_json('$RUNS_GLOB', format='newline_delimited', filename=true, ignore_errors=true, union_by_name=true)
+  WHERE schema IS NOT NULL)"
+runsql() { duckdb -noheader -list -separator $'\t' -c "$DATA_CTE $1" 2>/dev/null; }  # <query on `data`>
 
 # =============================== render =====================================
 # Buffer the whole report and flush ONCE, so it snaps onto the screen instead of
-# dribbling section-by-section (each docker/sq call adds latency) over ssh + screen.
+# dribbling section-by-section (each docker/duckdb call adds latency) over ssh + screen.
 # Color was already decided above against the real tty (fd1), so capturing is safe.
 exec 3>&1; _BUF="$(mktemp)"; trap 'cat "$_BUF" >&3 2>/dev/null; rm -f "$_BUF"' EXIT; exec >"$_BUF"
 
@@ -74,25 +96,28 @@ if docker info >/dev/null 2>&1; then ok "docker reachable (rootless)"
 else no "docker NOT reachable (DOCKER_HOST=${DOCKER_HOST:-unset}) - rootless dockerd up?"; fi
 printf '  slots %s/%s free   analytics engine: %s\n' \
   "$(ls "$RUNNER_BASE/slots" 2>/dev/null | wc -l | tr -d ' ')" "${MAX_JOBS}" \
-  "$([ "$ENGINE" = none ] && echo 'none - install sq (https://sq.io)' || echo "$ENGINE")"
+  "$([ "$ENGINE" = none ] && echo 'none - install duckdb (run fetch-tools.sh)' || echo "$ENGINE")"
 
 # --- jobs: per (repo,job) rollup -------------------------------------------------
 rule "jobs"
 # coalesce nullable columns -> '-' so no TSV field is ever empty (empty fields collapse
 # under tab-IFS `read` and shift columns). running rows have null duration; never-green
 # jobs have null last_green; etc.
-JOBS_SQL="WITH r AS (SELECT *, row_number() OVER (PARTITION BY repo,job ORDER BY start_ns DESC) rn FROM data)
-SELECT repo, job,
+# DuckDB is strict-typed (start parses as TIMESTAMP): strftime for date strings,
+# ::VARCHAR for numbers shown as text. The window goes in a subquery (the data CTE is
+# prepended by runsql, so the query itself can't open another top-level WITH).
+JOBS_SQL="SELECT repo, job,
   max(CASE WHEN rn=1 THEN status END),
-  coalesce(max(CASE WHEN rn=1 THEN duration_s END),'-'),
-  max(CASE WHEN rn=1 THEN start END),
+  coalesce(max(CASE WHEN rn=1 THEN duration_s END)::VARCHAR,'-'),
+  coalesce(strftime(max(CASE WHEN rn=1 THEN start END),'%Y-%m-%dT%H:%M:%SZ'),'-'),
   count(*),
   sum(CASE WHEN exit IS NOT NULL AND exit<>0 THEN 1 ELSE 0 END),
-  coalesce(substr(max(CASE WHEN exit=0 THEN start END),1,10),'-'),
-  coalesce(substr(max(CASE WHEN exit IS NOT NULL AND exit<>0 THEN start END),1,10),'-')
-FROM r GROUP BY repo, job ORDER BY repo, job;"
+  coalesce(strftime(max(CASE WHEN exit=0 THEN start END),'%Y-%m-%d'),'-'),
+  coalesce(strftime(max(CASE WHEN exit IS NOT NULL AND exit<>0 THEN start END),'%Y-%m-%d'),'-')
+FROM (SELECT *, row_number() OVER (PARTITION BY repo,job ORDER BY start_ns DESC) rn FROM data)
+GROUP BY repo, job ORDER BY repo, job;"
 if [ "$ENGINE" = none ]; then
-  echo "  (sq not installed - run fetch-tools.sh; needed for per-job rollups)"
+  echo "  (duckdb not installed - run fetch-tools.sh; needed for per-job rollups)"
 else
   printf '  %s%-34s %-9s %5s %7s %4s %4s %-11s %-11s%s\n' "$cD" \
     JOB STATUS AGE DUR RUNS FAIL LAST-GREEN LAST-RED "$c0"
@@ -100,8 +125,8 @@ else
   if [ -z "$rows" ]; then echo "  (no runs yet)"; else
     printf '%s\n' "$rows" | while IFS=$'\t' read -r repo job st dur start n fail green red; do
       [ -n "$job" ] || continue
-      printf '  %-34s %-9s %5s %7s %4s %4s %-11s %-11s\n' \
-        "$repo/$job" "$st" "$(age_fmt "$(iso_age "$start")")" "$(dur_fmt "$dur")" \
+      printf '  %-34s %s %5s %7s %4s %4s %-11s %-11s\n' \
+        "$repo/$job" "$(cstatus "$st" 9)" "$(age_fmt "$(iso_age "$start")")" "$(dur_fmt "$dur")" \
         "$n" "$fail" "${green:--}" "${red:--}"
     done
   fi
@@ -109,7 +134,8 @@ fi
 
 # --- recent runs -----------------------------------------------------------------
 rule "recent runs"
-REC_SQL="SELECT status, coalesce(duration_s,'-'), start, job, branch, substr(sha,1,8), dir
+REC_SQL="SELECT status, coalesce(duration_s::VARCHAR,'-'),
+  coalesce(strftime(start,'%Y-%m-%dT%H:%M:%SZ'),'-'), job, branch, substr(sha,1,8), dir
 FROM data ORDER BY start_ns DESC LIMIT ${CI_STATUS_RECENT:-12};"
 if [ "$ENGINE" = none ]; then
   find "$RUNNER_BASE/runs" -type f -name meta.json -printf '%T@ %h\n' 2>/dev/null \
@@ -118,15 +144,15 @@ else
   printf '  %s%-9s %7s %-20s %-20s %-9s %s%s\n' "$cD" STATUS DUR STARTED "JOB${gMid}BRANCH" SHA RUN-DIR "$c0"
   runsql "$REC_SQL" | while IFS=$'\t' read -r st dur start job branch sha dir; do
     [ -n "$st" ] || continue
-    printf '  %-9s %7s %-20s %-20s %-9s %s%s%s\n' \
-      "$st" "$(dur_fmt "$dur")" "$start" "${job}${gMid}${branch}" "$sha" "$cD" "${dir#"$RUNNER_BASE"/}" "$c0"
+    printf '  %s %7s %-20s %-20s %-9s %s%s%s\n' \
+      "$(cstatus "$st" 9)" "$(dur_fmt "$dur")" "$start" "${job}${gMid}${branch}" "$sha" "$cD" "${dir#"$RUNNER_BASE"/}" "$c0"
   done
 fi
 printf '  %s%s cat <run-dir>/output.log   %s   ci-log [repo] [job]  jumps to the newest%s\n' "$cD" "$gArr" "$gMid" "$c0"
 
 # --- orphaned (status=running) ---------------------------------------------------
 if [ "$ENGINE" != none ]; then
-  orph="$(runsql "SELECT repo,job,branch,start FROM data WHERE status='running' ORDER BY start_ns DESC;")"
+  orph="$(runsql "SELECT repo,job,branch,coalesce(strftime(start,'%Y-%m-%dT%H:%M:%SZ'),'-') FROM data WHERE status='running' ORDER BY start_ns DESC;")"
   if [ -n "$orph" ]; then
     rule "running / possibly orphaned"
     printf '%s\n' "$orph" | while IFS=$'\t' read -r repo job branch start; do

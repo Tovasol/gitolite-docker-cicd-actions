@@ -37,9 +37,12 @@ out="$(CICD_BASE="$TB" bash "$HERE/../bin/ci-runs" 2>/dev/null)"
 assert_eq    "ci-runs emits only the 1 valid line" "$(printf '%s\n' "$out" | grep -c '^{.*}$')" 1
 assert_match "valid line is the good one"          "$out" '"job":"smoke"'
 assert_no_match "garbage dropped"                  "$out" 'NOT JSON'
-if command -v sq >/dev/null 2>&1; then
-  assert_ok "sq query over filtered stream works" bash -c "printf '%s\n' \"\$1\" | sq -H --tsv sql 'SELECT job FROM data' >/dev/null" _ "$out"
-else skip "sq query" "sq not installed"; fi
+# DuckDB (ci-status's engine) reads the same run dirs directly; ignore_errors + the schema
+# filter must drop the garbage/truncated meta and keep exactly the 1 valid row.
+if command -v duckdb >/dev/null 2>&1; then
+  n="$(duckdb -noheader -list -c "SELECT count(*) FROM read_json('$RD/**/meta.json', format='newline_delimited', ignore_errors=true, union_by_name=true) WHERE schema IS NOT NULL" 2>/dev/null)"
+  assert_eq "duckdb glob skips corrupt (1 valid row)" "${n:-x}" 1
+else skip "duckdb glob" "duckdb not installed"; fi
 rm -rf "$TB"
 
 suite "malformed ci.yml tolerance"

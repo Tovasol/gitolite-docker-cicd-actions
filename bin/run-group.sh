@@ -91,7 +91,7 @@ jesc() { printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
 # Fat, single-line meta.json — the SOURCE OF TRUTH for a run (path is a dumb bucket).
 # Identity (META_*) is set once per run by the caller; this writes/overwrites the line
-# with the dynamic status/timing. NDJSON-friendly: one object, one line, sq/jq/sqlite
+# with the dynamic status/timing. NDJSON-friendly: one object, one line, duckdb/jq/sqlite
 # all consume `find runs -name meta.json -exec cat {} +`. schema:1 = additive-only.
 emit_meta() {  # <file> <status> [exit] [end_iso] [end_ns] [dur]  (last 4 optional)
   local f="$1" status="$2" ex="${3:-}" eiso="${4:-}" ens="${5:-}" dur="${6:-}" end_j ens_j dur_j ex_j

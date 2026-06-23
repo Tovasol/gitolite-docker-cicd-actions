@@ -458,8 +458,11 @@ git commit -am "ci: rotate runner key" && git push
 
 ```bash
 # dashboard first — health + per-job rollups + recent runs + orphaned + pending:
-ci-status                       # everything;  ci-status <repo>  to scope
-ci-runs <repo> | sq sql 'SELECT job,status,start FROM data ORDER BY start_ns DESC LIMIT 20'
+ci-status                       # everything;  ci-status <repo>  to scope;  --color for watch
+# ad-hoc analytics straight over the run files (no concat — DuckDB globs them):
+duckdb -c "SELECT job,status,start FROM read_json('$HOME/runner/runs/<repo>/**/meta.json', \
+  format='newline_delimited', filename=true, ignore_errors=true) WHERE schema IS NOT NULL \
+  ORDER BY start_ns DESC LIMIT 20"
 
 # runs are FLAT + meta-driven: runs/<repo…>/<ts>-<sha8>-<job>/ (branch+job are IN meta).
 ls -t /home/cicd-runner/runner/runs/<repo>/ | head     # newest run dirs for a repo

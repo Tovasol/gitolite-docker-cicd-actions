@@ -29,20 +29,20 @@ if ! have age-keygen; then
   install -m755 "$tmp"/age/age "$tmp"/age/age-keygen "$BIN/"
   rm -rf "$tmp"
 fi
-# sq (SQL over JSON) — powers ci-status analytics. OPTIONAL: the runner never needs it;
-# ci-status degrades to its dependency-light view if absent. Asset name varies by release,
-# so resolve the real linux/<arch> tarball via the GitHub API; never fatal.
-if ! have sq; then
-  echo "→ sq (neilotoole, latest, $A) [optional: ci-status analytics]"
+# duckdb — powers ci-status analytics (reads the run meta.json files directly via a native
+# glob; no concat/cache plumbing). OPTIONAL: the runner core never needs it; ci-status
+# degrades to its dependency-light view if absent. Single static binary in a .zip.
+if ! have duckdb; then
+  case "$A" in amd64) da=amd64 ;; arm64) da=aarch64 ;; *) da="$A" ;; esac
+  echo "→ duckdb (latest, linux-$da) [optional: ci-status analytics]"
   tmp="$(mktemp -d)"
-  url="$(curl -fsSL https://api.github.com/repos/neilotoole/sq/releases/latest 2>/dev/null \
-         | grep -oE 'https://[^"]+linux[._-]'"$A"'\.tar\.gz' | head -1)"
-  if [ -n "$url" ] && curl -fsSL "$url" -o "$tmp/sq.tgz" && tar xzf "$tmp/sq.tgz" -C "$tmp" 2>/dev/null; then
-    f="$(find "$tmp" -type f -name sq | head -1)"
-    [ -n "$f" ] && install -m755 "$f" "$BIN/sq" && echo "  sq -> $BIN/sq"
+  url="https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-$da.zip"
+  if command -v unzip >/dev/null 2>&1 && curl -fsSL "$url" -o "$tmp/d.zip" \
+     && unzip -o "$tmp/d.zip" -d "$tmp" >/dev/null 2>&1 && [ -f "$tmp/duckdb" ]; then
+    install -m755 "$tmp/duckdb" "$BIN/duckdb" && echo "  duckdb -> $BIN/duckdb"
   fi
-  command -v "$BIN/sq" >/dev/null 2>&1 || have sq || \
-    echo "  (sq not installed — analytics optional; grab it from https://sq.io into $BIN)"
+  command -v "$BIN/duckdb" >/dev/null 2>&1 || have duckdb || \
+    echo "  (duckdb not installed — analytics optional; needs unzip+network, or emerge dev-db/duckdb / https://duckdb.org)"
   rm -rf "$tmp"
 fi
 
