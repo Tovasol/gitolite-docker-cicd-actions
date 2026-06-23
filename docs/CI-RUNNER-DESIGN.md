@@ -196,16 +196,28 @@ throwaway run.
   queue/<group>/group.lock       # flock target for per-group serialization
   slots/1 .. slots/N             # global concurrency semaphore (flock each)
   secrets/<repo>/<ns>.env        # per-repo secret namespaces, chmod 600
-  runs/<group>/<ts>-<sha8>/
+  runs/<group>/<ts>-<sha8>-<job>/
       status                     # queued | running | exit:<n> | timeout | cancelled
       meta.json                  # repo, branch, sha, trigger reason, start, end, duration
       cmd                        # exact `docker run …` invocation — reproducible by hand
       output.log                 # combined stdout+stderr
-  runs/<group>/latest -> <newest>
+  runs/<group>/.latest/<job>        -> newest run of THAT job
+  runs/<group>/.latest/<job>@ok     -> last GREEN run of that job (rollback / last-good ref)
+  runs/<group>/.latest/<job>@fail   -> last RED run of that job (jump to last failure)
 ```
 
+**Per-job `latest` pointers (not one global `latest`).** With multiple jobs per push
+of differing cadence (e.g. `smoke` every push, `deploy-site` only on site changes), a
+single `runs/<group>/latest` is last-writer-wins → it tracks the most *frequent* job
+(smoke), not the most *important* (deploy), and the deploy pointer is clobbered by the
+next unrelated push. So the runner maintains **per-job** symlinks under `.latest/`:
+`<job>` (newest), `<job>@ok` (last success — the rollback/last-good-deploy reference),
+`<job>@fail` (last failure — the debug entry point). The old single `latest` is
+removed (nothing parsed it; it was a human convenience that lied). `ci-status` prints
+a per-job summary from these, and still lists the raw time-sorted recent runs.
+
 - **History** → `ls -t ~/ci/runs/<group>/`
-- **Logs** → `cat .../output.log`, live `tail -f .../latest/output.log`
+- **Logs** → `cat .../output.log`, live `tail -f .../.latest/<job>/output.log`
 - **Debug** → the `cmd` file re-runs the exact failed container by hand;
   `status` has the exit code
 - **Group** = `repo[+branch]` (this is "grouping", Laminar-style)

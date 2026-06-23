@@ -7,6 +7,14 @@ CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
 
 ok() { printf '  [ok]   %s\n' "$*"; }
 no() { printf '  [FAIL] %s\n' "$*"; }
+fmtdur() {  # <seconds>|"" -> human duration
+  local d="${1:-}"; case "$d" in ''|*[!0-9]*) printf '—'; return ;; esac
+  if   [ "$d" -ge 3600 ]; then printf '%dh%02dm' $((d/3600)) $(((d%3600)/60))
+  elif [ "$d" -ge 60 ];   then printf '%dm%02ds' $((d/60)) $((d%60))
+  else printf '%ds' "$d"; fi
+}
+mstart() { sed -n 's/.*"start":"\([^"]*\)".*/\1/p' "$1/meta.json" 2>/dev/null | head -1; }   # ISO start
+rundur() { cat "$1/duration" 2>/dev/null; }                                                  # seconds
 
 echo "cicd-runner status @ $(_ts)"
 
@@ -24,13 +32,31 @@ else no "docker not reachable (DOCKER_HOST=$DOCKER_HOST) — is rootless dockerd
 sample="$(find "$RUNNER_BASE/runs" -maxdepth 0 2>/dev/null)"
 echo "  base: $RUNNER_BASE   slots: $(ls "$RUNNER_BASE/slots" 2>/dev/null | wc -l)/${MAX_JOBS}"
 
-# 4. recent runs
+# 4a. latest per job (per-job pointers; DESIGN §3 — no single ambiguous 'latest')
+echo "latest per job:"
+find "$RUNNER_BASE/runs" -type d -name .latest 2>/dev/null | sort | while read -r L; do
+  grp="${L%/.latest}"; grp="${grp#"$RUNNER_BASE"/runs/}"
+  for p in "$L"/*; do
+    [ -L "$p" ] || continue
+    b="$(basename "$p")"; case "$b" in *@ok|*@fail) continue ;; esac
+    st="$(cat "$p/status" 2>/dev/null)"; [ -n "$st" ] || st="(pruned)"
+    dur="$(fmtdur "$(rundur "$p")")"; started="$(mstart "$p")"
+    extra=""
+    [ -L "$L/$b@ok" ]   && extra="$extra ok=$(basename "$(readlink "$L/$b@ok")"   2>/dev/null)"
+    [ -L "$L/$b@fail" ] && extra="$extra fail=$(basename "$(readlink "$L/$b@fail")" 2>/dev/null)"
+    printf '  %-26s %-10s %7s  started %s%s\n' "$grp/$b" "$st" "$dur" "${started:-—}" "$extra"
+  done
+done
+
+# 4b. recent runs
 # NOTE: run dirs are runs/<repo>/<branch>/<ts-sha-job>/status and <repo> may contain
 # slashes (e.g. tovasol/agent-forge), so status sits 4–6 levels deep. Don't cap depth.
-echo "recent runs:"
+echo "recent runs:                 status     dur      started               run"
 find "$RUNNER_BASE/runs" -type f -name status -printf '%T@ %p\n' 2>/dev/null \
   | sort -rn | head -10 | while read -r _ s; do
-      d="$(dirname "$s")"; printf '  %-10s %s\n' "$(cat "$s")" "${d#$RUNNER_BASE/runs/}"
+      d="$(dirname "$s")"
+      printf '  %-10s %7s  %-20s  %s\n' \
+        "$(cat "$s")" "$(fmtdur "$(rundur "$d")")" "$(mstart "$d")" "${d#$RUNNER_BASE/runs/}"
     done
 
 # 5. queued-but-unprocessed (crash recovery hint)

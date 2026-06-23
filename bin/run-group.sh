@@ -64,6 +64,24 @@ trap ':' EXIT                                 # slot/lock fds auto-release on ex
 
 src_sha() { [ "$1" = delete ] && printf '%s' "$3" || printf '%s' "$2"; }  # event new old
 
+# Per-job latest pointers (DESIGN §3). No single ambiguous `latest` (a frequent job
+# like smoke would clobber the deploy pointer). Maintain, per job: <job> (newest),
+# <job>@ok (last green — rollback ref), <job>@fail (last red — debug entry point).
+link_latest() {  # <job> <rundir> <rc>
+  local job="$1" rdir="$2" rc="$3" L="$RUNS/.latest"
+  mkdir -p "$L"
+  ln -sfn "$rdir" "$L/$job"
+  if [ "$rc" -eq 0 ]; then ln -sfn "$rdir" "$L/$job@ok"; else ln -sfn "$rdir" "$L/$job@fail"; fi
+}
+
+# run timing: meta.json already carries the ISO start; record epoch for math + end+dur.
+mark_start() { date +%s > "$1/.start.epoch"; }      # <rundir>
+mark_end() {  # <rundir>
+  local e s; e="$(date +%s)"; s="$(cat "$1/.start.epoch" 2>/dev/null || echo "$e")"
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$1/ended"
+  printf '%s\n' "$((e - s))" > "$1/duration"        # whole seconds
+}
+
 # Readiness gates (deferred-recovery, §33). When the environment can't run a job
 # (docker down, or key not loaded for a secret-using job), DEFER it: leave the target
 # pending + keep the incoming tar, so it auto-runs once ready (ci-recover / unlock-ci).
@@ -99,7 +117,7 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   name="cicd-$(printf '%s' "$group-$job" | tr -c 'a-zA-Z0-9_.-' '-')-$ts"
   printf '{"group":"%s","job":"%s","event":"%s","sha":"%s","branch":"%s","pusher":"%s","start":"%s"}\n' \
     "$group" "$job" "$event" "$newrev" "$branch" "$pusher" "$(_ts)" > "$dir/meta.json"
-  echo running > "$dir/status"
+  echo running > "$dir/status"; mark_start "$dir"
 
   envfile=""
   if [ -f "$work/ci/secrets.enc.yaml" ]; then
@@ -141,7 +159,7 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   rc=$?
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; rc=124; fi
   if [ "$rc" -eq 124 ]; then status_word=timeout; else status_word="exit:$rc"; fi
-  echo "$status_word" > "$dir/status"; ln -sfn "$dir" "$RUNS/latest"
+  echo "$status_word" > "$dir/status"; mark_end "$dir"; link_latest "$job" "$dir" "$rc"
   cicd_flush_outbox "$outdir/notify" "$rc" "$dir" "$group/$job" "$envfile"
   [ "$rc" -eq 0 ] && log "$group/$job: done" || log "$group/$job: FAILED $status_word"
   [ -n "$envfile" ] && rm -f "$envfile"
@@ -183,7 +201,7 @@ run_teardown() {  # <oldrev> <pusher>
   local oldrev="$1" pusher="$2" ts dir name envfile rc
   local work="" manifest="" tjob="" image runcmd mountwork outdir srctar secsrc
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  dir="$RUNS/$ts-teardown"; mkdir -p "$dir"; echo running > "$dir/status"
+  dir="$RUNS/$ts-teardown"; mkdir -p "$dir"; echo running > "$dir/status"; mark_start "$dir"
   name="cicd-teardown-$(printf '%s' "$group" | tr -c 'a-zA-Z0-9_.-' '-')-$ts"
 
   # --- source tree: hook-delivered incoming/<oldrev>.tar -> else persisted env source.tar ---
@@ -247,7 +265,7 @@ run_teardown() {  # <oldrev> <pusher>
       >>"$dir/output.log" 2>&1
   rc=$?
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; rc=1; fi
-  echo "exit:$rc" > "$dir/status"; ln -sfn "$dir" "$RUNS/latest"
+  echo "exit:$rc" > "$dir/status"; mark_end "$dir"; link_latest teardown "$dir" "$rc"
 
   if [ "$rc" -eq 0 ]; then
     cicd_flush_outbox "$outdir/notify" 0 "$dir" "$group teardown" "$envfile"
