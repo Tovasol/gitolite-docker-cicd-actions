@@ -24,7 +24,9 @@ if command -v sq >/dev/null 2>&1; then
   sq -H --tsv sql "SELECT suite, test, detail FROM data WHERE status='fail'" < "$REPORT" 2>/dev/null \
     | while IFS=$'\t' read -r s t d; do printf '  ✗ %s / %s — %s\n' "$s" "$t" "$d"; done
 else
-  for s in pass fail skip; do printf '  %-5s %s\n' "$s" "$(grep -c "\"status\":\"$s\"" "$REPORT" 2>/dev/null || echo 0)"; done
+  # grep -c already prints "0" on no match (and exits 1); `|| true` swallows that exit
+  # WITHOUT appending a second 0 (the old `|| echo 0` doubled it -> stray "0" lines).
+  for s in pass fail skip; do printf '  %-5s %s\n' "$s" "$(grep -c "\"status\":\"$s\"" "$REPORT" 2>/dev/null || true)"; done
 fi
 
 [ "$fails" -eq 0 ] && { echo; echo "ALL SUITES PASSED"; } || { echo; echo "SUITES FAILED: $fails"; }
