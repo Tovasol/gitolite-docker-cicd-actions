@@ -235,13 +235,24 @@ install -Dm755 /home/cicd-runner/runner/bin/post-receive "$LOCAL_CODE/hooks/comm
 chown -R git:git "$LOCAL_CODE"
 sudo -iu git gitolite setup --hooks-only
 
-# 2) the sudo bridge — git may run ONLY cicd-ingest as cicd-runner, no password
-cat > /etc/sudoers.d/cicd-runner <<'EOF'
-git ALL=(cicd-runner) NOPASSWD: /home/cicd-runner/runner/bin/cicd-ingest
-Defaults!/home/cicd-runner/runner/bin/cicd-ingest !requiretty
+# 2) the sudo bridge. git may run, as cicd-runner, ONLY: cicd-ingest (write: archive-push),
+#    and ci-status/ci-log (read-only, for the `ci-job status|log` inspect proxy, §34).
+#    Nothing else; no shell. The read commands expose run metadata only - never secrets
+#    or the age key. ci-job (running as git) computes the repo scope from gitolite access,
+#    so a user can never inspect a repo they can't read.
+B=/home/cicd-runner/runner/bin
+cat > /etc/sudoers.d/cicd-runner <<EOF
+git ALL=(cicd-runner) NOPASSWD: $B/cicd-ingest, $B/ci-status, $B/ci-log
+Defaults!$B/cicd-ingest,$B/ci-status,$B/ci-log !requiretty
 EOF
 chmod 440 /etc/sudoers.d/cicd-runner
 visudo -cf /etc/sudoers.d/cicd-runner          # validate
+
+# 3) enable the ci-job gitolite command (update-runner installs the script into
+#    LOCAL_CODE/commands/ci-job). Add 'ci-job' to the ENABLE list in ~git/.gitolite.rc:
+#       ENABLE => [ ..., 'ci-job', ],
+#    then:  sudo -u git gitolite setup
+#    Use it:  ssh git@host ci-job help
 ```
 Notes:
 - **No chmod needed on cicd-runner's home.** `sudo -u cicd-runner cicd-ingest`

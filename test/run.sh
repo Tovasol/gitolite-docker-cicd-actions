@@ -10,7 +10,8 @@ REPORT="${1:-$HERE/report.ndjson}"; : > "$REPORT"
 export CICD_TEST_REPORT="$REPORT"
 
 fails=0
-for t in lint.sh unit_lib.test.sh unit_meta.test.sh adversarial.test.sh; do
+# lint first, then every *.test.sh (auto-discovered, so new suites just drop in).
+for t in lint.sh $(cd "$HERE" && ls -1 ./*.test.sh 2>/dev/null | sed 's#^\./##'); do
   [ -f "$HERE/$t" ] || continue
   bash "$HERE/$t" || fails=$((fails + 1))
 done

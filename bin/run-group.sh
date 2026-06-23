@@ -317,10 +317,13 @@ run_teardown() {  # <oldrev> <pusher>
   return "$rc"
 }
 
-# Process one create/push target from the delivered tar.
-process_build() {  # <event> <newrev> <oldrev> <pusher>
-  local event="$1" newrev="$2" oldrev="$3" pusher="$4"
-  local work manifest changed any=1 srctar
+# Process one create/push/run target from the delivered tar.
+# event 'run' = MANUAL trigger (ci-job run): matches push-triggers but BYPASSES path
+# filters; with onlyjob it force-runs exactly that job (branch/path filters skipped).
+process_build() {  # <event> <newrev> <oldrev> <pusher> [onlyjob]
+  local event="$1" newrev="$2" oldrev="$3" pusher="$4" onlyjob="${5:-}"
+  local work manifest changed any=1 srctar manual=0 mevent="$1"
+  [ "$event" = run ] && { manual=1; mevent=push; }
   srctar="$INC/$newrev.tar"
   [ -f "$srctar" ] || { log "$group: no delivered source for $newrev (incoming missing)"; return 1; }
   work="$(mktemp -d)"
@@ -340,19 +343,25 @@ process_build() {  # <event> <newrev> <oldrev> <pusher>
 
   local job inc ign pinc pign
   for job in $(yq_keys "$manifest" ".jobs"); do
-    [ -n "$(yq_str "$manifest" ".jobs.\"$job\".on.$event")" ] || continue
-    inc="$(yq_list "$manifest" ".jobs.\"$job\".on.$event.branches")"
-    ign="$(yq_list "$manifest" ".jobs.\"$job\".on.$event.\"branches-ignore\"")"
-    branch_matches "$branch" "$inc" "$ign" || { log "$group/$job: branch filtered"; continue; }
-    if [ "$event" = "push" ] || [ "$event" = "create" ]; then
-      pinc="$(yq_list "$manifest" ".jobs.\"$job\".on.$event.paths")"
-      pign="$(yq_list "$manifest" ".jobs.\"$job\".on.$event.\"paths-ignore\"")"
-      if [ -n "$pinc$pign" ] && ! paths_match "$changed" "$pinc" "$pign"; then
-        log "$group/$job: paths filtered"; continue
+    if [ -n "$onlyjob" ]; then
+      # explicit single job (ci-job run --job): force it, skip trigger/branch/path filters.
+      [ "$job" = "$onlyjob" ] || continue
+    else
+      [ -n "$(yq_str "$manifest" ".jobs.\"$job\".on.$mevent")" ] || continue
+      inc="$(yq_list "$manifest" ".jobs.\"$job\".on.$mevent.branches")"
+      ign="$(yq_list "$manifest" ".jobs.\"$job\".on.$mevent.\"branches-ignore\"")"
+      branch_matches "$branch" "$inc" "$ign" || { log "$group/$job: branch filtered"; continue; }
+      # path filters apply to real pushes only — a manual run targets a version, not a diff.
+      if [ "$manual" -eq 0 ] && { [ "$mevent" = "push" ] || [ "$mevent" = "create" ]; }; then
+        pinc="$(yq_list "$manifest" ".jobs.\"$job\".on.$mevent.paths")"
+        pign="$(yq_list "$manifest" ".jobs.\"$job\".on.$mevent.\"paths-ignore\"")"
+        if [ -n "$pinc$pign" ] && ! paths_match "$changed" "$pinc" "$pign"; then
+          log "$group/$job: paths filtered"; continue
+        fi
       fi
     fi
     any=0
-    execute_job "$job" "$event" "$newrev" "$pusher" "$work" "$manifest"
+    execute_job "$job" "$mevent" "$newrev" "$pusher" "$work" "$manifest"
   done
 
   persist_env_for_teardown "$work" "$manifest" "$srctar"   # branch + source.tar for future teardown
@@ -369,7 +378,7 @@ while :; do
   [ -f "$Q/target" ] || break
   target="$(cat "$Q/target")"
   [ "$target" = "$last" ] && break
-  read -r event newrev oldrev pusher <<< "$target"
+  read -r event newrev oldrev pusher onlyjob <<< "$target"
   pusher="${pusher:-unknown}"
 
   # readiness gate: docker must be up to run ANYTHING (post-reboot / docker-down window).
@@ -382,12 +391,12 @@ while :; do
   rc=0
   case "$event" in
     delete) run_teardown "$oldrev" "$pusher"; rc=$? ;;
-    create|push)
+    create|push|run)
       if [ "${DELETE_SUPERSEDES:-1}" = "1" ]; then
         nxt="$(cat "$Q/target")"; read -r nev _ _ _ <<< "$nxt"
         [ "$nev" = "delete" ] && { last=""; continue; }
       fi
-      process_build "$event" "$newrev" "$oldrev" "$pusher"; rc=$? ;;
+      process_build "$event" "$newrev" "$oldrev" "$pusher" "$onlyjob"; rc=$? ;;
     *) log "$group: unknown event '$event'" ;;
   esac
 

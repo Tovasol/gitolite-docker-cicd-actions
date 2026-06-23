@@ -8,7 +8,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; ROOT="$HERE/.."
 
 # scripts to lint: bin/* + lib/* + installers + the repo-side ci/*.sh + the tests.
 mapfile -t FILES < <(
-  ls "$ROOT"/bin/* "$ROOT"/lib/* "$ROOT"/install.sh "$ROOT"/update-runner.sh \
+  ls "$ROOT"/bin/* "$ROOT"/lib/* "$ROOT"/git/* "$ROOT"/install.sh "$ROOT"/update-runner.sh \
      "$ROOT"/../ci/*.sh "$HERE"/*.sh 2>/dev/null | grep -vE '\.sample$'
 )
 

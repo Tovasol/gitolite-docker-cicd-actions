@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# ci-job — gitolite command. Runs AS the git user (gitolite authenticates the ssh key
+# and authorizes per-repo access), so a user can only run/inspect jobs on repos they
+# already have access to. Invoked over ssh:
+#
+#   ssh git@host ci-job run    <repo> <branch> [--ref <sha>] [--job <name>] [--watch]
+#   ssh git@host ci-job status [repo]
+#   ssh git@host ci-job log    <repo> (<branch> | <job> | <RUN-DIR>) [-f]
+#   ssh git@host ci-job help
+#
+# Privilege model (DESIGN §34):
+#   * run     = a privileged op (re-archives a version + triggers CI) -> requires WRITE
+#               access to the repo. Reuses the existing git->cicd-ingest sudo bridge.
+#   * status/log = read-only -> require READ; scoped to the repos gitolite says the user
+#               may read (computed here, NEVER taken from user input), proxied read-only
+#               into cicd-runner. cicd-runner stays a dumb executor with zero repo access.
+set -euo pipefail
+
+GL_USER="${GL_USER:-${USER:-unknown}}"          # gitolite sets GL_USER for commands
+RUNNER_USER="${CICD_RUNNER_USER:-cicd-runner}"
+RUNNER_BIN="${CICD_RUNNER_BIN:-/home/$RUNNER_USER/runner/bin}"
+ZERO=0000000000000000000000000000000000000000
+
+die() { echo "ci-job: $*" >&2; exit 1; }
+can() { gitolite access -q "$1" "$GL_USER" "$2" >/dev/null 2>&1; }   # can <repo> <R|W>
+repo_gitdir() {  # <repo> -> bare repo path
+  local base; base="$(gitolite query-rc GL_REPO_BASE 2>/dev/null || true)"
+  [ -n "$base" ] || base="$HOME/repositories"
+  printf '%s/%s.git' "$base" "${1%.git}"
+}
+# repos the invoking user may access at <perm>, one per line (the trusted scope).
+# Robust under set -e/pipefail: a denied repo (can -> nonzero) must not abort the scan.
+accessible() {  # <R|W>
+  gitolite list-phy-repos 2>/dev/null | while IFS= read -r r; do
+    can "$r" "$1" && printf '%s\n' "$r" || :
+  done || :
+}
+proxy() { sudo -n -u "$RUNNER_USER" "$RUNNER_BIN/$1" "${@:2}"; }   # read-only proxy into cicd-runner
+
+usage() { cat <<'EOF'
+ci-job - run and inspect CI jobs over ssh, scoped by your gitolite access.
+
+usage:
+  ci-job run    <repo> <branch> [--ref <sha>] [--job <name>] [--watch]
+  ci-job status [repo]
+  ci-job log    <repo> (<branch> | <job> | <RUN-DIR>) [-f]
+  ci-job help
+
+run     re-archive a version of the repo and trigger CI (requires WRITE access).
+        --ref <sha>   run an exact commit (default: branch tip) - bug triage at a version
+        --job <name>  force just one job (skips branch/path filters)
+        --watch       stream the run's log until it finishes
+status  per-job rollups + recent runs for every repo you can READ
+log     show/tail a run's log (READ access).  -f = follow live
+EOF
+}
+
+cmd_run() {
+  [ $# -ge 2 ] || die "usage: ci-job run <repo> <branch> [--ref <sha>] [--job <name>] [--watch]"
+  local repo="$1" branch="$2"; shift 2
+  local ref="" job="" watch=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --ref) ref="${2:-}"; shift 2 ;;
+    --job) job="${2:-}"; shift 2 ;;
+    --watch|-w) watch=1; shift ;;
+    *) die "run: unknown arg '$1'" ;;
+  esac; done
+  can "$repo" W || die "no WRITE access to '$repo' (gitolite) - cannot run jobs there"
+  local gd; gd="$(repo_gitdir "$repo")"; [ -d "$gd" ] || die "no such repo '$repo'"
+  local sha; sha="$(git --git-dir="$gd" rev-parse --verify "${ref:-$branch}^{commit}" 2>/dev/null)" \
+    || die "bad ref '${ref:-$branch}' in $repo"
+  # Frame for cicd-ingest: line 1 = base64(changed-files) [EMPTY = manual run, no path
+  # filtering], then the raw tar. Event 'run' = manual. onlyjob is the 7th ingest arg.
+  { printf '\n'; git --git-dir="$gd" archive "$sha"; } \
+    | proxy cicd-ingest "$repo" "$branch" run "$sha" "$ZERO" "$GL_USER" "$job" \
+    || die "ingest failed (is the git->cicd-ingest sudo grant in place?)"
+  echo "ci-job: queued run $repo/$branch @ ${sha:0:8}${job:+ job=$job}${ref:+ ref=$ref}"
+  [ "$watch" -eq 1 ] && { echo "-- watching (Ctrl-C to stop; the run keeps going) --"; exec_log "$repo" "$job" -f; }
+  return 0
+}
+
+cmd_status() {
+  local scope="${1:-}"
+  if [ -n "$scope" ]; then
+    can "$scope" R || die "no READ access to '$scope'"
+    proxy ci-status --repos "$scope"
+  else
+    local repos; repos="$(accessible R | tr '\n' ' ')"
+    [ -n "${repos// }" ] || { echo "ci-job: you have no readable repos"; return 0; }
+    proxy ci-status --repos "$repos"
+  fi
+}
+
+exec_log() { proxy ci-log "$@"; }   # internal: proxy ci-log with already-checked args
+cmd_log() {
+  [ $# -ge 1 ] || die "usage: ci-job log <repo> (<branch>|<job>|<RUN-DIR>) [-f]"
+  local repo="$1"; shift
+  can "$repo" R || die "no READ access to '$repo'"
+  proxy ci-log "$repo" "$@"
+}
+
+sub="${1:-help}"; [ $# -gt 0 ] && shift || true
+case "$sub" in
+  run)            cmd_run "$@" ;;
+  status)         cmd_status "$@" ;;
+  log)            cmd_log "$@" ;;
+  help|-h|--help) usage ;;
+  *)              die "unknown subcommand '$sub' (try: ci-job help)" ;;
+esac

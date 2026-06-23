@@ -9,21 +9,41 @@
 #
 # Usage: ci-status [repo-prefix]      # optional scope, e.g. ci-status tovasol/agent-forge
 set -uo pipefail
+usage() { cat <<'EOF'
+ci-status - health + analytics dashboard for the CI runner.
+Shows: key/docker/slots, per-job rollups, recent runs, running/orphaned, pending,
+and failed teardowns. Analytics need duckdb; the basics are pure shell.
+
+usage: ci-status [repo-prefix] [--color|--no-color]
+  repo-prefix   scope to one repo   (e.g. tovasol/agent-forge)
+  --color       force ANSI color (e.g. under: watch --color 'ci-status --color')
+  --no-color    disable color
+  -h, --help
+
+env: CI_STATUS_RECENT=N  recent rows (default 12) | NO_COLOR | CLICOLOR_FORCE
+EOF
+}
+# answer --help BEFORE sourcing config, so it works on any box / without a runner set up
+for a in "$@"; do case "$a" in -h|--help) usage; exit 0 ;; esac; done
+
 CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
 # shellcheck disable=SC1090
 . "$CICD_BASE/bin/lib.sh"; cicd_load_config
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# args: [repo-scope] [--color|--no-color]
-SCOPE=""; force_color=auto
-for a in "$@"; do case "$a" in
+# args: [repo-scope] [--color|--no-color] [--repos "<space-separated allowlist>"]
+# --repos is the access-scoped form used by the `ci-job` gitolite command: it restricts
+# the dashboard to exactly the repos gitolite says the user may read.
+SCOPE=""; force_color=auto; REPOS=""
+while [ $# -gt 0 ]; do case "$1" in
   --color)    force_color=on ;;
   --no-color) force_color=off ;;
+  --repos)    REPOS="${2:-}"; shift ;;
   -*)         ;;                         # ignore unknown flags
-  *)          SCOPE="$a" ;;
-esac; done
+  *)          SCOPE="$1" ;;
+esac; shift; done
 
-# Color decision (glyphs stay ASCII always — multibyte bought nothing but breakage).
+# Color decision (glyphs stay ASCII always - multibyte bought nothing but breakage).
 # Default auto: color on a real tty only. Force on with --color or CLICOLOR_FORCE (so
 # `watch --color 'ci-status --color'` shows color); off with --no-color or NO_COLOR.
 color=0
@@ -42,11 +62,20 @@ gMid='|'; gArr='->'; bar='--------------------------------------'
 ok()   { printf '  %s[ok]%s   %s\n' "$cG" "$c0" "$*"; }
 no()   { printf '  %s[!!]%s   %s\n' "$cR" "$c0" "$*"; }
 rule() { printf '\n%s%s %s %s%s\n' "$cB" "${bar:0:2}" "$*" "$bar" "$c0"; }
-# cstatus <status> <width> -> width-padded + colored (pad first so escapes don't break
-# alignment): green exit:0, yellow running, red anything else (exit:N, timeout, …).
-cstatus() {
-  local c=""; case "$1" in exit:0) c="$cG" ;; running) c="$cY" ;; *) c="$cR" ;; esac
-  printf '%s%-*s%s' "$c" "$2" "$1" "$c0"
+# tbl: read TAB-separated rows on stdin, ADAPTIVELY align columns to content with
+# `column -t` (util-linux - no hand-rolled widths, no TUI lib needed), color the status
+# token AFTER alignment (so the escapes never throw off column math), and indent 2.
+# Status colors: green exit:0, yellow running, red exit:N/timeout.
+tbl() {
+  if [ "$color" = 1 ]; then
+    column -t -s"$(printf '\t')" | sed -E "
+      s/(^|[[:space:]])(exit:0)([[:space:]]|\$)/\1${cG}\2${c0}\3/g
+      s/(^|[[:space:]])(running)([[:space:]]|\$)/\1${cY}\2${c0}\3/g
+      s/(^|[[:space:]])(exit:[1-9][0-9]*|timeout)([[:space:]]|\$)/\1${cR}\2${c0}\3/g" \
+      | sed 's/^/  /'
+  else
+    column -t -s"$(printf '\t')" | sed 's/^/  /'
+  fi
 }
 
 age_fmt() {  # <seconds-ago> -> compact age
@@ -67,16 +96,23 @@ iso_age() {  # <iso> -> seconds since (GNU date; '?' if unparseable)
   printf '%s' "$(( $(date +%s) - e ))"
 }
 
-# --- analytics engine: DuckDB reads the run meta.json files DIRECTLY via a native glob —
+# --- analytics engine: DuckDB reads the run meta.json files DIRECTLY via a native glob -
 # no concatenation, no cache file, no ingest plumbing. `filename` yields each run's dir;
 # `ignore_errors` + the `schema` filter drop any partial/corrupt meta. DuckDB's parallel
-# JSON reader is fast (~3 queries over 500 runs ≈ 0.13s), so we just re-glob per query.
+# JSON reader is fast (~3 queries over 500 runs ~ 0.13s), so we just re-glob per query.
 # A query references the `data` CTE; runsql prepends it. read_json over an empty glob
 # errors (suppressed) -> empty output -> the sections show "(no runs yet)".
 ENGINE=none; have duckdb && ENGINE=duckdb
-RUNS_GLOB="$RUNNER_BASE/runs/${SCOPE:+$SCOPE/}**/meta.json"
+# read_json source: a single glob, OR (when --repos given) a DuckDB list of per-repo
+# globs so the scan covers exactly the allowed repos. Empty allowlist -> [] -> no rows.
+if [ -n "$REPOS" ]; then
+  _globs=""; for _rp in $REPOS; do _globs="${_globs:+$_globs,}'$RUNNER_BASE/runs/$_rp/**/meta.json'"; done
+  RUNS_SRC="[$_globs]"
+else
+  RUNS_SRC="'$RUNNER_BASE/runs/${SCOPE:+$SCOPE/}**/meta.json'"
+fi
 DATA_CTE="WITH data AS (SELECT *, regexp_replace(filename,'/meta\.json\$','') AS dir
-  FROM read_json('$RUNS_GLOB', format='newline_delimited', filename=true, ignore_errors=true, union_by_name=true)
+  FROM read_json($RUNS_SRC, format='newline_delimited', filename=true, ignore_errors=true, union_by_name=true)
   WHERE schema IS NOT NULL)"
 runsql() { duckdb -noheader -list -separator $'\t' -c "$DATA_CTE $1" 2>/dev/null; }  # <query on `data`>
 
@@ -119,16 +155,15 @@ GROUP BY repo, job ORDER BY repo, job;"
 if [ "$ENGINE" = none ]; then
   echo "  (duckdb not installed - run fetch-tools.sh; needed for per-job rollups)"
 else
-  printf '  %s%-34s %-9s %5s %7s %4s %4s %-11s %-11s%s\n' "$cD" \
-    JOB STATUS AGE DUR RUNS FAIL LAST-GREEN LAST-RED "$c0"
   rows="$(runsql "$JOBS_SQL")"
   if [ -z "$rows" ]; then echo "  (no runs yet)"; else
-    printf '%s\n' "$rows" | while IFS=$'\t' read -r repo job st dur start n fail green red; do
-      [ -n "$job" ] || continue
-      printf '  %-34s %s %5s %7s %4s %4s %-11s %-11s\n' \
-        "$repo/$job" "$(cstatus "$st" 9)" "$(age_fmt "$(iso_age "$start")")" "$(dur_fmt "$dur")" \
-        "$n" "$fail" "${green:--}" "${red:--}"
-    done
+    { printf 'JOB\tSTATUS\tAGE\tDUR\tRUNS\tFAIL\tLAST-GREEN\tLAST-RED\n'
+      printf '%s\n' "$rows" | while IFS=$'\t' read -r repo job st dur start n fail green red; do
+        [ -n "$job" ] || continue
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$repo/$job" "$st" "$(age_fmt "$(iso_age "$start")")" "$(dur_fmt "$dur")" "$n" "$fail" "$green" "$red"
+      done
+    } | tbl
   fi
 fi
 
@@ -141,14 +176,14 @@ if [ "$ENGINE" = none ]; then
   find "$RUNNER_BASE/runs" -type f -name meta.json -printf '%T@ %h\n' 2>/dev/null \
     | sort -rn | head -12 | while read -r _ d; do printf '  %s\n' "${d#"$RUNNER_BASE"/}"; done
 else
-  printf '  %s%-9s %7s %-20s %-20s %-9s %s%s\n' "$cD" STATUS DUR STARTED "JOB${gMid}BRANCH" SHA RUN-DIR "$c0"
-  runsql "$REC_SQL" | while IFS=$'\t' read -r st dur start job branch sha dir; do
-    [ -n "$st" ] || continue
-    printf '  %s %7s %-20s %-20s %-9s %s%s%s\n' \
-      "$(cstatus "$st" 9)" "$(dur_fmt "$dur")" "$start" "${job}${gMid}${branch}" "$sha" "$cD" "${dir#"$RUNNER_BASE"/}" "$c0"
-  done
+  { printf 'STATUS\tDUR\tSTARTED\tJOB\tBRANCH\tSHA\tRUN-DIR\n'
+    runsql "$REC_SQL" | while IFS=$'\t' read -r st dur start job branch sha dir; do
+      [ -n "$st" ] || continue
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$st" "$(dur_fmt "$dur")" "$start" "$job" "$branch" "$sha" "$dir"
+    done
+  } | tbl
 fi
-printf '  %s%s cat <run-dir>/output.log   %s   ci-log [repo] [job]  jumps to the newest%s\n' "$cD" "$gArr" "$gMid" "$c0"
+printf '  %s%s ci-log <RUN-DIR>  (paste a row above)   %s   ci-log <repo> <job>  (newest of a job)%s\n' "$cD" "$gArr" "$gMid" "$c0"
 
 # --- orphaned (status=running) ---------------------------------------------------
 if [ "$ENGINE" != none ]; then

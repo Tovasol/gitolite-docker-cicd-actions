@@ -1955,3 +1955,49 @@ human after each reboot. Deferral just turns "processed-and-failed, lost" into
 "parked until ready, then run." `ci-recover` and the defer path are both idempotent
 — re-running while still-not-ready simply re-defers, no duplicate runs (coalesced by
 `target`, serialized by the per-group flock).
+
+---
+
+## 34. Operator commands: `ci-job` (gitolite-authz run + inspect over ssh)
+
+The runner can't re-run or trigger jobs itself — by design (§31): it has **zero repo
+access** and consumes the source tar after each run, so a re-trigger finds no source.
+Re-running a build means re-delivering the source, which only the **git user** can do
+(it owns the bare repos and can `git archive` any ref). So the privileged operation
+belongs to git, exposed as a **gitolite command** — `ci-job` — invoked over ssh:
+
+```
+ssh git@host ci-job run    <repo> <branch> [--ref <sha>] [--job <name>] [--watch]
+ssh git@host ci-job status [repo]
+ssh git@host ci-job log    <repo> (<branch>|<job>|<RUN-DIR>) [-f]
+```
+
+**Why this is the right model**
+- **Authz is gitolite's**, for free: gitolite authenticates the ssh key and knows
+  per-repo access. A user can only act on repos they already have. No new auth code.
+- **`run` = a privileged op** (re-archive + trigger CI ≈ deploy power) → requires
+  **WRITE**. It reuses the existing `git → cicd-ingest` sudo bridge unchanged — just
+  invoked manually instead of from the post-receive hook. Event `run` is *manual*:
+  matches push-triggers but **bypasses path filters** (you're targeting a *version*,
+  not a diff); `--job` force-runs exactly one job (skips branch/path filters); `--ref`
+  pins an older commit for **bug triage at a specific version**. "Re-run" is just `run`.
+- **`status`/`log` = read-only** → require **READ**, and are **access-scoped**: `ci-job`
+  (running as git) computes the user's readable repos *from gitolite access* (never from
+  user input) and proxies a read into cicd-runner restricted to exactly those repos
+  (`ci-status --repos`). So users see only what they may read — multi-tenant CI over ssh,
+  **no shell accounts on the box**.
+
+**Surface added** (deliberately tiny): the read proxy needs a narrow sudoers grant —
+`git` may run `ci-status`/`ci-log` as cicd-runner (read run *metadata* only; never
+secrets, never the age key). `run` needs nothing new. cicd-runner stays a dumb executor.
+
+**Install / self-contained**: `ci-job` ships in `cicd-runner/git/`, is archived out and
+dropped into gitolite's `LOCAL_CODE/commands/` by `update-runner.sh` (root step, like
+the post-receive hook), and is enabled once in `~git/.gitolite.rc` (`ENABLE` list). The
+runner-side change is `run-group`'s manual-run handling + `ci-status --repos` — both
+unit-tested with mocked gitolite/git/sudo.
+
+**dev/qa/prod (noted, deferred)**: real separation lives at the *destination* — prod's
+deploy token simply isn't in this CI (or only in a prod-repo's sops secrets that only
+prod-authorized users can enroll). gitolite per-repo access + per-repo secrets already
+carry most of it; a "may run prod" gitolite group could gate `ci-job run` later.
