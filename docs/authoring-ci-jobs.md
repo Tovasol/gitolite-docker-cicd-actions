@@ -145,6 +145,9 @@ Copy-paste starting points for the usual jobs. All fields are from §2; the scri
 ones you commit in your repo. Helpers (`step`, `retry`, `notify_*`, `die`) come from `/cicd/lib.sh`
 (§5); the dependency cache under `/cache` is automatic (§7).
 
+> For whole, ready-to-save files (a full multi-job `.gitolite/ci.yml`, `.sops.yaml`, and a complete
+> `ci/secrets.example.yaml`), see **§15** — no assembly from snippets.
+
 ### 4.1 Lint / test on every push to main
 
 Runs a committed script that installs its own tools and runs your tests.
@@ -463,6 +466,10 @@ cloudflare_account_id: 0123456789abcdef0123456789abcdef
 > field — there is no `notify:` key. Job *failures* are emailed automatically; you emit explicit
 > notifications from your script via the `/cicd/lib.sh` helpers. The SMTP keys only configure
 > *delivery* for this repo. Full picture in §13.
+
+> A complete, ready-to-fill `ci/secrets.example.yaml` (application secrets **and** the email block
+> assembled into one file) is in **§15.3** — copy that whole file instead of stitching this snippet
+> together with the SMTP block.
 
 #### Behavior
 
@@ -823,3 +830,103 @@ Read by host scripts at install/invoke time, not by jobs. The two an author migh
 | `CIJOB_POLL` / `CIJOB_POLL_MAX` | `2` / `300` | `--watch` poll interval (s) and max polls before it stops watching. Handy if you script around `ci-job run --watch`. |
 | `CI_STATUS_RECENT` | `12` | Number of recent runs shown by `ci-job status`. |
 | `NO_COLOR` / `CLICOLOR_FORCE` | *(unset)* | Standard color-off / force-color toggles for `ci-job status` output. |
+
+---
+
+## 15. Complete file templates (copy-paste whole)
+
+Whole files you can save as-is, then trim. No assembly from snippets.
+
+### 15.1 `.gitolite/ci.yml` — a full multi-job workflow
+
+Save at your repo root. Delete the jobs you don't need; the scripts under `run:` are ones you
+commit in your repo (see §4 for their bodies).
+
+```yaml
+# .gitolite/ci.yml — drop at your repo root. Presence of this file = CI opt-in.
+jobs:
+
+  # Run your test script on every push to main.
+  test:
+    on: { push: { branches: [main] } }
+    image: node:lts-bookworm-slim       # ships bash (run: still starts as sh)
+    network: bridge                      # needed to install deps
+    run: bash ci/test.sh
+
+  # Build + deploy, only when files under site/ change on main. Uses secrets (§15.3).
+  deploy-site:
+    on:
+      push:
+        branches: [main]
+        paths: ["site/**"]
+    image: node:20-alpine
+    timeout: 900
+    network: bridge
+    run: sh ci/deploy-site.sh
+
+  # Preview env for every feat/* branch: create on first push, update on later pushes.
+  preview:
+    on:
+      create: { branches: ["feat/*"] }
+      push:   { branches: ["feat/*"], paths: ["site/**"] }
+    image: node:20-alpine
+    network: bridge
+    run: sh ci/preview-deploy.sh         # names resources off preview-$CI_BRANCH_SLUG
+
+  # Tear the preview env down when the feat/* branch is deleted.
+  preview-teardown:
+    on:
+      delete: { branches: ["feat/*"] }
+    image: node:20-alpine
+    network: bridge
+    run: sh ci/preview-teardown.sh
+```
+
+### 15.2 `.sops.yaml` — full file
+
+Save at your repo root. Replace both placeholders (your GPG fingerprint; the runner's age public
+key from your operator).
+
+```yaml
+# sops recipients for this repo. Humans decrypt via GPG (pass/YubiKey); the CI
+# runner decrypts via its passphraseless age key (unattended). Either decrypts.
+# Replace the placeholders. Add a recipient -> `sops updatekeys ci/secrets.enc.yaml`.
+creation_rules:
+  - path_regex: \.enc\.(ya?ml|json|env)$
+    pgp: "REPLACE_WITH_YOUR_GPG_FINGERPRINT"
+    age: "age1replace_with_cicd_runner_public_key"
+```
+
+### 15.3 `ci/secrets.example.yaml` — full file (app secrets + email in one place)
+
+Save as `ci/secrets.example.yaml`, delete what you don't need, fill real values, then encrypt to
+`ci/secrets.enc.yaml` with the steps in the header. Every top-level key becomes an env var inside
+the job. The email block is optional — omit it entirely to use the operator's default mail server
+(or no email).
+
+```yaml
+# ci/secrets.example.yaml — TEMPLATE. Do NOT commit this plaintext. Create the encrypted file:
+#
+#   cp ci/secrets.example.yaml /tmp/s.yaml      # fill in real values in /tmp
+#   sops --encrypt /tmp/s.yaml > ci/secrets.enc.yaml   # encrypts to .sops.yaml recipients
+#   git add ci/secrets.enc.yaml && git commit && git push     # ciphertext only
+#   shred -u /tmp/s.yaml
+#
+# Every top-level key below becomes an ENV VAR inside the job container.
+
+# --- application secrets (examples — replace with your own) ---
+cloudflare_api_token: cf_xxxxxxxxxxxxxxxxxxxxxxxx     # Pages:Edit, scoped to this project
+cloudflare_account_id: 0123456789abcdef0123456789abcdef
+# npm_token: npm_xxxxxxxxxxxxxxxxxxxx                 # optional: private registry (.npmrc ${NPM_TOKEN})
+
+# --- OPTIONAL: per-repo email on CI failure (omit the whole block for the host default) ---
+SMTP_HOST_ADDR: smtp.gmail.com
+SMTP_HOST_PORT: "587"                                 # 465 = implicit TLS; 587/25 = STARTTLS
+SMTP_USER_NAME: you@gmail.com
+SMTP_USER_PWD: your-16-char-app-password
+NOTIFY_TO: alerts@example.com                         # comma-separated for several recipients
+MAILER_EMAIL: you@gmail.com                           # From: address (defaults to SMTP_USER_NAME)
+# optional presentation knobs:
+# SMTP_FROM_NAME: my-project-ci
+# NOTIFY_LOGLINES: "50"
+```
