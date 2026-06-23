@@ -48,15 +48,38 @@ echo "→ [3/5] crontab"
 # some cron implementations stage a temp file under ~/.cache; ensure it exists first.
 sudo -iu "$RUNNER_USER" bash -lc 'mkdir -p ~/.cache && crontab ~/src/crontab.sample'
 
-echo "→ [4/5] gitolite hook + ci-job command"
+echo "→ [4/5] gitolite hook + ci-job command (+ enable + sudo grant)"
 LOCAL_CODE="$(sudo -u "$GIT_USER" gitolite query-rc LOCAL_CODE)"
 install -Dm755 "$RUN/runner/bin/post-receive" "$LOCAL_CODE/hooks/common/post-receive"
 # ci-job: the git-side gitolite command (run/status/log over ssh, gitolite-authz, §34).
-# Lives under git's LOCAL_CODE/commands; runs AS git. NOTE: enable it once in
-# ~git/.gitolite.rc ENABLE list ('ci-job') + add the sudo read-grant (SOP §2.6).
 install -Dm755 "$RUN/src/git/ci-job" "$LOCAL_CODE/commands/ci-job"
 chown -R "$GIT_USER:$GIT_USER" "$LOCAL_CODE"
-sudo -u "$GIT_USER" gitolite setup --hooks-only
+
+# enable ci-job in gitolite.rc (idempotent) so `ssh git@host ci-job …` is allowed
+GIT_HOME="$(getent passwd "$GIT_USER" | cut -d: -f6)"
+RCF="$GIT_HOME/.gitolite.rc"
+if [ -f "$RCF" ] && ! grep -q "'ci-job'" "$RCF"; then
+  sudo -u "$GIT_USER" sed -i "s/ENABLE => \[/ENABLE => [ 'ci-job',/" "$RCF" \
+    && echo "  enabled 'ci-job' in gitolite.rc" \
+    || echo "  WARN: could not auto-enable ci-job — add 'ci-job' to the ENABLE list in $RCF"
+fi
+sudo -u "$GIT_USER" -H gitolite setup >/dev/null 2>&1 || true   # recompile (hooks + rc)
+
+# read-side sudo grant for ci-job's status/log/run-watch proxy (+ the cicd-ingest write
+# bridge). Deterministic + VALIDATED before it lands, so a bad file can never break sudo.
+B="$RUN/runner/bin"
+_su="$(mktemp)"
+cat > "$_su" <<EOF
+$GIT_USER ALL=($RUNNER_USER) NOPASSWD: $B/cicd-ingest, $B/ci-status, $B/ci-log, $B/ci-runs
+Defaults!$B/cicd-ingest,$B/ci-status,$B/ci-log,$B/ci-runs !requiretty
+EOF
+if visudo -cf "$_su" >/dev/null 2>&1; then
+  install -m440 "$_su" /etc/sudoers.d/cicd-runner
+  echo "  sudoers: $GIT_USER -> $RUNNER_USER (cicd-ingest + ci-status/ci-log/ci-runs)"
+else
+  echo "  WARN: generated sudoers failed validation — NOT installed (check $B paths)" >&2
+fi
+rm -f "$_su"
 
 echo "→ [5/5] boot/init service file"
 install -m755 "$RUN/src/init/docker-rootless-cicd-runner.openrc" \
