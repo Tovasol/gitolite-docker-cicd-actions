@@ -206,7 +206,7 @@ step "build"
 npm ci && npm run build
 
 step "deploy"
-# cloudflare_api_token / cloudflare_account_id come from ci/secrets.enc.yaml (§8.3)
+# CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID come from ci/secrets.enc.yaml (§8.3)
 if npx wrangler pages deploy ./dist --project-name my-site; then
   notify_success "deployed $CI_BRANCH @ $CI_SHA"
 else
@@ -433,49 +433,33 @@ creation_rules:
 
 #### Step 2 — write, encrypt, commit `ci/secrets.enc.yaml`
 
-Each top-level key becomes an **env var** inside your job. This is the canonical template — copy it
-to `ci/secrets.example.yaml`, then follow its own header to produce the encrypted file. It also
-shows the optional per-repo email/SMTP keys (§13):
+Each top-level key becomes an **env var** inside your job. Keep it flat (`key: value`, scalars
+only). A minimal file:
 
 ```yaml
-# TEMPLATE ONLY — do NOT commit this plaintext. Create the real encrypted file:
-#
-#   cp ci/secrets.example.yaml /tmp/s.yaml      # fill in real values in /tmp
-#   sops --encrypt /tmp/s.yaml > ci/secrets.enc.yaml   # encrypts to .sops.yaml recipients
-#   git add ci/secrets.enc.yaml && git commit && git push     # ciphertext only
-#   shred -u /tmp/s.yaml
-#
-# Keys here become ENV VARS inside the job container (via sops -> dotenv).
-cloudflare_api_token: cf_xxxxxxxxxxxxxxxxxxxxxxxx   # Pages:Edit, scoped to this project
-cloudflare_account_id: 0123456789abcdef0123456789abcdef
-# npm_token: npm_xxxxxxxxxxxxxxxxxxxx              # if using a private registry (.npmrc ${NPM_TOKEN})
-
-# --- OPTIONAL: per-project email notifications (opt-in) ---
-# Include these to have THIS repo's failures emailed using its own SMTP creds.
-# Omit them to fall back to the operator-global /etc/cicd-runner/notify.env (or no
-# email if that's absent). The job must also have notify: on-failure (the default).
-# SMTP_HOST_ADDR: smtp.gmail.com
-# SMTP_HOST_PORT: "587"
-# SMTP_USER_NAME: you@gmail.com
-# SMTP_USER_PWD: your-app-password
-# MAILER_EMAIL: you@gmail.com        # from + recipient
-# NOTIFY_TO: alerts@example.com      # optional separate recipient
+# ci/secrets.enc.yaml — flat key: value; each key becomes an env var in the job.
+CLOUDFLARE_API_TOKEN: cf-token-with-Account.Cloudflare-Pages.Edit-permission
+CLOUDFLARE_ACCOUNT_ID: your-cloudflare-account-id
 ```
 
-> About that template's wording: `notify: on-failure (the default)` is **not** a real manifest
-> field — there is no `notify:` key. Job *failures* are emailed automatically; you emit explicit
-> notifications from your script via the `/cicd/lib.sh` helpers. The SMTP keys only configure
-> *delivery* for this repo. Full picture in §13.
+Encrypt it in place with `sops` — it routes `*.enc.yaml` to the right recipients automatically via
+`.sops.yaml`, so you edit plaintext and it saves ciphertext:
 
-> A complete, ready-to-fill `ci/secrets.example.yaml` (application secrets **and** the email block
-> assembled into one file) is in **§15.3** — copy that whole file instead of stitching this snippet
-> together with the SMTP block.
+```sh
+sops ci/secrets.enc.yaml                              # opens $EDITOR; on save writes ENCRYPTED
+grep -q ENC ci/secrets.enc.yaml && echo "encrypted ✓" # sanity-check before committing
+git add ci/secrets.enc.yaml && git commit && git push # ciphertext only
+```
+
+> **For the full, copy-paste template that documents *every* key** — deploy creds, the complete
+> email/SMTP block (with custom subject/body), and arbitrary build secrets — see **§15.3**. That is
+> the comprehensive one to start from.
 
 #### Behavior
 
 - **Trigger = file presence.** `ci/secrets.enc.yaml` exists → the runner decrypts + injects. No
   manifest field opts in.
-- **Each key → one env var** in the `run:` script's environment (`cloudflare_api_token`, etc.).
+- **Each key → one env var** in the `run:` script's environment (`CLOUDFLARE_API_TOKEN`, etc.).
 - **Key not loaded → deferred, not failed.** If the file is present but the runner's age key isn't
   unlocked on the host, the run is held pending and auto-runs once the operator unlocks it.
 - **Decrypt failure → status `secrets-decrypt-failed`** (e.g. you encrypted to the wrong recipient
@@ -897,36 +881,105 @@ creation_rules:
     age: "age1replace_with_cicd_runner_public_key"
 ```
 
-### 15.3 `ci/secrets.example.yaml` — full file (app secrets + email in one place)
+### 15.3 `ci/secrets.enc.yaml` — full template (documents every key)
 
-Save as `ci/secrets.example.yaml`, delete what you don't need, fill real values, then encrypt to
-`ci/secrets.enc.yaml` with the steps in the header. Every top-level key becomes an env var inside
-the job. The email block is optional — omit it entirely to use the operator's default mail server
-(or no email).
+The comprehensive secrets template. Save it, keep only the sections you need, fill real values, then
+encrypt it in place (`sops ci/secrets.enc.yaml`). Only the deploy creds are required; everything else
+is optional. Every top-level key becomes an env var inside the job container, and the same decrypted
+set is what supplies the email/SMTP config (§13).
 
 ```yaml
-# ci/secrets.example.yaml — TEMPLATE. Do NOT commit this plaintext. Create the encrypted file:
+# ci/secrets.enc.yaml — TEMPLATE (documents every key the CI may use).
+# ─────────────────────────────────────────────────────────────────────────────
+# Do NOT put real values here and do NOT rename this file. Create the real
+# ENCRYPTED file with sops (it routes *.enc.yaml to the runner's age key via
+# .sops.yaml automatically):
 #
-#   cp ci/secrets.example.yaml /tmp/s.yaml      # fill in real values in /tmp
-#   sops --encrypt /tmp/s.yaml > ci/secrets.enc.yaml   # encrypts to .sops.yaml recipients
-#   git add ci/secrets.enc.yaml && git commit && git push     # ciphertext only
-#   shred -u /tmp/s.yaml
+#     sops ci/secrets.enc.yaml        # opens $EDITOR; on save writes ENCRYPTED
+#     grep -q ENC ci/secrets.enc.yaml && echo "encrypted ✓"   # before committing
 #
-# Every top-level key below becomes an ENV VAR inside the job container.
+# HOW IT REACHES THE JOB: at run time the runner decrypts this host-side into a
+# tmpfs file and injects it as `--env-file` into the build container. So EVERY key
+# below becomes an ENV VAR inside the container — and the same decrypted set is what
+# the email handler reads for SMTP. Keep it FLAT (key: value); only scalars.
+#
+# Only include the sections you need. All keys are optional except the deploy creds.
 
-# --- application secrets (examples — replace with your own) ---
-cloudflare_api_token: cf_xxxxxxxxxxxxxxxxxxxxxxxx     # Pages:Edit, scoped to this project
-cloudflare_account_id: 0123456789abcdef0123456789abcdef
-# npm_token: npm_xxxxxxxxxxxxxxxxxxxx                 # optional: private registry (.npmrc ${NPM_TOKEN})
+# ── (A) REQUIRED — Cloudflare Pages deploy (ci/deploy-site.sh) ────────────────
+CLOUDFLARE_API_TOKEN: cf-token-with-Account.Cloudflare-Pages.Edit-permission
+CLOUDFLARE_ACCOUNT_ID: your-cloudflare-account-id
 
-# --- OPTIONAL: per-repo email on CI failure (omit the whole block for the host default) ---
-SMTP_HOST_ADDR: smtp.gmail.com
-SMTP_HOST_PORT: "587"                                 # 465 = implicit TLS; 587/25 = STARTTLS
-SMTP_USER_NAME: you@gmail.com
-SMTP_USER_PWD: your-16-char-app-password
-NOTIFY_TO: alerts@example.com                         # comma-separated for several recipients
-MAILER_EMAIL: you@gmail.com                           # From: address (defaults to SMTP_USER_NAME)
-# optional presentation knobs:
-# SMTP_FROM_NAME: my-project-ci
-# NOTIFY_LOGLINES: "50"
+# ── (B) EMAIL NOTIFICATIONS (Gmail SMTP) ─────────────────────────────────────
+# Two accepted naming styles per field (first found wins): the Plausible-CE style
+# (SMTP_*_ADDR / _PORT / _NAME / _PWD, MAILER_EMAIL) OR the generic aliases. Pick one.
+#   host:    SMTP_HOST_ADDR   | SMTP_HOST          (default smtp.gmail.com)
+#   port:    SMTP_HOST_PORT   | SMTP_PORT          (587 STARTTLS, or 465 implicit TLS)
+#   user:    SMTP_USER_NAME   | SMTP_USER          (your full Gmail address)
+#   pass:    SMTP_USER_PWD    | SMTP_PASS          (Gmail *App Password*, 16 chars, 2FA on)
+#   to:      NOTIFY_TO        | MAILER_EMAIL       (comma-separated recipients)
+#   from:    MAILER_EMAIL     | NOTIFY_FROM        (envelope From; default = user)
+SMTP_HOST: smtp.gmail.com
+SMTP_PORT: "587"
+SMTP_USER: you@gmail.com
+SMTP_PASS: your-16-char-app-password
+NOTIFY_TO: you@gmail.com, ops@example.com
+#
+# Optional presentation / behavior:
+SMTP_FROM_NAME: PipelineForge CI          # From display name (default "cicd-runner")
+NOTIFY_INFO: "0"                           # 1 = also email non-terminal info() notices
+NOTIFY_LOGLINES: "30"                      # log-tail lines included in the body
+#
+# Custom subject/body with {{VAR}} interpolation (omit for sensible defaults).
+# Tokens: STATUS TAG REPO BRANCH JOB EVENT SHA SHORT_SHA PUSHER MESSAGE LABEL HOST NOW LOGTAIL
+NOTIFY_SUBJECT: "{{TAG}} {{REPO}}/{{BRANCH}} — {{JOB}} {{STATUS}} ({{SHORT_SHA}})"
+NOTIFY_BODY: |
+  {{STATUS}} — {{JOB}} on {{REPO}}/{{BRANCH}}
+
+  commit:  {{SHORT_SHA}}  by {{PUSHER}}
+  event:   {{EVENT}}
+  when:    {{NOW}}  on {{HOST}}
+  detail:  {{MESSAGE}}
+
+  --- log tail ---
+  {{LOGTAIL}}
+
+# ── (C) ANY OTHER BUILD-TIME SECRETS your ci/*.sh needs ───────────────────────
+# Whatever you add here is available as an env var in the container. Examples:
+# RESEND_API_KEY: re_xxx
+# GOOGLE_SA_EMAIL: svc@project.iam.gserviceaccount.com
+# GOOGLE_SA_KEY: "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+#
+# NOTE: these become visible INSIDE the build container. If SMTP creds (section B)
+# should NOT be exposed to the build, put them ONLY in the operator-global
+# /etc/cicd-runner/notify.env (§15.4) instead — the email handler falls back to that
+# file and it is never mounted into a container.
+```
+
+### 15.4 `/etc/cicd-runner/notify.env` — operator-global email fallback (operator-only)
+
+You normally don't touch this — it's the host-wide default SMTP config the operator installs, used
+for repos that don't ship their own email block (§15.3 B). Per-repo secrets override it key-by-key.
+Included so you know what the fallback looks like.
+
+```sh
+# OPERATOR-GLOBAL email fallback for CI failure alerts (optional).
+# Install as /etc/cicd-runner/notify.env  (chmod 640, root:cicd-runner).
+# Simple KEY=VAL only (no shell features). Per-project secrets (repo's sops
+# ci/secrets.enc.yaml) OVERRIDE these, so this is just the default for projects
+# that don't bring their own.
+SMTP_HOST_ADDR=smtp.gmail.com
+SMTP_HOST_PORT=587
+SMTP_USER_NAME=you@gmail.com
+SMTP_USER_PWD="your-16-char-app-password"
+MAILER_EMAIL=you@gmail.com         # from + default recipient
+# NOTIFY_TO=alerts@example.com      # optional: separate recipient (comma-separated OK)
+
+# --- presentation / behavior (optional) ---
+# SMTP_FROM_NAME=cicd-runner        # From display name
+# NOTIFY_INFO=0                     # 1 = also email non-terminal info() notices
+# NOTIFY_LOGLINES=30                # log-tail lines in the body
+# Custom templates with {{VAR}} tokens. Single-line only in this file (\n not
+#   expanded) — for a multi-line body prefer the per-project YAML block form.
+# NOTIFY_SUBJECT={{TAG}} {{REPO}}/{{BRANCH}} {{JOB}} — {{STATUS}}
+# NOTIFY_BODY={{STATUS}} {{JOB}} @ {{SHORT_SHA}} by {{PUSHER}} — {{MESSAGE}}
 ```
