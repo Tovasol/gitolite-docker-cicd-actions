@@ -64,6 +64,13 @@ trap ':' EXIT                                 # slot/lock fds auto-release on ex
 
 src_sha() { [ "$1" = delete ] && printf '%s' "$3" || printf '%s' "$2"; }  # event new old
 
+# Readiness gates (deferred-recovery, §33). When the environment can't run a job
+# (docker down, or key not loaded for a secret-using job), DEFER it: leave the target
+# pending + keep the incoming tar, so it auto-runs once ready (ci-recover / unlock-ci).
+# Distinct from a CODE failure (build errored) which is recorded + does not loop.
+ready_docker() { docker info >/dev/null 2>&1; }
+key_loaded()   { [ -s "${SOPS_AGE_KEY_FILE:-}" ]; }
+
 # Run one matched job inside a hardened, throwaway container.
 execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   local job="$1" event="$2" newrev="$3" pusher="$4" work="$5" manifest="$6"
@@ -198,6 +205,12 @@ run_teardown() {  # <oldrev> <pusher>
 
   secsrc=""
   [ -n "$work" ] && [ -f "$work/ci/secrets.enc.yaml" ] && secsrc="$work/ci/secrets.enc.yaml"
+  # DEFER teardown if it needs secrets but the key isn't loaded — don't mark it failed
+  # (env-not-ready ≠ code failure); retry once the key is posted.
+  if [ -n "$secsrc" ] && ! key_loaded; then
+    log "$group: teardown needs secrets, key not loaded — DEFERRING $slug (retry after unlock-ci)"
+    [ -n "$work" ] && rm -rf "$work"; return 2
+  fi
   envfile=""
   if [ -n "$secsrc" ]; then
     envfile="$(mktemp -p "${SHM_DIR:-/dev/shm}" cicd.env.XXXXXX)"
@@ -259,6 +272,13 @@ process_build() {  # <event> <newrev> <oldrev> <pusher>
   [ -f "$manifest" ] || { log "$group: no .gitolite/ci.yml at $newrev"; rm -rf "$work"; return 0; }
   changed="$(cat "$INC/$newrev.changed" 2>/dev/null)"   # computed by the hook (git side)
 
+  # DEFER (don't consume) if this repo needs secrets but the key isn't loaded — e.g.
+  # post-reboot before unlock-ci. Keep incoming/<sha>.tar; ci-recover retries when ready.
+  if [ -f "$work/ci/secrets.enc.yaml" ] && ! key_loaded; then
+    log "$group: key not loaded + repo has secrets — DEFERRING $newrev (retry after unlock-ci)"
+    rm -rf "$work"; return 2
+  fi
+
   local job inc ign pinc pign
   for job in $(yq_keys "$manifest" ".jobs"); do
     [ -n "$(yq_str "$manifest" ".jobs.\"$job\".on.$event")" ] || continue
@@ -284,7 +304,7 @@ process_build() {  # <event> <newrev> <oldrev> <pusher>
 }
 
 # ---- coalescing main loop ---------------------------------------------------
-last=""
+last=""; rc=0
 while :; do
   [ -f "$Q/target" ] || break
   target="$(cat "$Q/target")"
@@ -292,17 +312,27 @@ while :; do
   read -r event newrev oldrev pusher <<< "$target"
   pusher="${pusher:-unknown}"
 
+  # readiness gate: docker must be up to run ANYTHING (post-reboot / docker-down window).
+  # Defer = leave target pending, don't advance `last`; ci-recover / unlock-ci retries.
+  if ! ready_docker; then
+    log "$group: docker not ready — DEFERRING ($target); ci-recover/unlock-ci will retry"
+    break
+  fi
+
+  rc=0
   case "$event" in
-    delete) run_teardown "$oldrev" "$pusher" ;;
+    delete) run_teardown "$oldrev" "$pusher"; rc=$? ;;
     create|push)
       if [ "${DELETE_SUPERSEDES:-1}" = "1" ]; then
         nxt="$(cat "$Q/target")"; read -r nev _ _ _ <<< "$nxt"
         [ "$nev" = "delete" ] && { last=""; continue; }
       fi
-      process_build "$event" "$newrev" "$oldrev" "$pusher" ;;
+      process_build "$event" "$newrev" "$oldrev" "$pusher"; rc=$? ;;
     *) log "$group: unknown event '$event'" ;;
   esac
 
+  # rc==2 → deferred (env not ready): leave pending, retry later (do NOT advance last)
+  [ "$rc" = 2 ] && { log "$group: deferred ($target) — env not ready"; break; }
   last="$target"
 done
 

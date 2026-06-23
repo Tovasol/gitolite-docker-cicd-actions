@@ -276,6 +276,13 @@ The ramfs key is wiped on reboot (RAM-only, by design — §25). Everything else
 back automatically (docker service, ramfs mount + chown via `/etc/local.d`,
 `@reboot ci-recover`). You re-supply the key.
 
+> **Pushes during the reboot window are NOT lost.** A push that lands before you
+> re-post the key is *deferred* (parked, not failed): docker-down or key-not-loaded
+> secret jobs leave their queue target pending. When you run `unlock-ci` below it
+> **auto-triggers `ci-recover`** and the deferred pushes run immediately — you don't
+> re-push. A `*/10 ci-recover` cron is the backstop if the key is posted out-of-band.
+> (Deferred-recovery, DESIGN §10.6/§33.)
+
 **Key-in-pass (your setup) — from the Mac, one line (key never on disk/history):**
 ```bash
 pass show <your-key-entry> | ssh <user>@vps 'sudo -n -u cicd-runner /home/cicd-runner/runner/bin/unlock-ci'
@@ -433,8 +440,10 @@ It wires the named scripts (each sources `runner.conf`):
 - `*/10 * * * * reap-containers` — kill leaked/dead/runaway containers, free slots
 - `0 4 * * * prune-disk` — docker prune (capped) + run-log retention + disk guard
 - `0 5 * * * reap-envs` — tear down ephemeral envs whose branch is gone (§14)
-- `@reboot ci-recover` — re-run targets never processed (note: secret-using jobs
-  fail until `unlock-ci`)
+- `@reboot ci-recover` — re-run targets never processed (secret-using jobs *defer*,
+  not fail, until `unlock-ci` — which then auto-drains them)
+- `*/10 * * * * ci-recover` — deferred-recovery backstop: re-runs anything parked
+  because the env wasn't ready (docker late / key out-of-band). No-op when idle.
 
 Verify quarterly: `docker system df`, `df -h $(docker info -f '{{.DockerRootDir}}')`,
 `crontab -l`.

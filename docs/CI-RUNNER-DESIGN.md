@@ -372,7 +372,9 @@ built. This list IS the full scope.
    §7) unless disk/speed hurts — avoids deploying the wrong sha.
 6. **Crash recovery / at-least-once.** Runner dies after push recorded, before
    run → on restart, startup sweep: for each group, if `target` ≠ last-run sha,
-   run it. Otherwise a deploy silently never happens.
+   run it. Otherwise a deploy silently never happens. Extended by *deferred-recovery*
+   (§33): an env-not-ready run (docker down / key not posted) also leaves `target` ≠
+   `last` so the same sweep retries it — env failures park, code failures don't loop.
 7. **Failure notification.** post-receive returns success even if deploy fails
    (detached). Add a failure ping (email/webhook/`wall`) — one line in the
    failure branch.
@@ -1848,10 +1850,10 @@ the *intent* below ports to systemd/Debian and others.
    - *Intent:* a RAM-only, cicd-runner-owned dir at a stable path, swap-proof.
 3. **Pending-run recovery** — re-process pushes that landed but couldn't run.
    - `@reboot ci-recover` (cron/timer) re-runs queued targets once the env is ready.
-   - **Planned robustness (see §10.6 / below):** distinguish *environment-not-ready*
+   - **Robustness (IMPLEMENTED, see §10.6 / below):** distinguish *environment-not-ready*
      failures (docker down, key not loaded — transient) from *code* failures (build
-     errored — real). Env failures should DEFER (don't advance `last`), so they
-     auto-run when ready; code failures notify and don't loop.
+     errored — real). Env failures DEFER (don't advance `last`), so they auto-run
+     when ready; code failures notify and don't loop.
 
 ### The human gate (deliberate, not a gap)
 The **ramfs key itself cannot auto-restore** — it's RAM-only by design (§25). The
@@ -1879,7 +1881,30 @@ ramfs mountpoint+mount+chown (docker service start_pre) → rootless docker up �
 ships the OpenRC init template (`cicd-runner/init/`) so this is version-controlled,
 not just documented.
 
-### Status of the planned deferred-recovery
-Intent captured; not yet implemented in `run-group`. Until then: a push during a
-reboot window is processed-and-failed (docker/key down) and **not** auto-retried —
-re-push, or implement the env-vs-code deferral. Tracked so it isn't lost.
+### Deferred-recovery (IMPLEMENTED)
+A push that lands during a reboot / docker-down / key-not-posted window is now
+**deferred, not failed** — it auto-runs once the environment is ready. Mechanism:
+
+- **Readiness gates in `run-group`** (the coalesce loop):
+  - `ready_docker()` (`docker info`) gates the *whole* loop — docker down ⇒ defer
+    the run (break, don't advance `last`).
+  - `key_loaded()` (`[ -s $SOPS_AGE_KEY_FILE ]`) gates *secret-using* targets only:
+    `process_build` / `run_teardown` return **rc=2 (defer)** if the repo ships
+    `ci/secrets.enc.yaml` but the key isn't loaded. A no-secret build still runs.
+- **Defer = preserve state.** On defer the loop does **not** advance `$Q/last` and
+  the `incoming/<sha>.tar` is **kept** (not consumed). So `target != last` stays
+  true and the delivered tree is still on disk for the retry. A *code* failure is
+  unchanged: status recorded (`exit:N`), notified, `last` advanced (no loop).
+- **Retry triggers** (all converge on `ci-recover`, which re-runs every group where
+  `target != last`):
+  1. `unlock-ci` spawns `ci-recover` right after a valid key is loaded — posting the
+     key immediately drains everything deferred for want of secrets.
+  2. `@reboot ci-recover` — boot sweep.
+  3. `*/10 ci-recover` cron backstop — catches docker-came-up-late / out-of-band
+     key posting without a human re-running anything.
+
+The **human gate is preserved**: the ramfs key is still RAM-only and re-posted by a
+human after each reboot. Deferral just turns "processed-and-failed, lost" into
+"parked until ready, then run." `ci-recover` and the defer path are both idempotent
+— re-running while still-not-ready simply re-defers, no duplicate runs (coalesced by
+`target`, serialized by the per-group flock).

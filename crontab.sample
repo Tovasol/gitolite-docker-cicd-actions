@@ -13,6 +13,12 @@ CICD_BASE=/home/cicd-runner/runner
 0 5 * * *    $CICD_BASE/bin/reap-envs
 
 # crash-recovery sweep at boot (re-run targets that were never processed).
-# NOTE: secrets only decrypt AFTER `unlock-ci`; @reboot recovery of secret-using
-# jobs will fail until you unlock. That's intentional (human-gated boot, §25).
+# NOTE: secrets only decrypt AFTER `unlock-ci`. @reboot recovery of secret-using jobs
+# now DEFERS (target stays pending, not failed) until you unlock — human-gated boot
+# (§25). unlock-ci then triggers ci-recover automatically to drain the deferred work.
 @reboot      $CICD_BASE/bin/ci-recover
+
+# periodic deferred-recovery backstop: re-runs anything deferred because the env wasn't
+# ready (docker came up late, key posted out-of-band). Cheap no-op when nothing pending.
+# (§10.6/§33 — the safety net behind unlock-ci's own ci-recover trigger.)
+*/10 * * * * $CICD_BASE/bin/ci-recover
