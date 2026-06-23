@@ -242,8 +242,8 @@ sudo -iu git gitolite setup --hooks-only
 #    so a user can never inspect a repo they can't read.
 B=/home/cicd-runner/runner/bin
 cat > /etc/sudoers.d/cicd-runner <<EOF
-git ALL=(cicd-runner) NOPASSWD: $B/cicd-ingest, $B/ci-status, $B/ci-log
-Defaults!$B/cicd-ingest,$B/ci-status,$B/ci-log !requiretty
+git ALL=(cicd-runner) NOPASSWD: $B/cicd-ingest, $B/ci-status, $B/ci-log, $B/ci-runs
+Defaults!$B/cicd-ingest,$B/ci-status,$B/ci-log,$B/ci-runs !requiretty
 EOF
 chmod 440 /etc/sudoers.d/cicd-runner
 visudo -cf /etc/sudoers.d/cicd-runner          # validate

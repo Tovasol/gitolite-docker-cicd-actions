@@ -54,6 +54,16 @@ cat >/dev/null 2>&1 || true
 EOF
   chmod +x "$RB/$b"
 done
+# stateful ci-runs stub for --watch: poll 1 = not started, 2-3 = running, 4+ = exit:0
+SHA=deadbeefcafe1234567890aaaaaaaaaaaaaaaaaa
+cat > "$RB/ci-runs" <<EOF
+#!/usr/bin/env bash
+c="$M/poll.n"; n=\$(( \$(cat "\$c" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "\$c"
+if   [ "\$n" -ge 4 ]; then echo '{"schema":1,"repo":"tovasol/app","job":"deploy","sha":"$SHA","status":"exit:0"}'
+elif [ "\$n" -ge 2 ]; then echo '{"schema":1,"repo":"tovasol/app","job":"deploy","sha":"$SHA","status":"running"}'
+fi
+EOF
+chmod +x "$RB/ci-runs"
 chmod +x "$STUB"/*
 # fake bare repo dirs so [ -d gitdir ] passes
 mkdir -p "$M/repositories/tovasol/app.git" "$M/repositories/tovasol/lib.git" "$M/repositories/tovasol/secret.git"
@@ -87,6 +97,14 @@ assert_match "log proxies ci-log for readable repo" "$(cat "$REC")" 'ci-log tova
 : > "$REC"; out="$(run_cijob alice log tovasol/secret deploy)"; rc=$?
 assert_ne    "log on unreadable repo fails"     "$rc" 0
 assert_eq    "no ci-log call on denial"         "$(grep -c '^ci-log' "$REC")" 0
+
+suite "ci-job run --watch (polls status, no queue bypass)"
+rm -f "$M/poll.n"
+out="$(GL_USER=alice PATH="$STUB:$PATH" HOME="$M" CICD_RUNNER_BIN="$RB" \
+       CIJOB_POLL=0 CIJOB_POLL_MAX=12 bash "$CIJOB" run tovasol/app main --job deploy --watch 2>&1)"
+assert_match "watch shows 'running' transition"     "$out" 'running'
+assert_match "watch shows terminal 'exit:0'"        "$out" 'exit:0'
+assert_no_match "watch does NOT tail a missing log" "$out" 'No such file'
 
 rm -rf "$M"
 summary

@@ -75,7 +75,31 @@ cmd_run() {
     | proxy cicd-ingest "$repo" "$branch" run "$sha" "$ZERO" "$GL_USER" "$job" \
     || die "ingest failed (is the git->cicd-ingest sudo grant in place?)"
   echo "ci-job: queued run $repo/$branch @ ${sha:0:8}${job:+ job=$job}${ref:+ ref=$ref}"
-  [ "$watch" -eq 1 ] && { echo "-- watching (Ctrl-C to stop; the run keeps going) --"; exec_log "$repo" "$job" -f; }
+  [ "$watch" -eq 1 ] && watch_status "$repo" "$sha" "$job"
+  return 0
+}
+
+# Watch a just-queued run by POLLING the read path (no queue bypass, no 2nd path): the
+# run is async (cicd-ingest queued it + spawned run-group detached), so its dir/log don't
+# exist yet — and may never, if deferred (docker down / key not loaded). We poll ci-runs
+# for this sha and print STATUS transitions (queued -> running -> exit:N) until terminal.
+# To tail the actual LOG, use `ci-job log <repo> <job> -f` (tail -F waits for the file).
+watch_status() {  # <repo> <sha> [job]
+  local repo="$1" sha="$2" job="${3:-}" last="" row st i
+  echo "-- watching ${sha:0:8}${job:+ ($job)} (Ctrl-C stops watching; the run keeps going) --"
+  for ((i=0; i<${CIJOB_POLL_MAX:-300}; i++)); do
+    row="$(proxy ci-runs "$repo" 2>/dev/null | grep -F "\"sha\":\"$sha\"" \
+           | { if [ -n "$job" ]; then grep -F "\"job\":\"$job\""; else cat; fi; } | tail -1 || true)"
+    if [ -n "$row" ]; then
+      st="$(printf '%s' "$row" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+      [ "$st" != "$last" ] && { printf '  %s  %s\n' "$(date -u +%H:%M:%SZ)" "$st"; last="$st"; }
+      case "$st" in exit:*|timeout) return 0 ;; esac
+    elif [ "$i" -eq 4 ] && [ -z "$last" ]; then
+      echo "  (not started yet - queued; if it stays here, docker/key may not be ready: ci-job status)"
+    fi
+    sleep "${CIJOB_POLL:-2}"
+  done
+  echo "  (stopped watching after timeout; run may still be queued/running - ci-job status)"
   return 0
 }
 
@@ -91,7 +115,6 @@ cmd_status() {
   fi
 }
 
-exec_log() { proxy ci-log "$@"; }   # internal: proxy ci-log with already-checked args
 cmd_log() {
   [ $# -ge 1 ] || die "usage: ci-job log <repo> (<branch>|<job>|<RUN-DIR>) [-f]"
   local repo="$1"; shift

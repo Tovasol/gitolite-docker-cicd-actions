@@ -58,4 +58,6 @@ else
 fi
 [ -f "$dir/cmd" ] && { printf '\n\033[1m-- cmd --\033[0m\n'; cat "$dir/cmd"; }
 printf '\n\033[1m-- output.log --\033[0m\n'
-if [ "$follow" = 1 ]; then tail -f "$dir/output.log"; else cat "$dir/output.log" 2>/dev/null || echo "(no output.log)"; fi
+# -F (not -f): follow BY NAME, retrying if output.log doesn't exist yet (a just-started
+# run writes meta before the container's first byte) or gets rotated.
+if [ "$follow" = 1 ]; then tail -F "$dir/output.log" 2>/dev/null; else cat "$dir/output.log" 2>/dev/null || echo "(no output.log)"; fi
