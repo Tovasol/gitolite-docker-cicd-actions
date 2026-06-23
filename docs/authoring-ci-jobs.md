@@ -180,6 +180,11 @@ terminal notification still triggers a failure alert.
 
 `retry`, `notify`, etc. are the home for retry/notify logic — they are **not** manifest fields.
 
+> **Want emails (e.g. SMTP)?** That is the *delivery* half of notifications and it is configured
+> by the OPERATOR, not in the manifest — but a repo **can** ship its own SMTP credentials in its
+> encrypted secrets so failure alerts go to *your* mailbox. See **§12** for the full author-vs-
+> operator boundary and the exact secret keys (e.g. `SMTP_HOST_ADDR`, `SMTP_USER_PWD`, `NOTIFY_TO`).
+
 ---
 
 ## 5. Environment available inside the job
@@ -269,19 +274,89 @@ fetch-tools.
 
 ### 7.3 Secrets (sops + age)
 
-If your job needs secrets:
-1. Commit an encrypted file at **`ci/secrets.enc.yaml`** in your repo (sops-encrypted with the
-   runner's age recipient — key management is operator-controlled and out of scope here).
-2. The runner decrypts it (`sops -d --output-type dotenv`) into a tmpfs env-file and injects it
-   as `--env-file`. **Each key becomes an env var** available to your `run:` script.
+Secrets are sops-encrypted files committed **in your repo** (ciphertext only — never plaintext).
+The runner decrypts them host-side and injects each key as an env var into your job container.
+There is **no `secrets:` manifest field**; the runner keys entirely off the *presence* of the
+encrypted file (see §9).
 
-Author-facing contract: presence of `ci/secrets.enc.yaml` is the trigger — there is **no
-`secrets:` manifest field** (the runner keys entirely off the file). If the file is present but
-the age key isn't loaded on the host, the run is *deferred* (kept pending), not failed; it
-auto-runs once the key is unlocked. A decrypt failure marks the run `secrets-decrypt-failed`.
+#### Where the files go (exact paths)
 
-> Do not invent key-management/recipient details — coordinate with the operator for how to
-> encrypt against the runner's age public key.
+```
+<repo root>/
+├── .sops.yaml                 # sops recipients (who can decrypt). Repo root. REQUIRED to encrypt.
+└── ci/
+    ├── secrets.enc.yaml       # the ENCRYPTED secrets (committed). Runner reads THIS path exactly.
+    └── secrets.example.yaml   # optional plaintext TEMPLATE for humans (never the real secret)
+```
+
+The runner only ever reads **`ci/secrets.enc.yaml`** (hard-coded path in `run-group.sh`). The
+`.sops.yaml` and the example template are author/operator conveniences.
+
+#### Step 1 — `.sops.yaml` at the repo root (declares who may decrypt)
+
+This tells `sops` which recipients to encrypt to. Two kinds: a human GPG key (you, for editing)
+and the **CI runner's age public key** (passphraseless, so the runner decrypts unattended).
+Either recipient can decrypt. Get the runner's age public key (an `age1…` string) and confirm
+your own GPG fingerprint from your operator. Copy this file verbatim and replace the two
+placeholders:
+
+```yaml
+# sops recipients for this repo. Humans decrypt via GPG (pass/YubiKey); the CI
+# runner decrypts via its passphraseless age key (unattended). Either decrypts.
+# Replace the placeholders. Add a recipient -> `sops updatekeys ci/secrets.enc.yaml`.
+creation_rules:
+  - path_regex: \.enc\.(ya?ml|json|env)$
+    pgp: "REPLACE_WITH_YOUR_GPG_FINGERPRINT"
+    age: "age1replace_with_cicd_runner_public_key"
+```
+
+#### Step 2 — write, encrypt, commit `ci/secrets.enc.yaml`
+
+Each top-level key becomes an **env var** inside your job (via `sops -d --output-type dotenv`).
+This is the canonical template — copy it to `ci/secrets.example.yaml`, then follow its own header
+to produce the encrypted file. It also shows the **opt-in per-repo email/SMTP keys** (see §12):
+
+```yaml
+# TEMPLATE ONLY — do NOT commit this plaintext. Create the real encrypted file:
+#
+#   cp ci/secrets.example.yaml /tmp/s.yaml      # fill in real values in /tmp
+#   sops --encrypt /tmp/s.yaml > ci/secrets.enc.yaml   # encrypts to .sops.yaml recipients
+#   git add ci/secrets.enc.yaml && git commit && git push     # ciphertext only
+#   shred -u /tmp/s.yaml
+#
+# Keys here become ENV VARS inside the job container (via sops -> dotenv).
+cloudflare_api_token: cf_xxxxxxxxxxxxxxxxxxxxxxxx   # Pages:Edit, scoped to this project
+cloudflare_account_id: 0123456789abcdef0123456789abcdef
+# npm_token: npm_xxxxxxxxxxxxxxxxxxxx              # if using a private registry (.npmrc ${NPM_TOKEN})
+
+# --- OPTIONAL: per-project email notifications (opt-in) ---
+# Include these to have THIS repo's failures emailed using its own SMTP creds.
+# Omit them to fall back to the operator-global /etc/cicd-runner/notify.env (or no
+# email if that's absent). The job must also have notify: on-failure (the default).
+# SMTP_HOST_ADDR: smtp.gmail.com
+# SMTP_HOST_PORT: "587"
+# SMTP_USER_NAME: you@gmail.com
+# SMTP_USER_PWD: your-app-password
+# MAILER_EMAIL: you@gmail.com        # from + recipient
+# NOTIFY_TO: alerts@example.com      # optional separate recipient
+```
+
+> Note on that template's wording: `notify: on-failure (the default)` is **not** a real manifest
+> field — there is no `notify:` key. Job *failures* are emailed automatically by the runner's
+> backstop, and you emit explicit notifications from your script via the `/cicd/lib.sh` helpers.
+> The SMTP keys above only configure *delivery* for this repo. Full picture in §12.
+
+#### Behavior contract
+
+- **Trigger = file presence.** `ci/secrets.enc.yaml` exists → the runner decrypts + injects. No
+  manifest field opts in.
+- **Each key → one env var** in the `run:` script's environment (`cloudflare_api_token`, etc.).
+- **Key not loaded → deferred, not failed.** If the file is present but the runner's age key
+  isn't unlocked on the host, the run is held pending and auto-runs once the operator unlocks it.
+- **Decrypt failure → status `secrets-decrypt-failed`** (e.g. you encrypted to the wrong
+  recipient — re-run `sops updatekeys ci/secrets.enc.yaml`).
+- The decrypted values live only in a tmpfs env-file for the container's lifetime; the age key
+  never enters the job container.
 
 ---
 
@@ -381,4 +456,311 @@ gitolite against your ssh key.)
 - [ ] **Privileged operations.** `cap-drop ALL` + `no-new-privileges` forbid mounting, setcap,
       sudo-up, raw sockets, etc.
 - [ ] **Relying on path filters via manual run.** `ci-job run` skips path filters by design.
+
+---
+
+## 12. Notifications & email (SMTP): author vs operator
+
+Notifications have **two halves**, and they are owned by different people. Getting this boundary
+right is the whole point of this section.
+
 ```
+ AUTHOR (in your repo)                         OPERATOR (host config)
+ ─────────────────────                         ─────────────────────
+ emit notifications from your run: script      configure DELIVERY (how/where they're sent)
+   . /cicd/lib.sh                                NOTIFY_CMD   -> a handler script
+   notify "deploy starting"                      notify-email -> SMTP via curl   (§12.2)
+   notify_success "deployed ok"                  notify-wall  -> wall(1) broadcast
+   notify_error  "deploy failed"
+   die "fatal"                                  + per-project OR operator-global SMTP creds
+                                                  (§12.3 — THIS is where the secrets file
+ (you NEVER touch SMTP from inside the job)        comes in)
+```
+
+- **As a job author** you only ever call the `/cicd/lib.sh` helpers (`notify`, `notify_success`,
+  `notify_error`, `die`) from §4. They append a line to a mounted outbox; **nothing is sent from
+  inside your container** (no curl, no creds, no network needed in the job).
+- **After the container exits**, the runner (`lib/cicd.sh` → `cicd_flush_outbox` → `cicd_deliver`)
+  reads the outbox host-side and runs the operator's `NOTIFY_CMD` once per notification, plus a
+  **backstop** alert if the job failed (`rc≠0`) and emitted no terminal `notify_success`/`error`
+  (catches OOM/SIGKILL and scripts that forgot to notify). The backstop is on unless the operator
+  sets `NOTIFY_BACKSTOP=0`.
+
+### 12.1 What the handler is
+
+`NOTIFY_CMD` (in `runner.conf`) is the host-side program the runner invokes as
+`NOTIFY_CMD <group> <level: message> <logpath>`. Two handlers ship with the runner:
+
+| Handler | What it does |
+|---|---|
+| `bin/notify-email` | Emails the alert over **SMTP using `curl`** (no extra packages). Default `NOTIFY_CMD`. |
+| `bin/notify-wall.sample` | Broadcasts to logged-in terminals via `wall(1)` (sample; rename to use). |
+
+`notify-email` only emails **terminal** events by default — `notify_success` (`[CI OK]`) and
+`notify_error`/`die` (`[CI FAIL]`) plus the failure backstop. Plain `notify` (info) is **not**
+mailed unless `NOTIFY_INFO=1` is set (§12.4).
+
+### 12.2 The literal question: can SMTP creds go in `ci/secrets.enc.yaml`? — **Yes.**
+
+`bin/notify-email` runs **host-side** (not in your job container), but it is explicitly designed to
+read **per-project SMTP config from your repo's decrypted secrets first**, then fall back to an
+operator-global file. The exact precedence, from the code (`bin/notify-email`, `read_var`):
+
+1. **Your repo's decrypted secrets** — the runner passes the path to your decrypted
+   `ci/secrets.enc.yaml` to the handler via the env var `CICD_NOTIFY_ENV` (set in
+   `lib/cicd.sh` `cicd_deliver`). `notify-email` reads keys out of that file **first**.
+2. **Operator-global fallback** — `/etc/cicd-runner/notify.env` (see `etc/notify.env.sample`),
+   used only for keys your secrets don't provide.
+
+So a repo opts into **its own** email destination/credentials simply by putting the keys below into
+`ci/secrets.enc.yaml`. No manifest field, no operator change required (as long as the operator left
+`NOTIFY_CMD` pointed at `notify-email`, the default). **Each variable is resolved independently** —
+you can supply only `NOTIFY_TO` in your secrets and inherit the host's SMTP server, or supply
+everything.
+
+> Caveat to state plainly: the mailer is **host-side**, so it can only use secrets the runner could
+> decrypt — i.e. the host's age key must be loaded (the same key that gates secret-using jobs, §7.3).
+> The credentials are read from your *decrypted* secrets at delivery time; they never run inside the
+> container and are never exposed to your job's env unless you also reference them in `run:`.
+
+### 12.3 SMTP / email variable reference (exact names from `bin/notify-email`)
+
+These go in **`ci/secrets.enc.yaml`** (per-repo) and/or **`/etc/cicd-runner/notify.env`**
+(operator-global). The primary names match **Plausible CE**'s SMTP config so you can reuse the same
+values; a generic alias is accepted for each (the handler tries the primary name, then the alias):
+
+| Primary key | Alias | Default (if unset) | Meaning |
+|---|---|---|---|
+| `SMTP_HOST_ADDR` | `SMTP_HOST` | `smtp.gmail.com` | SMTP server hostname. |
+| `SMTP_HOST_PORT` | `SMTP_PORT` | `587` | SMTP port. **Port `465` ⇒ implicit TLS (`smtps://`); any other port (587/25) ⇒ STARTTLS on `smtp://`** — chosen automatically from the port, there is no separate TLS flag. |
+| `SMTP_USER_NAME` | `SMTP_USER` | *(none)* | SMTP/auth username. **Required** — if empty, the mailer silently skips (no email). |
+| `SMTP_USER_PWD` | `SMTP_PASS` | *(none)* | SMTP/auth password (for Gmail, a 16-char App Password). **Required.** |
+| `MAILER_EMAIL` | *(used as `FROM`/recipient default)* | falls back to `SMTP_USER_NAME` | The `From:` address; also the default recipient if `NOTIFY_TO` is unset. |
+| `NOTIFY_TO` | `MAILER_EMAIL` | falls back to `SMTP_USER_NAME` | Recipient(s). Comma-separated is accepted. **Required** (directly or via fallback). |
+| `NOTIFY_FROM` | *(read only as fallback for `FROM`)* | falls back to `MAILER_EMAIL`/`SMTP_USER_NAME` | Alternative `From:` source. |
+| `SMTP_FROM_NAME` | `NOTIFY_FROM_NAME` | `cicd-runner` | `From:` display name. |
+
+Auth: the handler always authenticates with `curl --user "$USER:$PASS" --ssl-reqd`. There is no
+"no-auth" mode — `SMTP_USER_NAME` **and** `SMTP_USER_PWD` **and** a recipient must all resolve or the
+mailer exits 0 without sending (never blocks/fails the job). Minimum to get mail to your inbox from a
+per-repo secrets file: `SMTP_USER_NAME`, `SMTP_USER_PWD`, and either `NOTIFY_TO` or `MAILER_EMAIL`.
+
+### 12.4 Presentation / behavior knobs (same two locations, optional)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `NOTIFY_INFO` | `0` | `1` = also email non-terminal `notify` (info) notices, not just success/fail. |
+| `NOTIFY_LOGLINES` | `30` | How many trailing lines of the run's `output.log` to include in the body. |
+| `NOTIFY_SUBJECT` | `{{TAG}} {{REPO}}/{{BRANCH}} {{JOB}} — {{STATUS}}` | Custom subject template. |
+| `NOTIFY_BODY` | *(built-in multi-line block)* | Custom body template. In the **YAML** secrets file you can use a multi-line block scalar; in the flat `notify.env` file it must be single-line (`\n` is not expanded). |
+
+Template tokens (literal `{{...}}` substitution — **no** eval; message/log are treated as untrusted):
+`{{STATUS}}` `{{TAG}}` `{{REPO}}` `{{BRANCH}}` `{{JOB}}` `{{EVENT}}` `{{SHA}}` `{{SHORT_SHA}}`
+`{{PUSHER}}` `{{MESSAGE}}` `{{LABEL}}` `{{HOST}}` `{{NOW}}` `{{LOGTAIL}}`. The non-secret fields
+(`REPO`, `BRANCH`, `SHA`, etc.) are enriched from the run's `meta.json` host-side.
+
+### 12.5 Author checklist for "email me on CI failure"
+
+1. Keep `notify_error`/`die` (or rely on the failure backstop) in your `run:` script — §4.
+2. Add SMTP keys to `ci/secrets.enc.yaml`, e.g.:
+   ```yaml
+   SMTP_HOST_ADDR: smtp.gmail.com
+   SMTP_HOST_PORT: "587"
+   SMTP_USER_NAME: you@gmail.com
+   SMTP_USER_PWD: your-16-char-app-password
+   NOTIFY_TO: alerts@example.com        # comma-separated for several
+   # optional:
+   # SMTP_FROM_NAME: my-project-ci
+   # NOTIFY_LOGLINES: "50"
+   ```
+   (sops-encrypt it against the runner's age recipient — §7.3.) Quote numeric values so the
+   dotenv export keeps them as strings.
+3. That's it — the operator's default `NOTIFY_CMD=notify-email` picks these up. You do **not** edit
+   `runner.conf` or `notify.env`; those are operator-only (§13d). If the operator repointed
+   `NOTIFY_CMD` at something else, ask them.
+
+---
+
+## 13. Configuration & environment reference (full surface)
+
+Everything the framework reads, grouped by **who sets it** and **where**. Every variable below was
+verified against the code; the file/why is given. Vars marked **operator config** are listed so you
+know the feature exists, but you **cannot** set them as a job author — they live in host files you
+don't control.
+
+### (a) Job author — in the manifest `.gitolite/ci.yml`
+
+Fully covered in **§2**. The complete set of fields the runner actually reads
+(`run-group.sh` via `yq_*`): per-job `run`, `image`, `timeout`, `memory`, `pids`, `network`, `env`,
+and `on.<push|create|delete>` with `branches`, `branches-ignore`, `paths`, `paths-ignore`.
+Anything else in the file is ignored (`version:`, `secrets:` — §9). Nothing is missing from §2.
+
+### (b) Job author / repo — via conventional files in your repo
+
+The runner looks for exactly these repo-relative paths (verified in `run-group.sh` / `post-receive`):
+
+| Path | Read by | Purpose |
+|---|---|---|
+| `.gitolite/ci.yml` | hook `have_ci`, `run-group.sh` `manifest=` | The manifest. Its presence is the **opt-in gate** (§2). |
+| `ci/secrets.enc.yaml` | `run-group.sh` (`sops -d --output-type dotenv`) | Encrypted secrets → injected as `--env-file`; **also the source of per-repo SMTP creds** (§12.3). Presence is the trigger; there is no `secrets:` field. |
+
+There are **no other** magic repo paths. (`ci/*.sh` scripts only exist because *your* `run:` calls
+them — the runner doesn't look for them.)
+
+### (c) Inside-container environment your job receives
+
+Injected on the `docker run` (verified in `run-group.sh` `execute_job` / `run_teardown` and the
+`CACHE_ENV` block). This is the COMPLETE list.
+
+**CI_* identity/context vars:**
+
+| Var | Value / meaning |
+|---|---|
+| `CI_EVENT` | `push`, `create`, or `delete` (manual `ci-job run` reports as `push`). |
+| `CI_REPO` | Gitolite repo path, e.g. `tovasol/agent-forge`. |
+| `CI_BRANCH` | Exact branch name. |
+| `CI_BRANCH_SLUG` | DNS-safe slug of the branch (lowercased, non-alnum→`-`, +6-char sha1). |
+| `CI_SHA` | Commit sha being built. *(Not set on `delete`/teardown — there is no new tree.)* |
+| `CI_PUSHER` | Gitolite user who triggered it. |
+| `CI_CACHE_DIR` | `/cache` — the shared cache mount (§6). |
+| `CI_ENV_DIR` | `/envstate` — persistent per-(repo,branch) state dir (mounted from `envs/<repo>/<slug>`). |
+| `CI_OUTBOX` | `/cicd/out/notify` — the notify outbox path used by `/cicd/lib.sh` (don't write it directly). |
+
+**Cache vars (`CACHE_ENV`, complete — every entry points a package manager at `/cache`):**
+
+| Var | Value | Ecosystem |
+|---|---|---|
+| `CI_CACHE_DIR` | `/cache` | generic / this runner |
+| `XDG_CACHE_HOME` | `/cache/xdg` | XDG fallback (use for unlisted tools) |
+| `XDG_DATA_HOME` | `/cache/xdg-data` | XDG data |
+| `npm_config_cache` | `/cache/npm` | npm |
+| `YARN_CACHE_FOLDER` | `/cache/yarn` | yarn |
+| `pnpm_config_store_dir` | `/cache/pnpm/store` | pnpm store |
+| `pnpm_config_cache_dir` | `/cache/pnpm/cache` | pnpm cache |
+| `BUN_INSTALL_CACHE_DIR` | `/cache/bun` | bun |
+| `PIP_CACHE_DIR` | `/cache/pip` | pip |
+| `POETRY_CACHE_DIR` | `/cache/poetry` | poetry |
+| `UV_CACHE_DIR` | `/cache/uv` | uv |
+| `PIPENV_CACHE_DIR` | `/cache/pipenv` | pipenv |
+| `COMPOSER_CACHE_DIR` | `/cache/composer` | PHP composer |
+| `GOMODCACHE` | `/cache/go/mod` | Go modules |
+| `GOCACHE` | `/cache/go/build` | Go build |
+| `CARGO_HOME` | `/cache/cargo` | Rust cargo |
+| `BUNDLE_PATH` | `/cache/bundle` | Ruby bundler (gems) |
+| `BUNDLE_USER_CACHE` | `/cache/bundle/cache` | Ruby bundler cache |
+| `NUGET_PACKAGES` | `/cache/nuget` | .NET NuGet |
+| `GRADLE_USER_HOME` | `/cache/gradle` | Gradle |
+| `MAVEN_ARGS` | `-Dmaven.repo.local=/cache/maven` | Maven (note: an arg, not a dir var) |
+| `DENO_DIR` | `/cache/deno` | Deno |
+| `MIX_HOME` | `/cache/mix` | Elixir mix |
+| `HEX_HOME` | `/cache/hex` | Elixir hex |
+
+**Then, layered on top (later wins):** your `jobs.<name>.env` map (plaintext `-e KEY=value`),
+then decrypted secrets from `ci/secrets.enc.yaml` (`--env-file`, so a secret with the same name
+**overrides** an `env:` entry, which in turn overrides the `CI_*`/cache defaults).
+
+> Note: `RESOURCE_LIMITS=0` on this runner means `--memory`/`--pids-limit` are omitted (§8); the
+> container still gets `--cap-drop ALL`, `--security-opt no-new-privileges`, `--network`, the
+> wall-clock `timeout`, and the `APT_HARDEN` apt fix.
+
+### (d) Operator / host config — `runner.conf` (and friends)
+
+These live in `runner.conf` (`$CICD_BASE/etc/runner.conf` or `/etc/cicd-runner/runner.conf`),
+loaded by `cicd_load_config` (`bin/lib.sh`) into every host-side script. **Operator config, not
+author-settable** — listed so you know the feature surface and its defaults. "Affects authors?"
+flags what changes the behavior or limits of your jobs.
+
+**Identity / paths:**
+
+| Key | Default | Controls | Affects authors? |
+|---|---|---|---|
+| `RUNNER_USER` | `cicd-runner` | Unix user the runner/containers run as. | Indirectly (rootless uid). |
+| `RUNNER_BASE` | `/home/cicd-runner/runner` | Root of `queue/ runs/ cache/ envs/ slots/ incoming/`. | No. |
+| `GIT_REPO_BASE` | `/home/git/repositories` | Documented as where gitolite bare repos live. **Declared in the sample but not read by any runner script** (the hook uses gitolite's own `GL_REPO`/cwd; `ci-job` uses `gitolite query-rc GL_REPO_BASE`). Effectively informational. | No. |
+| `LOCAL_BIN` | `/home/cicd-runner/.local/bin` | Dir prepended to `PATH` so the runner finds `sops`/`yq`/`age` under `sudo`. | No. |
+
+**Secrets (sops + age):**
+
+| Key | Default | Controls | Affects authors? |
+|---|---|---|---|
+| `SOPS_AGE_KEY_FILE` | `/run/ci-keys/age-keys.txt` | Path to the decrypted age key (ramfs; populated by `unlock-ci`). Its presence gates secret-using jobs and the host-side mailer. | Yes — if unloaded, secret jobs **defer**, and per-repo SMTP creds can't be read. |
+| `SHM_DIR` | `/dev/shm` | tmpfs where decrypted env-files are written transiently. | No. |
+
+**Concurrency:**
+
+| Key | Default | Controls | Affects authors? |
+|---|---|---|---|
+| `MAX_JOBS` | `4` | Global cap on simultaneous `docker run`s (slot semaphore in `bin/lib.sh` `acquire_slot`; also seeded by `install.sh`, shown by `ci-status`). | Yes — your job may queue behind others. |
+| `SLOT_WAIT_SECS` | `2` | Poll interval while waiting for a free slot (`acquire_slot`). | Marginally (queue latency). |
+
+**Per-job defaults (overridable in the manifest — §2):**
+
+| Key | Default | Controls | Affects authors? |
+|---|---|---|---|
+| `DEFAULT_IMAGE` | `node:20-alpine` | Image when `jobs.<name>.image` is unset. | Yes (default image). |
+| `DEFAULT_TIMEOUT` | `900` | Wall-clock kill (s) when `timeout` unset. Also used by `reap-containers` as the max age for killing runaway containers. | Yes. |
+| `DEFAULT_MEMORY` | `2g` | `--memory` default (only if `RESOURCE_LIMITS=1`). | Yes (when enforced). |
+| `DEFAULT_PIDS` | `512` | `--pids-limit` default (only if `RESOURCE_LIMITS=1`). | Yes (when enforced). |
+| `DEFAULT_NETWORK` | `bridge` | `--network` default (`bridge`/`none`). | Yes. |
+| `RESOURCE_LIMITS` | `0` | `1` ⇒ apply `--memory`/`--pids-limit`; `0` ⇒ omit them (OpenRC rootless can't enforce). | **Yes** — at `0`, `memory`/`pids` manifest fields are no-ops (§8). |
+
+**Dependency cache reaper (`bin/prune-disk`):**
+
+| Key | Default | Controls | Affects authors? |
+|---|---|---|---|
+| `CACHE_MAX_AGE_DAYS` | `30` | Delete `/cache` entries untouched this long. | Yes — old caches expire (cold rebuild). |
+| `CACHE_MAX_GB` | `20` | Then size-cap the whole cache (LRU eviction). | Yes — caches may be evicted under pressure. |
+| `LOG_RETENTION_DAYS` | `30` | Delete run dirs (logs/meta) older than this. | Yes — old run logs disappear from `ci-job log`/`status`. |
+
+**Behavior:**
+
+| Key | Default | Controls | Affects authors? |
+|---|---|---|---|
+| `CANCEL_IN_PROGRESS` | `0` | *Intended:* `1` = a new push kills the running job; `0` = coalesce. **Declared in the sample but NOT read by any code** — coalescing is always the behavior today. Documented as a known no-op so you don't rely on it. | No (no-op). |
+| `DELETE_SUPERSEDES` | `1` | `1` = a branch-delete cancels/overrides a pending build for that group (`run-group.sh` main loop). | Yes — a delete can pre-empt your queued build. |
+| `NOTIFY_BACKSTOP` | `1` | `1` = email on a job failure that emitted no script `notify_*` (catches OOM/SIGKILL). Read in `lib/cicd.sh` `cicd_flush_outbox`. | Indirectly (you still get failure alerts). |
+| `NOTIFY_CMD` | `…/bin/notify-email` | Host-side notification handler invoked per notification (§12). | Yes — determines whether/how your `notify_*` reach a human. |
+
+**Ephemeral-env reaper (`bin/reap-envs`):**
+
+| Key | Default | Controls | Affects authors? |
+|---|---|---|---|
+| `REPORT_STALE_DAYS` | `30` | Log envs idle this long as "verify + `ci-teardown`". | Marginally (housekeeping of preview envs). |
+| `AUTO_REAP_STALE_DAYS` | `0` | `0` = report only; `>0` = auto-teardown after N idle days. | Yes if `>0` — abandoned preview envs get torn down. |
+
+**Docker context:**
+
+| Key | Default | Controls | Affects authors? |
+|---|---|---|---|
+| `DOCKER_HOST` | `unix:///run/user/__UID__/docker.sock` | Targets the rootless docker daemon (`install.sh` fills `__UID__`). Exported by `run-group.sh`, `prune-disk`, `reap-containers`, `ci-status`. | No. |
+
+**Trusted branches (declared-but-unused):**
+
+| Key | Default | Status |
+|---|---|---|
+| `TRUSTED_BRANCHES` | *(unset)* | Consumed only by `is_trusted_branch()` in `bin/lib.sh`, which is **never called**. Not in the sample config; effectively dead. Don't rely on it. |
+
+**Operator-global SMTP fallback file** — `/etc/cicd-runner/notify.env` (template
+`etc/notify.env.sample`): holds the same keys as §12.3/§12.4 as a default for repos that don't ship
+their own SMTP creds. **Operator-only**; per-repo `ci/secrets.enc.yaml` overrides it key-by-key.
+
+### (e) Bootstrap / wrapper env vars (rarely relevant to authors)
+
+These are read by host scripts at install/invoke time, not by jobs. Listed for completeness:
+
+| Var | Where | Default | Meaning |
+|---|---|---|---|
+| `CICD_BASE` | every host script | `/home/cicd-runner/runner` | Install root used to locate `bin/lib.sh` + config before `runner.conf` is loaded. |
+| `CICD_CONF` | `bin/lib.sh` `cicd_load_config` | *(unset)* | Explicit override path to `runner.conf` (highest precedence in the search order). |
+| `CICD_RUNNER_USER` | `post-receive`, `git/ci-job` | `cicd-runner` | Runner user the git side `sudo`s to. |
+| `CICD_RUNNER_BIN` | `git/ci-job` | `/home/<user>/runner/bin` | Where `ci-job` proxies read commands. |
+| `CICD_NOTIFY_ENV` | `lib/cicd.sh` → `notify-email` | per-run decrypted secrets, else `/etc/cicd-runner/notify.env` | Path the mailer reads SMTP creds from (this is the mechanism that delivers per-repo secrets to the host-side mailer — §12.2). |
+| `RUNNER_BASE_OVERRIDE` | `install.sh` | `$HOME/runner` | Override install base at setup time. |
+| `GIT_USER` | `update-runner.sh` | `git` | Gitolite user for the self-update flow. |
+| `BRANCH` | `update-runner.sh` | `main` | Branch the updater archives the runner from. |
+| `CICD_AGE_ENC` | `bin/unlock-ci` | `$CICD_BASE/etc/age-key.gpg` | Optional gpg-at-rest blob holding the age key. |
+| `GPG_TTY` | `bin/unlock-ci` | `$(tty)` | TTY for an interactive gpg prompt when unlocking. |
+| `CICD_TOOLS_DIR` | `bin/fetch-tools.sh` | `$HOME/.local/bin` | Install dir for the stack's pinned tools (sops/yq/age/duckdb). |
+| `CIJOB_POLL` / `CIJOB_POLL_MAX` | `git/ci-job` watch | `2` / `300` | `--watch` poll interval (s) and max polls before it stops watching. Handy if you script around `ci-job run --watch`. |
+| `CI_STATUS_RECENT` | `bin/ci-status` | `12` | Number of recent runs shown by `ci-job status`. |
+| `NO_COLOR` / `CLICOLOR_FORCE` | `bin/ci-status` | *(unset)* | Standard color-off / force-color toggles for `ci-job status` output. |
