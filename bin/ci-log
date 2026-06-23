@@ -49,10 +49,13 @@ else
 fi
 
 printf '\033[1m-- run: %s --\033[0m\n' "${dir#"$RUNNER_BASE"/}"
-# pretty key=value view via duckdb -line; plain cat if duckdb absent.
-if command -v duckdb >/dev/null 2>&1; then
-  duckdb -line -c "SELECT * FROM read_json('$dir/meta.json', format='newline_delimited')" 2>/dev/null \
-    || { cat "$dir/meta.json"; echo; }
+# pretty key=value view via duckdb -line; plain cat if duckdb absent. CAPTURE the output
+# (so duckdb's stdout is a pipe, not the tty) — otherwise duckdb probes the terminal
+# background (OSC 11) and the reply (`11;rgb:…`) pollutes the prompt after the log.
+if command -v duckdb >/dev/null 2>&1 \
+   && _m="$(duckdb -line -c "SELECT * FROM read_json('$dir/meta.json', format='newline_delimited')" 2>/dev/null)" \
+   && [ -n "$_m" ]; then
+  printf '%s\n' "$_m"
 else
   cat "$dir/meta.json"; echo
 fi
