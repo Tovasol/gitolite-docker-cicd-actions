@@ -196,31 +196,47 @@ throwaway run.
   queue/<group>/group.lock       # flock target for per-group serialization
   slots/1 .. slots/N             # global concurrency semaphore (flock each)
   secrets/<repo>/<ns>.env        # per-repo secret namespaces, chmod 600
-  runs/<group>/<ts>-<sha8>-<job>/
-      status                     # queued | running | exit:<n> | timeout | cancelled
-      meta.json                  # repo, branch, sha, trigger reason, start, end, duration
+  runs/<repo…>/<ts>-<sha8>-<job>/    # FLAT: branch + job live in meta, NOT the path
+      meta.json                  # THE SOURCE OF TRUTH — fat single-line JSON (below)
       cmd                        # exact `docker run …` invocation — reproducible by hand
       output.log                 # combined stdout+stderr
-  runs/<group>/.latest/<job>        -> newest run of THAT job
-  runs/<group>/.latest/<job>@ok     -> last GREEN run of that job (rollback / last-good ref)
-  runs/<group>/.latest/<job>@fail   -> last RED run of that job (jump to last failure)
 ```
 
-**Per-job `latest` pointers (not one global `latest`).** With multiple jobs per push
-of differing cadence (e.g. `smoke` every push, `deploy-site` only on site changes), a
-single `runs/<group>/latest` is last-writer-wins → it tracks the most *frequent* job
-(smoke), not the most *important* (deploy), and the deploy pointer is clobbered by the
-next unrelated push. So the runner maintains **per-job** symlinks under `.latest/`:
-`<job>` (newest), `<job>@ok` (last success — the rollback/last-good-deploy reference),
-`<job>@fail` (last failure — the debug entry point). The old single `latest` is
-removed (nothing parsed it; it was a human convenience that lied). `ci-status` prints
-a per-job summary from these, and still lists the raw time-sorted recent runs.
+**Flat, meta-driven runs (no per-branch/per-job path levels, no symlinks).** The path
+is a *dumb bucket*; `meta.json` is authoritative and self-describing. This is the
+resolution of a long design thread — three earlier schemes (per-branch dirs, sentinel
+delimiters, per-job `.latest` symlinks) all fought the same ambiguity: repo **and**
+branch can contain `/`, so a path that encodes them can't be parsed back. The fix is
+to stop encoding them in the path at all:
 
-- **History** → `ls -t ~/ci/runs/<group>/`
-- **Logs** → `cat .../output.log`, live `tail -f .../.latest/<job>/output.log`
-- **Debug** → the `cmd` file re-runs the exact failed container by hand;
-  `status` has the exit code
-- **Group** = `repo[+branch]` (this is "grouping", Laminar-style)
+- **Layout** `runs/<repo…>/<ts>-<sha8>-<job>/`. The leaf is one **slash-free** segment
+  (the run-id) → it's the unambiguous anchor: everything left of it (under `runs/`) is
+  the repo, full stop. Branch and job live in `meta.json`. Repo prefix is kept only for
+  ops ergonomics (`rm -rf runs/<repo>`, scoped `find`, browse) — never parsed.
+- **Unique run-id**: `<ts>-<sha8>-<job>`; same-second/sha/job retrigger collisions are
+  broken by an atomic `mkdir` loop (`-1`, `-2`…). `meta.start_ns` (nanoseconds) gives a
+  total order for "latest".
+- **`meta.json`** = fat single line, additive-only, `schema`-versioned:
+  `{schema, repo, branch, job, event, sha, pusher, start, start_ns, status, end,
+  end_ns, duration_s, exit}`. Written `running` at start, rewritten final at end. One
+  file fully reconstructs the logical structure with zero path parsing.
+- **No symlinks / no stored views.** "latest per job", "last green (rollback ref)",
+  "by branch", "timings" are all **derived by query**, never maintained as state — so
+  nothing dangles and no migration is needed when a new view is wanted.
+- **Query seam = NDJSON.** Each `meta.json` is one line, so `ci-runs`
+  (`find runs -name meta.json -exec cat {} +`) emits an NDJSON stream that `sq`,
+  `sqlite3`, `jq`, or `duckdb` all consume. `ci-status` runs SQL over it (prefers
+  `sqlite3` — deterministic, header-less; `sq` supported as fallback). `json_valid`/
+  `json_each` skip partial/corrupt lines, so a crash mid-write never breaks a query.
+- **Failure states.** `status:running` + no live container after a crash = orphaned;
+  surfaced in `ci-status` (flagged stale >2h), pruned by retention; the recovery re-run
+  (newer `start_ns`) is what "latest" resolves to, so the stale one never masks it.
+
+- **History** → `ls -t ~/ci/runs/<repo…>/` or `ci-runs <repo> | sq …`
+- **Logs** → `cat .../output.log`; find the latest via `ci-status <repo>`
+- **Debug** → the `cmd` file re-runs the exact failed container by hand
+- **Group** (queue/coalescing) is still `repo+branch` — a SEPARATE tree (`queue/`),
+  unaffected by the flat `runs/` layout.
 
 Do NOT rely on `docker logs` (purged with `--rm`). Always redirect to
 `output.log` so logs are plain files regardless of container retention.

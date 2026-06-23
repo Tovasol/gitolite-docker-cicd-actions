@@ -457,16 +457,19 @@ git commit -am "ci: rotate runner key" && git push
 ## 8. Operate / debug a CI run
 
 ```bash
-# latest run for a repo/branch:
-ls -t /home/cicd-runner/runner/runs/<repo>/<branch>/ | head
-cd /home/cicd-runner/runner/runs/<repo>/<branch>/<ts>-<sha>/
-cat status           # running | exit:<n> | timeout | cancelled
+# dashboard first — health + per-job rollups + recent runs + orphaned + pending:
+ci-status                       # everything;  ci-status <repo>  to scope
+ci-runs <repo> | sq sql 'SELECT job,status,start FROM data ORDER BY start_ns DESC LIMIT 20'
+
+# runs are FLAT + meta-driven: runs/<repo…>/<ts>-<sha8>-<job>/ (branch+job are IN meta).
+ls -t /home/cicd-runner/runner/runs/<repo>/ | head     # newest run dirs for a repo
+cd /home/cicd-runner/runner/runs/<repo>/<ts>-<sha8>-<job>/
+cat meta.json        # SOURCE OF TRUTH: status, repo, branch, job, sha, start/end, duration, exit
 cat output.log       # full stdout+stderr
 cat cmd              # exact docker run — paste to reproduce the failed container by hand
-cat meta.json        # who pushed, branch, sha, timings
 
-# follow a live run:
-tail -f /home/cicd-runner/runner/runs/<repo>/<branch>/latest/output.log
+# follow the latest run of a job (resolve its dir via ci-status, then):
+tail -f /home/cicd-runner/runner/runs/<repo>/<ts>-<sha8>-<job>/output.log
 
 # re-trigger: just RE-PUSH from your Mac — the hook re-archives + re-delivers the
 # source (archive-push). The runner has no repo access, so it can't reconstruct the

@@ -12,9 +12,14 @@ docker builder prune --keep-storage 10g --filter until=48h -f >/dev/null 2>&1 ||
 docker image prune -f >/dev/null 2>&1 || true
 docker container prune -f --filter until=1h >/dev/null 2>&1 || true
 
-# run-log retention
-find "$RUNNER_BASE/runs" -maxdepth 3 -type d -mtime "+${LOG_RETENTION_DAYS:-30}" \
-  -name '20*' -exec rm -rf {} + 2>/dev/null || true
+# run-log retention — meta-driven, depth-agnostic (run dirs sit under runs/<repo…>/,
+# and repo may have slashes). A run dir is one containing meta.json; delete those whose
+# meta is older than LOG_RETENTION_DAYS, then sweep now-empty repo dirs. No depth caps.
+find "$RUNNER_BASE/runs" -type f -name meta.json -mtime "+${LOG_RETENTION_DAYS:-30}" \
+  -printf '%h\0' 2>/dev/null | xargs -0 -r rm -rf 2>/dev/null || true
+# sweep empty leftover dirs, but only those idle >60min so we never race a run dir that
+# was just mkdir'd and is about to get its meta.json written.
+find "$RUNNER_BASE/runs" -mindepth 1 -type d -empty -mmin +60 -delete 2>/dev/null || true
 
 # global dependency cache reaper (DESIGN §32): age-evict cache entries untouched for
 # CACHE_MAX_AGE_DAYS, then size-cap the whole /cache to CACHE_MAX_GB (delete oldest-

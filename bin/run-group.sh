@@ -16,11 +16,16 @@ repo="$1"; branch="$2"
 group="$repo/$branch"
 slug="$(slugify "$branch")"
 Q="$RUNNER_BASE/queue/$group"
-RUNS="$RUNNER_BASE/runs/$group"
+# Flat, meta-driven runs (DESIGN §3): runs/<repo…>/<ts>-<sha8>-<job>/ — branch+job live
+# in meta.json (the source of truth), NOT in the path. The leaf is one slash-free
+# segment, so repo (which may contain slashes) is unambiguous and never parsed back out.
+RUNS="$RUNNER_BASE/runs/$repo"
 ENVS="$RUNNER_BASE/envs/$repo/$slug"
 CACHE="$RUNNER_BASE/cache"                    # GLOBAL cache, shared all repos (content-addressed dedup, §32)
 INC="$RUNNER_BASE/incoming/$group"           # cicd-ingest drops <sha>.tar + <sha>.changed here
 ZERO=0000000000000000000000000000000000000000
+# meta.json identity, set per-run before emit_meta (declared here for set -u safety)
+META_repo="" META_branch="" META_job="" META_event="" META_sha="" META_pusher="" META_start="" META_startns=0
 export SOPS_AGE_KEY_FILE
 [ -n "${DOCKER_HOST:-}" ] && export DOCKER_HOST
 
@@ -64,22 +69,32 @@ trap ':' EXIT                                 # slot/lock fds auto-release on ex
 
 src_sha() { [ "$1" = delete ] && printf '%s' "$3" || printf '%s' "$2"; }  # event new old
 
-# Per-job latest pointers (DESIGN §3). No single ambiguous `latest` (a frequent job
-# like smoke would clobber the deploy pointer). Maintain, per job: <job> (newest),
-# <job>@ok (last green — rollback ref), <job>@fail (last red — debug entry point).
-link_latest() {  # <job> <rundir> <rc>
-  local job="$1" rdir="$2" rc="$3" L="$RUNS/.latest"
-  mkdir -p "$L"
-  ln -sfn "$rdir" "$L/$job"
-  if [ "$rc" -eq 0 ]; then ln -sfn "$rdir" "$L/$job@ok"; else ln -sfn "$rdir" "$L/$job@fail"; fi
+# Create a unique, slash-free run dir runs/<repo>/<ts>-<sha8>-<job> (atomic via mkdir;
+# collision on same-second/sha/job retrigger -> -1, -2… suffix). Echoes the dir.
+make_rundir() {  # <ts> <sha8> <job>
+  local base="$RUNS/$1-$2-$3" d="$RUNS/$1-$2-$3" n=1
+  mkdir -p "$RUNS"
+  until mkdir "$d" 2>/dev/null; do d="$base-$n"; n=$((n + 1)); done
+  printf '%s' "$d"
 }
 
-# run timing: meta.json already carries the ISO start; record epoch for math + end+dur.
-mark_start() { date +%s > "$1/.start.epoch"; }      # <rundir>
-mark_end() {  # <rundir>
-  local e s; e="$(date +%s)"; s="$(cat "$1/.start.epoch" 2>/dev/null || echo "$e")"
-  date -u +%Y-%m-%dT%H:%M:%SZ > "$1/ended"
-  printf '%s\n' "$((e - s))" > "$1/duration"        # whole seconds
+# JSON string escape (backslash + doublequote) for the hand-rolled meta writer.
+jesc() { printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# Fat, single-line meta.json — the SOURCE OF TRUTH for a run (path is a dumb bucket).
+# Identity (META_*) is set once per run by the caller; this writes/overwrites the line
+# with the dynamic status/timing. NDJSON-friendly: one object, one line, sq/jq/sqlite
+# all consume `find runs -name meta.json -exec cat {} +`. schema:1 = additive-only.
+emit_meta() {  # <file> <status> <exit|''> <end_iso|''> <end_ns|''> <dur|''>
+  local f="$1" status="$2" ex="$3" eiso="$4" ens="$5" dur="$6" end_j ens_j dur_j ex_j
+  [ -n "$eiso" ] && end_j="\"$(jesc "$eiso")\"" || end_j=null
+  [ -n "$ens" ]  && ens_j="$ens" || ens_j=null
+  [ -n "$dur" ]  && dur_j="$dur" || dur_j=null
+  [ -n "$ex" ]   && ex_j="$ex"   || ex_j=null
+  printf '{"schema":1,"repo":"%s","branch":"%s","job":"%s","event":"%s","sha":"%s","pusher":"%s","start":"%s","start_ns":%s,"status":"%s","end":%s,"end_ns":%s,"duration_s":%s,"exit":%s}\n' \
+    "$(jesc "$META_repo")" "$(jesc "$META_branch")" "$(jesc "$META_job")" "$(jesc "$META_event")" \
+    "$(jesc "$META_sha")" "$(jesc "$META_pusher")" "$(jesc "$META_start")" "${META_startns:-0}" \
+    "$(jesc "$status")" "$end_j" "$ens_j" "$dur_j" "$ex_j" > "$f"
 }
 
 # Readiness gates (deferred-recovery, §33). When the environment can't run a job
@@ -93,6 +108,7 @@ key_loaded()   { [ -s "${SOPS_AGE_KEY_FILE:-}" ]; }
 execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   local job="$1" event="$2" newrev="$3" pusher="$4" work="$5" manifest="$6"
   local image timeout mem pids network runcmd ts dir name envfile rc outdir status_word
+  local start_iso start_ns end_iso end_ns dur
   image="$(yq_str "$manifest" ".jobs.\"$job\".image")";     image="${image:-$DEFAULT_IMAGE}"
   timeout="$(yq_str "$manifest" ".jobs.\"$job\".timeout")"; timeout="${timeout:-$DEFAULT_TIMEOUT}"
   mem="$(yq_str "$manifest" ".jobs.\"$job\".memory")";      mem="${mem:-$DEFAULT_MEMORY}"
@@ -112,18 +128,19 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   done
   # retry + notify live in the script via /cicd/lib.sh; runner owns safety + delivery.
 
-  ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  dir="$RUNS/$ts-${newrev:0:8}-$job"; mkdir -p "$dir"
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"; start_iso="$(_ts)"; start_ns="$(date +%s%N)"
+  dir="$(make_rundir "$ts" "${newrev:0:8}" "$job")"
   name="cicd-$(printf '%s' "$group-$job" | tr -c 'a-zA-Z0-9_.-' '-')-$ts"
-  printf '{"group":"%s","job":"%s","event":"%s","sha":"%s","branch":"%s","pusher":"%s","start":"%s"}\n' \
-    "$group" "$job" "$event" "$newrev" "$branch" "$pusher" "$(_ts)" > "$dir/meta.json"
-  echo running > "$dir/status"; mark_start "$dir"
+  META_repo="$repo"; META_branch="$branch"; META_job="$job"; META_event="$event"
+  META_sha="$newrev"; META_pusher="$pusher"; META_start="$start_iso"; META_startns="$start_ns"
+  emit_meta "$dir/meta.json" running
 
   envfile=""
   if [ -f "$work/ci/secrets.enc.yaml" ]; then
     envfile="$(mktemp -p "${SHM_DIR:-/dev/shm}" cicd.env.XXXXXX)"
     if ! sops -d --output-type dotenv "$work/ci/secrets.enc.yaml" > "$envfile" 2>"$dir/secrets.err"; then
-      echo "exit:secrets-decrypt-failed" > "$dir/status"; rm -f "$envfile"
+      end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))
+      emit_meta "$dir/meta.json" secrets-decrypt-failed 1 "$(_ts)" "$end_ns" "$dur"; rm -f "$envfile"
       notify_failure "$group/$job" secrets "$dir/output.log"
       log "$group/$job: secret decrypt failed (key loaded? run unlock-ci) — see $dir/secrets.err"
       return 1
@@ -159,7 +176,8 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   rc=$?
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; rc=124; fi
   if [ "$rc" -eq 124 ]; then status_word=timeout; else status_word="exit:$rc"; fi
-  echo "$status_word" > "$dir/status"; mark_end "$dir"; link_latest "$job" "$dir" "$rc"
+  end_iso="$(_ts)"; end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))
+  emit_meta "$dir/meta.json" "$status_word" "$rc" "$end_iso" "$end_ns" "$dur"
   cicd_flush_outbox "$outdir/notify" "$rc" "$dir" "$group/$job" "$envfile"
   [ "$rc" -eq 0 ] && log "$group/$job: done" || log "$group/$job: FAILED $status_word"
   [ -n "$envfile" ] && rm -f "$envfile"
@@ -198,11 +216,14 @@ find_delete_job() {  # <manifest> -> first job whose on.delete matches $branch
 }
 
 run_teardown() {  # <oldrev> <pusher>
-  local oldrev="$1" pusher="$2" ts dir name envfile rc
+  local oldrev="$1" pusher="$2" ts dir name envfile rc start_iso start_ns end_ns dur
   local work="" manifest="" tjob="" image runcmd mountwork outdir srctar secsrc
-  ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  dir="$RUNS/$ts-teardown"; mkdir -p "$dir"; echo running > "$dir/status"; mark_start "$dir"
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"; start_iso="$(_ts)"; start_ns="$(date +%s%N)"
+  dir="$(make_rundir "$ts" "${oldrev:0:8}" teardown)"
   name="cicd-teardown-$(printf '%s' "$group" | tr -c 'a-zA-Z0-9_.-' '-')-$ts"
+  META_repo="$repo"; META_branch="$branch"; META_job="teardown"; META_event="delete"
+  META_sha="$oldrev"; META_pusher="$pusher"; META_start="$start_iso"; META_startns="$start_ns"
+  emit_meta "$dir/meta.json" running
 
   # --- source tree: hook-delivered incoming/<oldrev>.tar -> else persisted env source.tar ---
   srctar=""
@@ -226,7 +247,9 @@ run_teardown() {  # <oldrev> <pusher>
     mountwork=(-w /envstate)
   fi
   if [ -z "${runcmd:-}" ]; then
-    echo "exit:0" > "$dir/status"; [ -n "$work" ] && rm -rf "$work"
+    end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))
+    emit_meta "$dir/meta.json" exit:0 0 "$(_ts)" "$end_ns" "$dur"
+    [ -n "$work" ] && rm -rf "$work"
     log "$group: nothing to tear down for $slug"; return 0
   fi
 
@@ -265,7 +288,8 @@ run_teardown() {  # <oldrev> <pusher>
       >>"$dir/output.log" 2>&1
   rc=$?
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; rc=1; fi
-  echo "exit:$rc" > "$dir/status"; mark_end "$dir"; link_latest teardown "$dir" "$rc"
+  end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))
+  emit_meta "$dir/meta.json" "exit:$rc" "$rc" "$(_ts)" "$end_ns" "$dur"
 
   if [ "$rc" -eq 0 ]; then
     cicd_flush_outbox "$outdir/notify" 0 "$dir" "$group teardown" "$envfile"

@@ -29,6 +29,22 @@ if ! have age-keygen; then
   install -m755 "$tmp"/age/age "$tmp"/age/age-keygen "$BIN/"
   rm -rf "$tmp"
 fi
+# sq (SQL over JSON) — powers ci-status analytics. OPTIONAL: the runner never needs it;
+# ci-status degrades to its dependency-light view if absent. Asset name varies by release,
+# so resolve the real linux/<arch> tarball via the GitHub API; never fatal.
+if ! have sq; then
+  echo "→ sq (neilotoole, latest, $A) [optional: ci-status analytics]"
+  tmp="$(mktemp -d)"
+  url="$(curl -fsSL https://api.github.com/repos/neilotoole/sq/releases/latest 2>/dev/null \
+         | grep -oE 'https://[^"]+linux[._-]'"$A"'\.tar\.gz' | head -1)"
+  if [ -n "$url" ] && curl -fsSL "$url" -o "$tmp/sq.tgz" && tar xzf "$tmp/sq.tgz" -C "$tmp" 2>/dev/null; then
+    f="$(find "$tmp" -type f -name sq | head -1)"
+    [ -n "$f" ] && install -m755 "$f" "$BIN/sq" && echo "  sq -> $BIN/sq"
+  fi
+  command -v "$BIN/sq" >/dev/null 2>&1 || have sq || \
+    echo "  (sq not installed — analytics optional; grab it from https://sq.io into $BIN)"
+  rm -rf "$tmp"
+fi
 
 echo "--- $BIN ---"; ls -1 "$BIN"
 case ":$PATH:" in

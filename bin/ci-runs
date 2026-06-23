@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# ci-runs — emit every run's meta.json as an NDJSON stream (one run per line). This is
+# the SEAM between dumb run dirs and any query engine. Each meta.json is already a single
+# fat line, so concatenating them IS valid NDJSON. Pipe it anywhere:
+#
+#   ci-runs | sq sql 'SELECT job, count(*) FROM data GROUP BY job'
+#   ci-runs | jq -s 'group_by(.job)'
+#   ci-runs tovasol/agent-forge | sqlite3 …          # optional repo-prefix scope (arg 1)
+#
+# Path is a dumb bucket; meta.json is the source of truth — so every view (latest, by
+# branch, by status, timings) is just a query over this stream, never stored state.
+set -uo pipefail
+CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
+# shellcheck disable=SC1090
+. "$CICD_BASE/bin/lib.sh"; cicd_load_config
+
+root="$RUNNER_BASE/runs"
+[ -n "${1:-}" ] && root="$RUNNER_BASE/runs/$1"
+[ -d "$root" ] || exit 0
+find "$root" -type f -name meta.json -exec cat {} + 2>/dev/null

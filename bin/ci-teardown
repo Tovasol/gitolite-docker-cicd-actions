@@ -42,7 +42,7 @@ case "$cmd" in
     printf 'delete 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 manual\n' \
       > "$q/target.tmp"; mv -f "$q/target.tmp" "$q/target"
     setsid "$CICD_BASE/bin/run-group.sh" "$repo" "$branch" </dev/null >>"$RUNNER_BASE/runner.log" 2>&1 &
-    echo "retry triggered: $repo branch='$branch' — watch ci-status / runs/.../.latest/teardown"
+    echo "retry triggered: $repo branch='$branch' — watch: ci-status $repo  (or tail runner.log)"
     ;;
 
   abandon)

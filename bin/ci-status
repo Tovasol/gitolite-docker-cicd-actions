@@ -1,75 +1,157 @@
 #!/usr/bin/env bash
-# ci-status — health check + recent runs. First thing to run when "nothing happened".
+# ci-status — health + analytics dashboard. First thing to run when "nothing happened".
+#
+# Two layers, deliberately split so the tool never gets fragile (DESIGN §3):
+#   • BASICS (key/docker/slots/pending/teardowns) — pure shell + find. Always work.
+#   • ANALYTICS (per-job rollups, recent, orphaned) — SQL over the run meta NDJSON via
+#     `sq` (preferred) or `sqlite3` (fallback). If neither is present, this layer is
+#     skipped with a hint; the basics still render.
+#
+# Usage: ci-status [repo-prefix]      # optional scope, e.g. ci-status tovasol/agent-forge
 set -uo pipefail
 CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
 # shellcheck disable=SC1090
 . "$CICD_BASE/bin/lib.sh"; cicd_load_config
+SCOPE="${1:-}"
 
-ok() { printf '  [ok]   %s\n' "$*"; }
-no() { printf '  [FAIL] %s\n' "$*"; }
-fmtdur() {  # <seconds>|"" -> human duration
+have() { command -v "$1" >/dev/null 2>&1; }
+ok()   { printf '  \033[32m●\033[0m %s\n' "$*"; }
+no()   { printf '  \033[31m●\033[0m %s\n' "$*"; }
+rule() { printf '\n\033[1m── %s ─────────────────────────────────────────────\033[0m\n' "$*"; }
+
+age_fmt() {  # <seconds-ago> -> compact age
+  local s="${1:-}"; case "$s" in ''|*[!0-9]*) printf '?'; return ;; esac
+  if   [ "$s" -ge 86400 ]; then printf '%dd' $((s/86400))
+  elif [ "$s" -ge 3600 ];  then printf '%dh' $((s/3600))
+  elif [ "$s" -ge 60 ];    then printf '%dm' $((s/60))
+  else printf '%ds' "$s"; fi
+}
+dur_fmt() {  # <seconds> -> human run duration
   local d="${1:-}"; case "$d" in ''|*[!0-9]*) printf '—'; return ;; esac
   if   [ "$d" -ge 3600 ]; then printf '%dh%02dm' $((d/3600)) $(((d%3600)/60))
   elif [ "$d" -ge 60 ];   then printf '%dm%02ds' $((d/60)) $((d%60))
   else printf '%ds' "$d"; fi
 }
-mstart() { sed -n 's/.*"start":"\([^"]*\)".*/\1/p' "$1/meta.json" 2>/dev/null | head -1; }   # ISO start
-rundur() { cat "$1/duration" 2>/dev/null; }                                                  # seconds
+iso_age() {  # <iso> -> seconds since (GNU date; '?' if unparseable)
+  local e; e="$(date -d "${1:-}" +%s 2>/dev/null)" || { printf '?'; return; }
+  printf '%s' "$(( $(date +%s) - e ))"
+}
 
-echo "cicd-runner status @ $(_ts)"
+# --- analytics engine: run a SELECT over the run-meta NDJSON. Same SQL feeds both
+# engines (sq exposes JSON keys as columns natively; for sqlite we build a matching
+# `data` view). json_valid()/json_each skip partial or corrupt meta lines. ----------
+ndjson() { "$CICD_BASE/bin/ci-runs" "$SCOPE" 2>/dev/null; }
+# Engine preference: sqlite3 first — deterministic, header-less, and near-universal.
+# sq is fully supported as a fallback (its TSV carries a header row, so we strip it).
+# Override with CI_STATUS_ENGINE=sq|sqlite3.
+ENGINE="${CI_STATUS_ENGINE:-}"
+[ -n "$ENGINE" ] || { if have sqlite3; then ENGINE=sqlite3; elif have sq; then ENGINE=sq; else ENGINE=none; fi; }
+_sqlite_run() {  # <select-sql>  (TSV out)
+  local tf; tf="$(mktemp)"; { printf '['; ndjson | paste -sd, -; printf ']'; } > "$tf"
+  sqlite3 -batch -noheader -separator $'\t' ":memory:" "
+    CREATE TEMP VIEW data AS SELECT
+      json_extract(value,'\$.repo') repo,   json_extract(value,'\$.branch') branch,
+      json_extract(value,'\$.job') job,     json_extract(value,'\$.status') status,
+      json_extract(value,'\$.event') event, json_extract(value,'\$.sha') sha,
+      json_extract(value,'\$.start') start, json_extract(value,'\$.start_ns') start_ns,
+      json_extract(value,'\$.duration_s') duration_s, json_extract(value,'\$.exit') exit
+    FROM json_each(readfile('$tf'));
+    $1" 2>/dev/null
+  rm -f "$tf"
+}
+runsql() {  # <select-sql>  (TSV out)
+  case "$ENGINE" in
+    sqlite3) _sqlite_run "$1" ;;
+    sq)      ndjson | sq sql --format tsv "$1" 2>/dev/null | sed '1d' ;;  # drop sq header
+    *) return 1 ;;
+  esac
+}
 
-# 1. key loaded?
+# =============================== render =====================================
+printf '\033[1m═══ cicd-runner ═══\033[0m  %s%s\n' "$(_ts)" "${SCOPE:+   scope=$SCOPE}"
+
+rule health
 if [ -s "$SOPS_AGE_KEY_FILE" ]; then ok "age key loaded ($SOPS_AGE_KEY_FILE)"
 else no "age key NOT loaded — run: unlock-ci   (did the box reboot?)"; fi
-
-# 2. docker reachable (rootless)?
 [ -n "${DOCKER_HOST:-}" ] && export DOCKER_HOST
-if docker info >/dev/null 2>&1; then
-  ok "docker reachable ($(docker info --format '{{.Name}} rootless={{.SecurityOptions}}' 2>/dev/null | grep -o rootless || echo rootful?))"
-else no "docker not reachable (DOCKER_HOST=$DOCKER_HOST) — is rootless dockerd running?"; fi
+if docker info >/dev/null 2>&1; then ok "docker reachable (rootless)"
+else no "docker NOT reachable (DOCKER_HOST=${DOCKER_HOST:-unset}) — rootless dockerd up?"; fi
+printf '  slots %s/%s free   analytics engine: %s\n' \
+  "$(ls "$RUNNER_BASE/slots" 2>/dev/null | wc -l | tr -d ' ')" "${MAX_JOBS}" \
+  "$([ "$ENGINE" = none ] && echo 'none (install sq or sqlite3)' || echo "$ENGINE")"
 
-# 3. test decrypt against any repo's secrets (proves the key actually works)
-sample="$(find "$RUNNER_BASE/runs" -maxdepth 0 2>/dev/null)"
-echo "  base: $RUNNER_BASE   slots: $(ls "$RUNNER_BASE/slots" 2>/dev/null | wc -l)/${MAX_JOBS}"
-
-# 4a. latest per job (per-job pointers; DESIGN §3 — no single ambiguous 'latest')
-echo "latest per job:"
-find "$RUNNER_BASE/runs" -type d -name .latest 2>/dev/null | sort | while read -r L; do
-  grp="${L%/.latest}"; grp="${grp#"$RUNNER_BASE"/runs/}"
-  for p in "$L"/*; do
-    [ -L "$p" ] || continue
-    b="$(basename "$p")"; case "$b" in *@ok|*@fail) continue ;; esac
-    st="$(cat "$p/status" 2>/dev/null)"; [ -n "$st" ] || st="(pruned)"
-    dur="$(fmtdur "$(rundur "$p")")"; started="$(mstart "$p")"
-    extra=""
-    [ -L "$L/$b@ok" ]   && extra="$extra ok=$(basename "$(readlink "$L/$b@ok")"   2>/dev/null)"
-    [ -L "$L/$b@fail" ] && extra="$extra fail=$(basename "$(readlink "$L/$b@fail")" 2>/dev/null)"
-    printf '  %-26s %-10s %7s  started %s%s\n' "$grp/$b" "$st" "$dur" "${started:-—}" "$extra"
-  done
-done
-
-# 4b. recent runs
-# NOTE: run dirs are runs/<repo>/<branch>/<ts-sha-job>/status and <repo> may contain
-# slashes (e.g. tovasol/agent-forge), so status sits 4–6 levels deep. Don't cap depth.
-echo "recent runs:                 status     dur      started               run"
-find "$RUNNER_BASE/runs" -type f -name status -printf '%T@ %p\n' 2>/dev/null \
-  | sort -rn | head -10 | while read -r _ s; do
-      d="$(dirname "$s")"
-      printf '  %-10s %7s  %-20s  %s\n' \
-        "$(cat "$s")" "$(fmtdur "$(rundur "$d")")" "$(mstart "$d")" "${d#$RUNNER_BASE/runs/}"
+# --- jobs: per (repo,job) rollup -------------------------------------------------
+rule "jobs"
+# coalesce nullable columns -> '-' so no TSV field is ever empty (empty fields collapse
+# under tab-IFS `read` and shift columns). running rows have null duration; never-green
+# jobs have null last_green; etc.
+JOBS_SQL="WITH r AS (SELECT *, row_number() OVER (PARTITION BY repo,job ORDER BY start_ns DESC) rn FROM data)
+SELECT repo, job,
+  max(CASE WHEN rn=1 THEN status END),
+  coalesce(max(CASE WHEN rn=1 THEN duration_s END),'-'),
+  max(CASE WHEN rn=1 THEN start END),
+  count(*),
+  sum(CASE WHEN exit IS NOT NULL AND exit<>0 THEN 1 ELSE 0 END),
+  coalesce(substr(max(CASE WHEN exit=0 THEN start END),1,10),'-'),
+  coalesce(substr(max(CASE WHEN exit IS NOT NULL AND exit<>0 THEN start END),1,10),'-')
+FROM r GROUP BY repo, job ORDER BY repo, job;"
+if [ "$ENGINE" = none ]; then
+  echo "  (no analytics engine — install sq or sqlite3 for per-job rollups)"
+else
+  printf '  \033[2m%-34s %-9s %5s %7s %4s %4s %-11s %-11s\033[0m\n' \
+    JOB STATUS AGE DUR RUNS FAIL LAST-GREEN LAST-RED
+  rows="$(runsql "$JOBS_SQL")"
+  if [ -z "$rows" ]; then echo "  (no runs yet)"; else
+    printf '%s\n' "$rows" | while IFS=$'\t' read -r repo job st dur start n fail green red; do
+      [ -n "$job" ] || continue
+      printf '  %-34s %-9s %5s %7s %4s %4s %-11s %-11s\n' \
+        "$repo/$job" "$st" "$(age_fmt "$(iso_age "$start")")" "$(dur_fmt "$dur")" \
+        "$n" "$fail" "${green:-—}" "${red:-—}"
     done
+  fi
+fi
 
-# 5. queued-but-unprocessed (crash recovery hint)
-echo "pending (target != last):"
-find "$RUNNER_BASE/queue" -name target 2>/dev/null | while read -r t; do
+# --- recent runs -----------------------------------------------------------------
+rule "recent runs"
+REC_SQL="SELECT status, coalesce(duration_s,'-'), start, repo, job, branch, substr(sha,1,8)
+FROM data ORDER BY start_ns DESC LIMIT ${CI_STATUS_RECENT:-12};"
+if [ "$ENGINE" = none ]; then
+  find "$RUNNER_BASE/runs" -type f -name meta.json -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn | head -12 | while read -r _ m; do
+        printf '  %s\n' "$(sed -n 's/.*"status":"\([^"]*\)".*"start":"\([^"]*\)".*/\2  \1/p' "$m")"
+      done
+else
+  printf '  \033[2m%-9s %7s %-20s %-22s %s\033[0m\n' STATUS DUR STARTED JOB·BRANCH SHA
+  runsql "$REC_SQL" | while IFS=$'\t' read -r st dur start repo job branch sha; do
+    [ -n "$st" ] || continue
+    printf '  %-9s %7s %-20s %-22s %s\n' "$st" "$(dur_fmt "$dur")" "$start" "${job}·${branch}" "$sha"
+  done
+fi
+
+# --- orphaned (status=running) ---------------------------------------------------
+if [ "$ENGINE" != none ]; then
+  orph="$(runsql "SELECT repo,job,branch,start FROM data WHERE status='running' ORDER BY start_ns DESC;")"
+  if [ -n "$orph" ]; then
+    rule "running / possibly orphaned"
+    printf '%s\n' "$orph" | while IFS=$'\t' read -r repo job branch start; do
+      [ -n "$job" ] || continue
+      a="$(iso_age "$start")"; flag=""; case "$a" in ''|*[!0-9]*) ;; *) [ "$a" -gt 7200 ] && flag="  \033[31m← stale >2h\033[0m" ;; esac
+      printf '  %-34s %-16s started %s (%s ago)%b\n' "$repo/$job" "$branch" "$start" "$(age_fmt "$a")" "$flag"
+    done
+  fi
+fi
+
+# --- pending (target != last) ----------------------------------------------------
+pend="$(find "$RUNNER_BASE/queue" -name target 2>/dev/null | while read -r t; do
   g="$(dirname "$t")"; [ "$(cat "$t" 2>/dev/null)" != "$(cat "$g/last" 2>/dev/null)" ] && \
-    printf '  %s -> %s\n' "${g#$RUNNER_BASE/queue/}" "$(cat "$t")"
-done
+    printf '  %s -> %s\n' "${g#"$RUNNER_BASE"/queue/}" "$(cat "$t")"; done)"
+if [ -n "$pend" ]; then rule "pending (target ≠ last — ci-recover will retry)"; printf '%s\n' "$pend"; fi
 
-# 6. failed teardowns awaiting operator action
-echo "FAILED teardowns (need operator — ci-teardown retry|abandon):"
-find "$RUNNER_BASE/envs" -name teardown-failed 2>/dev/null | while read -r f; do
-  d="$(dirname "$f")"
-  printf '  %s\n' "${d#"$RUNNER_BASE"/envs/}"
-  sed 's/^/      /' "$f"
-done
+# --- failed teardowns ------------------------------------------------------------
+td="$(find "$RUNNER_BASE/envs" -name teardown-failed 2>/dev/null)"
+if [ -n "$td" ]; then
+  rule "FAILED teardowns (need operator — ci-teardown retry|abandon)"
+  printf '%s\n' "$td" | while read -r f; do
+    d="$(dirname "$f")"; printf '  %s\n' "${d#"$RUNNER_BASE"/envs/}"; sed 's/^/      /' "$f"
+  done
+fi
