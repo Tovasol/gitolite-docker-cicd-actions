@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# ci-status — health + analytics dashboard. First thing to run when "nothing happened".
+# ci-status - health + analytics dashboard. First thing to run when "nothing happened".
 #
-# Two layers, deliberately split so the tool never gets fragile (DESIGN §3):
-#   • BASICS (key/docker/slots/pending/teardowns) — pure shell + find. Always work.
-#   • ANALYTICS (per-job rollups, recent, orphaned) — SQL over the run meta NDJSON via
-#     `sq` (preferred) or `sqlite3` (fallback). If neither is present, this layer is
-#     skipped with a hint; the basics still render.
+# Two layers, deliberately split so the tool never gets fragile (DESIGN section 3):
+#   * BASICS (key/docker/slots/pending/teardowns) - pure shell + find. Always work.
+#   * ANALYTICS (per-job rollups, recent, orphaned) - SQL over the run meta NDJSON via
+#     `sq` (https://sq.io). If sq isn't installed, this layer is skipped with a hint;
+#     the basics still render.
 #
 # Usage: ci-status [repo-prefix]      # optional scope, e.g. ci-status tovasol/agent-forge
 set -uo pipefail
@@ -15,9 +15,18 @@ CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
 SCOPE="${1:-}"
 
 have() { command -v "$1" >/dev/null 2>&1; }
-ok()   { printf '  \033[32m●\033[0m %s\n' "$*"; }
-no()   { printf '  \033[31m●\033[0m %s\n' "$*"; }
-rule() { printf '\n\033[1m── %s ─────────────────────────────────────────────\033[0m\n' "$*"; }
+# Color is tty-gated (ANSI escapes are ASCII-safe; green/red status is worth keeping).
+# Glyphs are ALWAYS plain ASCII - multibyte box-drawing bought nothing but breakage
+# (busybox watch, dumb terminals, the earlier '...' parse bug). Honors NO_COLOR/TERM=dumb.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; then
+  cB=$'\033[1m'; c0=$'\033[0m'; cD=$'\033[2m'; cG=$'\033[32m'; cR=$'\033[31m'
+else
+  cB=''; c0=''; cD=''; cG=''; cR=''
+fi
+gMid='|'; gArr='->'; bar='--------------------------------------'
+ok()   { printf '  %s[ok]%s   %s\n' "$cG" "$c0" "$*"; }
+no()   { printf '  %s[!!]%s   %s\n' "$cR" "$c0" "$*"; }
+rule() { printf '\n%s%s %s %s%s\n' "$cB" "${bar:0:2}" "$*" "$bar" "$c0"; }
 
 age_fmt() {  # <seconds-ago> -> compact age
   local s="${1:-}"; case "$s" in ''|*[!0-9]*) printf '?'; return ;; esac
@@ -27,7 +36,7 @@ age_fmt() {  # <seconds-ago> -> compact age
   else printf '%ds' "$s"; fi
 }
 dur_fmt() {  # <seconds> -> human run duration
-  local d="${1:-}"; case "$d" in ''|*[!0-9]*) printf '—'; return ;; esac
+  local d="${1:-}"; case "$d" in ''|*[!0-9]*) printf '-'; return ;; esac
   if   [ "$d" -ge 3600 ]; then printf '%dh%02dm' $((d/3600)) $(((d%3600)/60))
   elif [ "$d" -ge 60 ];   then printf '%dm%02ds' $((d/60)) $((d%60))
   else printf '%ds' "$d"; fi
@@ -37,30 +46,35 @@ iso_age() {  # <iso> -> seconds since (GNU date; '?' if unparseable)
   printf '%s' "$(( $(date +%s) - e ))"
 }
 
-# --- analytics engine: run a SELECT over the run-meta NDJSON. Same SQL feeds both
-# engines (sq exposes JSON keys as columns natively; for sqlite we build a matching
-# `data` view). json_valid()/json_each skip partial or corrupt meta lines. ----------
+# --- analytics engine: run a SELECT over the run-meta NDJSON via sq (which auto-ingests
+# + infers columns, so there's no hand-rolled table). ci-runs already filters to clean
+# JSON lines, so a partial/corrupt meta can't break the query. -----------------------
 ndjson() { "$CICD_BASE/bin/ci-runs" "$SCOPE" 2>/dev/null; }
 # Analytics engine: sq (https://sq.io) runs SQL directly over the NDJSON run stream. It
 # auto-ingests and infers columns from the JSON keys, so there is NO hand-rolled table /
-# view to maintain — piped data is the table `data`. `-H` drops the header row, `--tsv`
+# view to maintain - piped data is the table `data`. `-H` drops the header row, `--tsv`
 # emits tab-separated rows (SQLite SQL underneath, so window functions etc. work). The
 # health/pending/teardown basics are pure shell, so they work with or without sq.
 ENGINE=none; have sq && ENGINE=sq
 runsql() { ndjson | sq -H --tsv sql "$1" 2>/dev/null; }  # <select-sql> -> TSV rows
 
 # =============================== render =====================================
-printf '\033[1m═══ cicd-runner ═══\033[0m  %s%s\n' "$(_ts)" "${SCOPE:+   scope=$SCOPE}"
+# Buffer the whole report and flush ONCE, so it snaps onto the screen instead of
+# dribbling section-by-section (each docker/sq call adds latency) over ssh + screen.
+# Color was already decided above against the real tty (fd1), so capturing is safe.
+exec 3>&1; _BUF="$(mktemp)"; trap 'cat "$_BUF" >&3 2>/dev/null; rm -f "$_BUF"' EXIT; exec >"$_BUF"
+
+printf '%s== cicd-runner ==%s  %s%s\n' "$cB" "$c0" "$(_ts)" "${SCOPE:+   scope=$SCOPE}"
 
 rule health
 if [ -s "$SOPS_AGE_KEY_FILE" ]; then ok "age key loaded ($SOPS_AGE_KEY_FILE)"
-else no "age key NOT loaded — run: unlock-ci   (did the box reboot?)"; fi
+else no "age key NOT loaded - run: unlock-ci   (did the box reboot?)"; fi
 [ -n "${DOCKER_HOST:-}" ] && export DOCKER_HOST
 if docker info >/dev/null 2>&1; then ok "docker reachable (rootless)"
-else no "docker NOT reachable (DOCKER_HOST=${DOCKER_HOST:-unset}) — rootless dockerd up?"; fi
+else no "docker NOT reachable (DOCKER_HOST=${DOCKER_HOST:-unset}) - rootless dockerd up?"; fi
 printf '  slots %s/%s free   analytics engine: %s\n' \
   "$(ls "$RUNNER_BASE/slots" 2>/dev/null | wc -l | tr -d ' ')" "${MAX_JOBS}" \
-  "$([ "$ENGINE" = none ] && echo 'none — install sq (https://sq.io)' || echo "$ENGINE")"
+  "$([ "$ENGINE" = none ] && echo 'none - install sq (https://sq.io)' || echo "$ENGINE")"
 
 # --- jobs: per (repo,job) rollup -------------------------------------------------
 rule "jobs"
@@ -78,37 +92,37 @@ SELECT repo, job,
   coalesce(substr(max(CASE WHEN exit IS NOT NULL AND exit<>0 THEN start END),1,10),'-')
 FROM r GROUP BY repo, job ORDER BY repo, job;"
 if [ "$ENGINE" = none ]; then
-  echo "  (sq not installed — run fetch-tools.sh; needed for per-job rollups)"
+  echo "  (sq not installed - run fetch-tools.sh; needed for per-job rollups)"
 else
-  printf '  \033[2m%-34s %-9s %5s %7s %4s %4s %-11s %-11s\033[0m\n' \
-    JOB STATUS AGE DUR RUNS FAIL LAST-GREEN LAST-RED
+  printf '  %s%-34s %-9s %5s %7s %4s %4s %-11s %-11s%s\n' "$cD" \
+    JOB STATUS AGE DUR RUNS FAIL LAST-GREEN LAST-RED "$c0"
   rows="$(runsql "$JOBS_SQL")"
   if [ -z "$rows" ]; then echo "  (no runs yet)"; else
     printf '%s\n' "$rows" | while IFS=$'\t' read -r repo job st dur start n fail green red; do
       [ -n "$job" ] || continue
       printf '  %-34s %-9s %5s %7s %4s %4s %-11s %-11s\n' \
         "$repo/$job" "$st" "$(age_fmt "$(iso_age "$start")")" "$(dur_fmt "$dur")" \
-        "$n" "$fail" "${green:-—}" "${red:-—}"
+        "$n" "$fail" "${green:--}" "${red:--}"
     done
   fi
 fi
 
 # --- recent runs -----------------------------------------------------------------
 rule "recent runs"
-REC_SQL="SELECT status, coalesce(duration_s,'-'), start, repo, job, branch, substr(sha,1,8)
+REC_SQL="SELECT status, coalesce(duration_s,'-'), start, job, branch, substr(sha,1,8), dir
 FROM data ORDER BY start_ns DESC LIMIT ${CI_STATUS_RECENT:-12};"
 if [ "$ENGINE" = none ]; then
-  find "$RUNNER_BASE/runs" -type f -name meta.json -printf '%T@ %p\n' 2>/dev/null \
-    | sort -rn | head -12 | while read -r _ m; do
-        printf '  %s\n' "$(sed -n 's/.*"status":"\([^"]*\)".*"start":"\([^"]*\)".*/\2  \1/p' "$m")"
-      done
+  find "$RUNNER_BASE/runs" -type f -name meta.json -printf '%T@ %h\n' 2>/dev/null \
+    | sort -rn | head -12 | while read -r _ d; do printf '  %s\n' "${d#"$RUNNER_BASE"/}"; done
 else
-  printf '  \033[2m%-9s %7s %-20s %-22s %s\033[0m\n' STATUS DUR STARTED JOB·BRANCH SHA
-  runsql "$REC_SQL" | while IFS=$'\t' read -r st dur start repo job branch sha; do
+  printf '  %s%-9s %7s %-20s %-20s %-9s %s%s\n' "$cD" STATUS DUR STARTED "JOB${gMid}BRANCH" SHA RUN-DIR "$c0"
+  runsql "$REC_SQL" | while IFS=$'\t' read -r st dur start job branch sha dir; do
     [ -n "$st" ] || continue
-    printf '  %-9s %7s %-20s %-22s %s\n' "$st" "$(dur_fmt "$dur")" "$start" "${job}·${branch}" "$sha"
+    printf '  %-9s %7s %-20s %-20s %-9s %s%s%s\n' \
+      "$st" "$(dur_fmt "$dur")" "$start" "${job}${gMid}${branch}" "$sha" "$cD" "${dir#"$RUNNER_BASE"/}" "$c0"
   done
 fi
+printf '  %s%s cat <run-dir>/output.log   %s   ci-log [repo] [job]  jumps to the newest%s\n' "$cD" "$gArr" "$gMid" "$c0"
 
 # --- orphaned (status=running) ---------------------------------------------------
 if [ "$ENGINE" != none ]; then
@@ -117,8 +131,8 @@ if [ "$ENGINE" != none ]; then
     rule "running / possibly orphaned"
     printf '%s\n' "$orph" | while IFS=$'\t' read -r repo job branch start; do
       [ -n "$job" ] || continue
-      a="$(iso_age "$start")"; flag=""; case "$a" in ''|*[!0-9]*) ;; *) [ "$a" -gt 7200 ] && flag="  \033[31m← stale >2h\033[0m" ;; esac
-      printf '  %-34s %-16s started %s (%s ago)%b\n' "$repo/$job" "$branch" "$start" "$(age_fmt "$a")" "$flag"
+      a="$(iso_age "$start")"; flag=""; case "$a" in ''|*[!0-9]*) ;; *) [ "$a" -gt 7200 ] && flag="  ${cR}<- stale >2h${c0}" ;; esac
+      printf '  %-34s %-16s started %s (%s ago)%s\n' "$repo/$job" "$branch" "$start" "$(age_fmt "$a")" "$flag"
     done
   fi
 fi
@@ -127,12 +141,12 @@ fi
 pend="$(find "$RUNNER_BASE/queue" -name target 2>/dev/null | while read -r t; do
   g="$(dirname "$t")"; [ "$(cat "$t" 2>/dev/null)" != "$(cat "$g/last" 2>/dev/null)" ] && \
     printf '  %s -> %s\n' "${g#"$RUNNER_BASE"/queue/}" "$(cat "$t")"; done)"
-if [ -n "$pend" ]; then rule "pending (target ≠ last — ci-recover will retry)"; printf '%s\n' "$pend"; fi
+if [ -n "$pend" ]; then rule "pending (target != last - ci-recover will retry)"; printf '%s\n' "$pend"; fi
 
 # --- failed teardowns ------------------------------------------------------------
 td="$(find "$RUNNER_BASE/envs" -name teardown-failed 2>/dev/null)"
 if [ -n "$td" ]; then
-  rule "FAILED teardowns (need operator — ci-teardown retry|abandon)"
+  rule "FAILED teardowns (need operator - ci-teardown retry|abandon)"
   printf '%s\n' "$td" | while read -r f; do
     d="$(dirname "$f")"; printf '  %s\n' "${d#"$RUNNER_BASE"/envs/}"; sed 's/^/      /' "$f"
   done
