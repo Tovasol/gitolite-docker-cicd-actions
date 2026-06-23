@@ -45,7 +45,8 @@ echo "→ [2/5] install.sh (scripts + dirs)"
 sudo -iu "$RUNNER_USER" bash -lc 'cd ~/src && ./install.sh'
 
 echo "→ [3/5] crontab"
-sudo -iu "$RUNNER_USER" bash -lc 'crontab ~/src/crontab.sample'
+# some cron implementations stage a temp file under ~/.cache; ensure it exists first.
+sudo -iu "$RUNNER_USER" bash -lc 'mkdir -p ~/.cache && crontab ~/src/crontab.sample'
 
 echo "→ [4/5] gitolite hook"
 LOCAL_CODE="$(sudo -u "$GIT_USER" gitolite query-rc LOCAL_CODE)"

@@ -14,6 +14,7 @@ CONF_SYS="/etc/cicd-runner/runner.conf"
 echo "Installing cicd-runner into $BASE (user: $(id -un), uid: $(id -u))"
 
 mkdir -p "$BASE"/{bin,etc,lib,queue,runs,cache,envs,slots,incoming}
+mkdir -p "$HOME/.cache"        # some cron impls stage a temp file here (crontab install)
 install -m755 "$SRC/bin/"* "$BASE/bin/"
 install -m644 "$SRC/lib/"* "$BASE/lib/"      # in-container helpers (mounted ro as /cicd/lib.sh)
 # strip the .sample suffix on the wall notifier so it's runnable if referenced
