@@ -41,31 +41,13 @@ iso_age() {  # <iso> -> seconds since (GNU date; '?' if unparseable)
 # engines (sq exposes JSON keys as columns natively; for sqlite we build a matching
 # `data` view). json_valid()/json_each skip partial or corrupt meta lines. ----------
 ndjson() { "$CICD_BASE/bin/ci-runs" "$SCOPE" 2>/dev/null; }
-# Engine preference: sqlite3 first — deterministic, header-less, and near-universal.
-# sq is fully supported as a fallback (its TSV carries a header row, so we strip it).
-# Override with CI_STATUS_ENGINE=sq|sqlite3.
-ENGINE="${CI_STATUS_ENGINE:-}"
-[ -n "$ENGINE" ] || { if have sqlite3; then ENGINE=sqlite3; elif have sq; then ENGINE=sq; else ENGINE=none; fi; }
-_sqlite_run() {  # <select-sql>  (TSV out)
-  local tf; tf="$(mktemp)"; { printf '['; ndjson | paste -sd, -; printf ']'; } > "$tf"
-  sqlite3 -batch -noheader -separator $'\t' ":memory:" "
-    CREATE TEMP VIEW data AS SELECT
-      json_extract(value,'\$.repo') repo,   json_extract(value,'\$.branch') branch,
-      json_extract(value,'\$.job') job,     json_extract(value,'\$.status') status,
-      json_extract(value,'\$.event') event, json_extract(value,'\$.sha') sha,
-      json_extract(value,'\$.start') start, json_extract(value,'\$.start_ns') start_ns,
-      json_extract(value,'\$.duration_s') duration_s, json_extract(value,'\$.exit') exit
-    FROM json_each(readfile('$tf'));
-    $1" 2>/dev/null
-  rm -f "$tf"
-}
-runsql() {  # <select-sql>  (TSV out)
-  case "$ENGINE" in
-    sqlite3) _sqlite_run "$1" ;;
-    sq)      ndjson | sq sql --format tsv "$1" 2>/dev/null | sed '1d' ;;  # drop sq header
-    *) return 1 ;;
-  esac
-}
+# Analytics engine: sq (https://sq.io) runs SQL directly over the NDJSON run stream. It
+# auto-ingests and infers columns from the JSON keys, so there is NO hand-rolled table /
+# view to maintain — piped data is the table `data`. `-H` drops the header row, `--tsv`
+# emits tab-separated rows (SQLite SQL underneath, so window functions etc. work). The
+# health/pending/teardown basics are pure shell, so they work with or without sq.
+ENGINE=none; have sq && ENGINE=sq
+runsql() { ndjson | sq -H --tsv sql "$1" 2>/dev/null; }  # <select-sql> -> TSV rows
 
 # =============================== render =====================================
 printf '\033[1m═══ cicd-runner ═══\033[0m  %s%s\n' "$(_ts)" "${SCOPE:+   scope=$SCOPE}"
@@ -78,7 +60,7 @@ if docker info >/dev/null 2>&1; then ok "docker reachable (rootless)"
 else no "docker NOT reachable (DOCKER_HOST=${DOCKER_HOST:-unset}) — rootless dockerd up?"; fi
 printf '  slots %s/%s free   analytics engine: %s\n' \
   "$(ls "$RUNNER_BASE/slots" 2>/dev/null | wc -l | tr -d ' ')" "${MAX_JOBS}" \
-  "$([ "$ENGINE" = none ] && echo 'none (install sq or sqlite3)' || echo "$ENGINE")"
+  "$([ "$ENGINE" = none ] && echo 'none — install sq (https://sq.io)' || echo "$ENGINE")"
 
 # --- jobs: per (repo,job) rollup -------------------------------------------------
 rule "jobs"
@@ -96,7 +78,7 @@ SELECT repo, job,
   coalesce(substr(max(CASE WHEN exit IS NOT NULL AND exit<>0 THEN start END),1,10),'-')
 FROM r GROUP BY repo, job ORDER BY repo, job;"
 if [ "$ENGINE" = none ]; then
-  echo "  (no analytics engine — install sq or sqlite3 for per-job rollups)"
+  echo "  (sq not installed — run fetch-tools.sh; needed for per-job rollups)"
 else
   printf '  \033[2m%-34s %-9s %5s %7s %4s %4s %-11s %-11s\033[0m\n' \
     JOB STATUS AGE DUR RUNS FAIL LAST-GREEN LAST-RED

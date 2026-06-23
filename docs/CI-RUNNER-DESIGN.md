@@ -225,9 +225,11 @@ to stop encoding them in the path at all:
   nothing dangles and no migration is needed when a new view is wanted.
 - **Query seam = NDJSON.** Each `meta.json` is one line, so `ci-runs`
   (`find runs -name meta.json -exec cat {} +`) emits an NDJSON stream that `sq`,
-  `sqlite3`, `jq`, or `duckdb` all consume. `ci-status` runs SQL over it (prefers
-  `sqlite3` — deterministic, header-less; `sq` supported as fallback). `json_valid`/
-  `json_each` skip partial/corrupt lines, so a crash mid-write never breaks a query.
+  `jq`, `sqlite3`, or `duckdb` all consume. `ci-status` runs SQL over it with **`sq`**
+  (`sq -H --tsv sql '… FROM data'`) — sq auto-ingests the stream and infers columns, so
+  there is no hand-rolled table/view to maintain; the queries are plain SQLite SQL
+  (window functions etc.). The seam is engine-agnostic, so any other tool drops in for
+  ad-hoc use. The shell health/pending/teardown layer needs no engine at all.
 - **Failure states.** `status:running` + no live container after a crash = orphaned;
   surfaced in `ci-status` (flagged stale >2h), pruned by retention; the recovery re-run
   (newer `start_ns`) is what "latest" resolves to, so the stale one never masks it.
