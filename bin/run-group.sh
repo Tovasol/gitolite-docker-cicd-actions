@@ -85,8 +85,8 @@ jesc() { printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 # Identity (META_*) is set once per run by the caller; this writes/overwrites the line
 # with the dynamic status/timing. NDJSON-friendly: one object, one line, sq/jq/sqlite
 # all consume `find runs -name meta.json -exec cat {} +`. schema:1 = additive-only.
-emit_meta() {  # <file> <status> <exit|''> <end_iso|''> <end_ns|''> <dur|''>
-  local f="$1" status="$2" ex="$3" eiso="$4" ens="$5" dur="$6" end_j ens_j dur_j ex_j
+emit_meta() {  # <file> <status> [exit] [end_iso] [end_ns] [dur]  (last 4 optional)
+  local f="$1" status="$2" ex="${3:-}" eiso="${4:-}" ens="${5:-}" dur="${6:-}" end_j ens_j dur_j ex_j
   [ -n "$eiso" ] && end_j="\"$(jesc "$eiso")\"" || end_j=null
   [ -n "$ens" ]  && ens_j="$ens" || ens_j=null
   [ -n "$dur" ]  && dur_j="$dur" || dur_j=null
