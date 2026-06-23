@@ -17,4 +17,8 @@ CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
 root="$RUNNER_BASE/runs"
 [ -n "${1:-}" ] && root="$RUNNER_BASE/runs/$1"
 [ -d "$root" ] || exit 0
-find "$root" -type f -name meta.json -exec cat {} + 2>/dev/null
+# Emit only well-formed single-line JSON objects. A meta.json half-written during a
+# crash (truncated, no closing brace) or any stray non-JSON is dropped here, so the
+# stream a consumer sees (sq auto-detects format) is always clean — one corrupt run
+# can't break a query. emit_meta always writes one `{…}` line, so valid runs pass.
+find "$root" -type f -name meta.json -exec cat {} + 2>/dev/null | grep -E '^\{.*\}$' || true

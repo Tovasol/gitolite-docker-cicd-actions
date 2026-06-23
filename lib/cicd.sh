@@ -1,3 +1,4 @@
+# shellcheck shell=sh
 # cicd.sh — reusable helpers for ci/*.sh scripts. POSIX sh (works in busybox ash).
 # The runner mounts this read-only at /cicd/lib.sh. Source it at the top of your script:
 #     . /cicd/lib.sh

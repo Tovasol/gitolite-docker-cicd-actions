@@ -10,29 +10,36 @@ set -uo pipefail   # NOT -e: errors handled explicitly so one job can't abort th
 
 CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
 # shellcheck disable=SC1090
-. "$CICD_BASE/bin/lib.sh"; cicd_load_config || exit 1
+. "$CICD_BASE/bin/lib.sh"                       # function library — no side effects on source
 
-repo="$1"; branch="$2"
-group="$repo/$branch"
-slug="$(slugify "$branch")"
-Q="$RUNNER_BASE/queue/$group"
-# Flat, meta-driven runs (DESIGN §3): runs/<repo…>/<ts>-<sha8>-<job>/ — branch+job live
-# in meta.json (the source of truth), NOT in the path. The leaf is one slash-free
-# segment, so repo (which may contain slashes) is unambiguous and never parsed back out.
-RUNS="$RUNNER_BASE/runs/$repo"
-ENVS="$RUNNER_BASE/envs/$repo/$slug"
-CACHE="$RUNNER_BASE/cache"                    # GLOBAL cache, shared all repos (content-addressed dedup, §32)
-INC="$RUNNER_BASE/incoming/$group"           # cicd-ingest drops <sha>.tar + <sha>.changed here
+# Source-guard: tests can `source run-group.sh` to unit-test its functions. When sourced
+# (BASH_SOURCE != $0) we define functions only and skip config/arg-parse/redirect/main.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then _CICD_MAIN=1; else _CICD_MAIN=0; fi
+
+# globals referenced by functions — placeholdered for set -u safety when sourced; the
+# real values are computed below only when executed (a test sets what it needs).
+repo="" branch="" group="" slug="" Q="" RUNS="" ENVS="" INC="" CACHE="${CICD_BASE}/cache"
 ZERO=0000000000000000000000000000000000000000
-# meta.json identity, set per-run before emit_meta (declared here for set -u safety)
 META_repo="" META_branch="" META_job="" META_event="" META_sha="" META_pusher="" META_start="" META_startns=0
-export SOPS_AGE_KEY_FILE
-[ -n "${DOCKER_HOST:-}" ] && export DOCKER_HOST
 
-# detached (no tty, via the hook's setsid+sudo) -> log to the runner log
-[ -t 1 ] || exec >>"$RUNNER_BASE/runner.log" 2>&1
-
-mkdir -p "$Q" "$RUNS" "$CACHE"
+if [ "$_CICD_MAIN" = 1 ]; then
+  cicd_load_config || exit 1
+  repo="$1"; branch="$2"
+  group="$repo/$branch"
+  slug="$(slugify "$branch")"
+  Q="$RUNNER_BASE/queue/$group"
+  # Flat, meta-driven runs (DESIGN §3): runs/<repo…>/<ts>-<sha8>-<job>/ — branch+job live
+  # in meta.json (the truth), NOT in the path; the slash-free leaf anchors the repo.
+  RUNS="$RUNNER_BASE/runs/$repo"
+  ENVS="$RUNNER_BASE/envs/$repo/$slug"
+  CACHE="$RUNNER_BASE/cache"                  # GLOBAL cache, shared all repos (§32)
+  INC="$RUNNER_BASE/incoming/$group"          # cicd-ingest drops <sha>.tar + <sha>.changed
+  export SOPS_AGE_KEY_FILE
+  [ -n "${DOCKER_HOST:-}" ] && export DOCKER_HOST
+  # detached (no tty, via the hook's setsid+sudo) -> log to the runner log
+  [ -t 1 ] || exec >>"$RUNNER_BASE/runner.log" 2>&1
+  mkdir -p "$Q" "$RUNS" "$CACHE"
+fi
 
 # Static default cache env block (DESIGN §32): points every common package manager's
 # cache into the one global /cache mount. NOT logic — just conventional env names; a
@@ -55,17 +62,18 @@ CACHE_ENV=(
   -e DENO_DIR=/cache/deno -e MIX_HOME=/cache/mix -e HEX_HOME=/cache/hex
 )
 
-# called with event args (reap-envs / ci-recover / ci-teardown)? record the target.
-if [ -n "${3:-}" ]; then
-  printf '%s %s %s %s\n' "$3" "${4:-}" "${5:-}" "${6:-unknown}" > "$Q/target.tmp"
-  mv -f "$Q/target.tmp" "$Q/target"
+if [ "$_CICD_MAIN" = 1 ]; then
+  # called with event args (reap-envs / ci-recover / ci-teardown)? record the target.
+  if [ -n "${3:-}" ]; then
+    printf '%s %s %s %s\n' "$3" "${4:-}" "${5:-}" "${6:-unknown}" > "$Q/target.tmp"
+    mv -f "$Q/target.tmp" "$Q/target"
+  fi
+  # ---- per-group lock: if another run-group holds it, exit (it will coalesce) ----
+  exec 9>>"$Q/group.lock"
+  flock -n 9 || { log "$group already running; exit"; exit 0; }
+  acquire_slot                                # global slot, held until process exits
+  trap ':' EXIT                               # slot/lock fds auto-release on exit
 fi
-
-# ---- per-group lock: if another run-group holds it, exit (it will coalesce) ----
-exec 9>>"$Q/group.lock"
-flock -n 9 || { log "$group already running; exit"; exit 0; }
-acquire_slot                                  # global slot, held until process exits
-trap ':' EXIT                                 # slot/lock fds auto-release on exit
 
 src_sha() { [ "$1" = delete ] && printf '%s' "$3" || printf '%s' "$2"; }  # event new old
 
@@ -355,6 +363,7 @@ process_build() {  # <event> <newrev> <oldrev> <pusher>
 }
 
 # ---- coalescing main loop ---------------------------------------------------
+if [ "$_CICD_MAIN" = 1 ]; then
 last=""; rc=0
 while :; do
   [ -f "$Q/target" ] || break
@@ -393,3 +402,4 @@ find "$INC" -maxdepth 1 -type f -name '*.changed' -mmin +60 -delete 2>/dev/null 
 
 printf '%s\n' "$last" > "$Q/last"
 log "$group: idle"
+fi  # _CICD_MAIN

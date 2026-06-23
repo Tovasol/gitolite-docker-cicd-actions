@@ -54,9 +54,13 @@ glob_match() { local re; re="$(glob_to_regex "$2")"; [[ "$1" =~ $re ]]; }
 
 # Match a value against a space/comma-separated list of globs. Empty list => no match.
 matches_any() {
-  local value="$1" list="$2" p
+  local value="$1" list="$2" p parts
   list="${list//,/ }"
-  for p in $list; do glob_match "$value" "$p" && return 0; done
+  # split on whitespace WITHOUT pathname expansion — `for p in $list` would glob-expand
+  # the patterns themselves against the runner's CWD (e.g. "site/**" -> "site/scaffold"),
+  # silently breaking filters. `read -ra` splits on IFS and never globs.
+  read -ra parts <<< "$list"
+  for p in "${parts[@]}"; do glob_match "$value" "$p" && return 0; done
   return 1
 }
 

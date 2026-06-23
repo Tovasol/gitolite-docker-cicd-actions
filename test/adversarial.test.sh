@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Tier-2 adversarial / seam-fuzz tests: hostile inputs at the boundaries.
+#   1. malicious tar (path traversal + symlink escape) — extraction must stay contained.
+#   2. corrupt/truncated meta.json — ci-runs must drop it, queries must not break.
+#   3. malformed .gitolite/ci.yml — yq helpers must return empty, not crash.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$HERE/harness.sh"
+export CICD_BASE="$HERE/.."
+# shellcheck source=/dev/null
+. "$HERE/../bin/lib.sh"
+
+suite "tar extraction containment"
+FIX="$HERE/adversarial/evil-traversal.tar"
+if [ -f "$FIX" ]; then
+  base="$(mktemp -d)"; work="$base/x/y"; mkdir -p "$work"
+  # exactly what run-group does: tar -x into the work dir
+  tar -x -C "$work" -f "$FIX" 2>/dev/null || true
+  assert_ok "../ traversal blocked"        test ! -e "$base/x/escape-parent.txt"
+  assert_ok "../../ traversal blocked"     test ! -e "$base/escape-deep.txt"
+  assert_ok "no write through symlink-out" test ! -e "/tmp/symlink-escape-target"
+  rm -rf "$base"; rm -f "/tmp/symlink-escape-target"
+else skip "tar fixture" "evil-traversal.tar missing"; fi
+
+suite "corrupt meta resilience (ci-runs filter)"
+# build a fake base so ci-runs resolves RUNNER_BASE, drop good + garbage + truncated meta
+TB="$(mktemp -d)"; mkdir -p "$TB/bin" "$TB/etc"
+cp "$HERE/../bin/lib.sh" "$TB/bin/"
+printf 'RUNNER_BASE=%s\n' "$TB" > "$TB/etc/runner.conf"
+RD="$TB/runs/tovasol/agent-forge"
+mkdir -p "$RD/good" "$RD/garbage" "$RD/trunc"
+printf '{"schema":1,"repo":"tovasol/agent-forge","job":"smoke","status":"exit:0","exit":0}\n' > "$RD/good/meta.json"
+printf 'NOT JSON AT ALL {{{\n'                                                                 > "$RD/garbage/meta.json"
+printf '{"schema":1,"repo":"tovasol/agent-forge","job":"trunc'                                  > "$RD/trunc/meta.json"  # truncated, no newline/close
+out="$(CICD_BASE="$TB" bash "$HERE/../bin/ci-runs" 2>/dev/null)"
+assert_eq    "ci-runs emits only the 1 valid line" "$(printf '%s\n' "$out" | grep -c '^{.*}$')" 1
+assert_match "valid line is the good one"          "$out" '"job":"smoke"'
+assert_no_match "garbage dropped"                  "$out" 'NOT JSON'
+if command -v sq >/dev/null 2>&1; then
+  assert_ok "sq query over filtered stream works" bash -c "printf '%s\n' \"\$1\" | sq -H --tsv sql 'SELECT job FROM data' >/dev/null" _ "$out"
+else skip "sq query" "sq not installed"; fi
+rm -rf "$TB"
+
+suite "malformed ci.yml tolerance"
+BY="$(mktemp)"; printf 'jobs:\n  deploy:\n    on: { push:\n  this is : not valid : yaml ][\n' > "$BY"
+assert_ok    "yq_keys does not crash on bad yaml" bash -c "yq_keys '$BY' '.jobs' >/dev/null 2>&1; true"
+assert_eq    "yq_keys returns empty on bad yaml"  "$(yq_keys "$BY" '.jobs' 2>/dev/null)" ""
+rm -f "$BY"
+
+summary

@@ -1,0 +1,75 @@
+{"suite":"bash -n (parse)","test":"bash -n deploy-site.sh","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n smoke.sh","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n ci-recover","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n ci-runs","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n ci-status","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n ci-teardown","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n cicd-ingest","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n fetch-tools.sh","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n lib.sh","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n notify-email","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n post-receive","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n prune-disk","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n reap-containers","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n reap-envs","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n run-group.sh","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n unlock-ci","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n install.sh","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n cicd.sh","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n update-runner.sh","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n harness.sh","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n lint.sh","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n run.sh","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n unit_lib.test.sh","status":"pass","detail":""}
+{"suite":"bash -n (parse)","test":"bash -n unit_meta.test.sh","status":"pass","detail":""}
+{"suite":"shellcheck","test":"shellcheck","status":"skip","detail":"not installed (ci/test.sh installs it; runs locally if present)"}
+{"suite":"glob_match","test":"** matches nested","status":"pass","detail":""}
+{"suite":"glob_match","test":"** matches direct child","status":"pass","detail":""}
+{"suite":"glob_match","test":"* matches one segment","status":"pass","detail":""}
+{"suite":"glob_match","test":"* does NOT cross slash","status":"pass","detail":""}
+{"suite":"glob_match","test":"? matches one char","status":"pass","detail":""}
+{"suite":"glob_match","test":"literal dot is escaped","status":"pass","detail":""}
+{"suite":"glob_match","test":"dot not treated as regex","status":"pass","detail":""}
+{"suite":"glob_match","test":"regex metachars literal","status":"pass","detail":""}
+{"suite":"glob_match","test":"leading **/ optional","status":"pass","detail":""}
+{"suite":"glob_match","test":"leading **/ with prefix","status":"pass","detail":""}
+{"suite":"branch_matches","test":"empty include = all","status":"pass","detail":""}
+{"suite":"branch_matches","test":"exact include","status":"pass","detail":""}
+{"suite":"branch_matches","test":"glob include one-seg","status":"pass","detail":""}
+{"suite":"branch_matches","test":"not in include","status":"pass","detail":""}
+{"suite":"branch_matches","test":"ignore wins over include","status":"pass","detail":""}
+{"suite":"branch_matches","test":"ignore wins (explicit)","status":"pass","detail":""}
+{"suite":"paths_match","test":"any changed hits include","status":"pass","detail":""}
+{"suite":"paths_match","test":"none hit include","status":"pass","detail":""}
+{"suite":"paths_match","test":"all paths ignored","status":"pass","detail":""}
+{"suite":"paths_match","test":"empty filters = match","status":"pass","detail":""}
+{"suite":"slugify","test":"lowercases + dashes","status":"pass","detail":""}
+{"suite":"slugify","test":"no slash leaks","status":"pass","detail":""}
+{"suite":"slugify","test":"no traversal dots","status":"pass","detail":""}
+{"suite":"slugify","test":"shell metachars gone","status":"pass","detail":""}
+{"suite":"slugify","test":"empty -> safe base","status":"pass","detail":""}
+{"suite":"slugify","test":"distinct inputs differ","status":"pass","detail":""}
+{"suite":"clamp_int","test":"in range","status":"pass","detail":""}
+{"suite":"clamp_int","test":"below -> lo","status":"pass","detail":""}
+{"suite":"clamp_int","test":"above -> hi","status":"pass","detail":""}
+{"suite":"clamp_int","test":"non-numeric->lo","status":"pass","detail":""}
+{"suite":"clamp_int","test":"empty -> lo","status":"pass","detail":""}
+{"suite":"clamp_int","test":"injection -> lo","status":"pass","detail":""}
+{"suite":"jesc","test":"escapes doublequote","status":"pass","detail":""}
+{"suite":"jesc","test":"escapes backslash","status":"pass","detail":""}
+{"suite":"jesc","test":"passes plain","status":"pass","detail":""}
+{"suite":"emit_meta","test":"running: one line","status":"pass","detail":""}
+{"suite":"emit_meta","test":"running: valid json","status":"pass","detail":""}
+{"suite":"emit_meta","test":"running: status","status":"pass","detail":""}
+{"suite":"emit_meta","test":"running: end null","status":"pass","detail":""}
+{"suite":"emit_meta","test":"running: exit null","status":"pass","detail":""}
+{"suite":"emit_meta","test":"final: valid json","status":"pass","detail":""}
+{"suite":"emit_meta","test":"final: status","status":"pass","detail":""}
+{"suite":"emit_meta","test":"final: duration","status":"pass","detail":""}
+{"suite":"emit_meta","test":"final: exit num","status":"pass","detail":""}
+{"suite":"emit_meta","test":"quote in branch -> still valid json","status":"pass","detail":""}
+{"suite":"emit_meta","test":"quote escaped","status":"pass","detail":""}
+{"suite":"make_rundir","test":"first dir created","status":"pass","detail":""}
+{"suite":"make_rundir","test":"second dir created","status":"pass","detail":""}
+{"suite":"make_rundir","test":"collision -> distinct dirs","status":"pass","detail":""}
+{"suite":"make_rundir","test":"leaf is slash-free run-id","status":"pass","detail":""}
