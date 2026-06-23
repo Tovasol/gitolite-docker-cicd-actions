@@ -120,9 +120,21 @@ jobs:
   deploy-site:
     on: { branches: [main], paths: ["site/**"] }
     image: node:20-alpine
-    secrets: [cloudflare]
+    env:                          # custom NON-secret env, injected into the container
+      NODE_ENV: production
+      WRANGLER_LOG: error
     run: sh ci/deploy-site.sh
 ```
+
+**Custom job env (`.jobs.<job>.env`).** A per-job map of plaintext key/value pairs
+injected as `-e K=V` into that job's container — for non-secret build config that you
+want version-controlled and diffable (vs burying it in the encrypted secrets). Scope
+is **per-job only** (no top-level/global block — repeat or compute in `ci/*.sh` if
+shared). Precedence (later wins): `CI_*` → cache vars → **job `env:`** → decrypted
+`ci/secrets.enc.yaml`. Job `env:` is allowed to override `CI_*`/cache (deliberate, by
+choice — gives full control; the operator owns the manifest). Secrets still win over
+`env:`, so a secret can override a plaintext default. Values are static strings;
+anything dynamic is computed inside the script.
 
 ### `ci/deploy-site.sh` — the durable, portable logic
 ```sh

@@ -25,8 +25,10 @@ sample="$(find "$RUNNER_BASE/runs" -maxdepth 0 2>/dev/null)"
 echo "  base: $RUNNER_BASE   slots: $(ls "$RUNNER_BASE/slots" 2>/dev/null | wc -l)/${MAX_JOBS}"
 
 # 4. recent runs
+# NOTE: run dirs are runs/<repo>/<branch>/<ts-sha-job>/status and <repo> may contain
+# slashes (e.g. tovasol/agent-forge), so status sits 4–6 levels deep. Don't cap depth.
 echo "recent runs:"
-find "$RUNNER_BASE/runs" -maxdepth 3 -name status -printf '%T@ %p\n' 2>/dev/null \
+find "$RUNNER_BASE/runs" -type f -name status -printf '%T@ %p\n' 2>/dev/null \
   | sort -rn | head -10 | while read -r _ s; do
       d="$(dirname "$s")"; printf '  %-10s %s\n' "$(cat "$s")" "${d#$RUNNER_BASE/runs/}"
     done

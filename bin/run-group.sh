@@ -84,6 +84,14 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   [ -n "$runcmd" ] || { log "$group/$job: no run: command, skip"; return 0; }
   local limits=()
   [ "${RESOURCE_LIMITS:-1}" = "1" ] && limits=(--pids-limit "$pids" --memory "$mem")
+  # custom per-job env (.jobs.<job>.env): plaintext K=V injected as -e. Placed AFTER
+  # CI_*/cache so it can override them (by design), BEFORE the secrets --env-file so a
+  # secret still wins. See DESIGN §4 "Custom job env".
+  local jenv=() ek ev
+  for ek in $(yq_keys "$manifest" ".jobs.\"$job\".env"); do
+    ev="$(yq_str "$manifest" ".jobs.\"$job\".env.\"$ek\"")"
+    jenv+=(-e "$ek=$ev")
+  done
   # retry + notify live in the script via /cicd/lib.sh; runner owns safety + delivery.
 
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -122,6 +130,7 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
       -e CI_EVENT="$event" -e CI_REPO="$repo" -e CI_BRANCH="$branch" \
       -e CI_BRANCH_SLUG="$slug" -e CI_SHA="$newrev" -e CI_PUSHER="$pusher" \
       "${CACHE_ENV[@]}" \
+      "${jenv[@]}" \
       -e CI_ENV_DIR=/envstate -v "$ENVS:/envstate" \
       -e CI_OUTBOX=/cicd/out/notify \
       -v "$RUNNER_BASE/lib/cicd.sh:/cicd/lib.sh:ro" -v "$outdir:/cicd/out" \

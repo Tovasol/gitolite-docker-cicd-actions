@@ -43,15 +43,65 @@ FROM="$(read_var MAILER_EMAIL NOTIFY_FROM)"; FROM="${FROM:-$USER}"
 # scheme by port: 465 = implicit TLS (smtps); else STARTTLS on smtp:// (587/25)
 if [ "$PORT" = "465" ]; then url="smtps://$HOST:$PORT"; else url="smtp://$HOST:$PORT"; fi
 
-case "$status" in
-  success*|info*|ok*|OK*) tag="[CI OK]" ;;
-  *)                      tag="[CI FAIL]" ;;
+# status arrives as "<level>: <message>" (level from notify_success/error/notify).
+LEVEL="${status%%:*}"; MESSAGE="${status#*: }"; [ "$MESSAGE" = "$status" ] && MESSAGE="$status"
+case "$LEVEL" in
+  success|ok|OK) STATUS=success; tag="[CI OK]" ;;
+  error|fail)    STATUS=failure; tag="[CI FAIL]" ;;
+  *)             STATUS=info;    tag="[CI]" ;;
 esac
-hn="$(hostname 2>/dev/null || echo vps)"
-tail_log="$(tail -n 30 "$logpath" 2>/dev/null)"
-msg="$(printf 'From: cicd-runner <%s>\r\nTo: %s\r\nSubject: %s %s (%s)\r\nDate: %s\r\n\r\nhost:   %s\ngroup:  %s\nstatus: %s\nlog:    %s\n\n--- last 30 log lines ---\n%s\r\n' \
-  "$FROM" "$TO" "$tag" "$group" "$status" "$(date -R 2>/dev/null)" \
-  "$hn" "$group" "$status" "$logpath" "$tail_log")"
+# only terminal events by default; set NOTIFY_INFO=1 to also mail info notices.
+NOTIFY_INFO="$(read_var NOTIFY_INFO)"
+[ "$STATUS" = info ] && [ "${NOTIFY_INFO:-0}" != 1 ] && exit 0
+
+# enrich interpolation vars from the run's meta.json (sits beside the log)
+META="$(dirname "$logpath")/meta.json"
+jget() { sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$META" 2>/dev/null | head -1; }
+REPO="$(jget repo)"; BRANCH="$(jget branch)"; SHA="$(jget sha)"
+PUSHER="$(jget pusher)"; EVENT="$(jget event)"; JOB="$(jget job)"
+[ -n "$REPO" ] || REPO="$group"
+SHORT_SHA="$(printf '%s' "$SHA" | cut -c1-8)"
+HOST_NAME="$(hostname 2>/dev/null || echo vps)"
+NOW="$(date -u '+%Y-%m-%d %H:%M:%SZ')"
+LOGLINES="$(read_var NOTIFY_LOGLINES)"; LOGLINES="${LOGLINES:-30}"
+LOGTAIL="$(tail -n "$LOGLINES" "$logpath" 2>/dev/null)"
+
+# custom templates ({{VAR}} tokens) — per-project or host default, else built-ins.
+SUBJECT_TMPL="$(read_var NOTIFY_SUBJECT)"
+BODY_TMPL="$(read_var NOTIFY_BODY)"
+SUBJECT_TMPL="${SUBJECT_TMPL:-{{TAG}} {{REPO}}/{{BRANCH}} {{JOB}} — {{STATUS}}}"
+BODY_TMPL="${BODY_TMPL:-CI {{STATUS}} on {{HOST}}
+
+repo:    {{REPO}}
+branch:  {{BRANCH}}
+job:     {{JOB}}
+event:   {{EVENT}}
+commit:  {{SHORT_SHA}}
+pusher:  {{PUSHER}}
+time:    {{NOW}}
+message: {{MESSAGE}}
+
+--- last $LOGLINES log lines ---
+{{LOGTAIL}}}"
+
+# literal token substitution (NO eval — message/logtail are untrusted)
+render() {
+  local t="$1"
+  t="${t//\{\{STATUS\}\}/$STATUS}";     t="${t//\{\{TAG\}\}/$tag}"
+  t="${t//\{\{REPO\}\}/$REPO}";         t="${t//\{\{BRANCH\}\}/$BRANCH}"
+  t="${t//\{\{JOB\}\}/$JOB}";           t="${t//\{\{EVENT\}\}/$EVENT}"
+  t="${t//\{\{SHA\}\}/$SHA}";           t="${t//\{\{SHORT_SHA\}\}/$SHORT_SHA}"
+  t="${t//\{\{PUSHER\}\}/$PUSHER}";     t="${t//\{\{MESSAGE\}\}/$MESSAGE}"
+  t="${t//\{\{LABEL\}\}/$group}";       t="${t//\{\{HOST\}\}/$HOST_NAME}"
+  t="${t//\{\{NOW\}\}/$NOW}";           t="${t//\{\{LOGTAIL\}\}/$LOGTAIL}"
+  printf '%s' "$t"
+}
+SUBJECT="$(render "$SUBJECT_TMPL")"; SUBJECT="${SUBJECT//$'\n'/ }"
+BODY="$(render "$BODY_TMPL")"
+
+FROM_NAME="$(read_var SMTP_FROM_NAME NOTIFY_FROM_NAME)"; FROM_NAME="${FROM_NAME:-cicd-runner}"
+msg="$(printf 'From: %s <%s>\r\nTo: %s\r\nSubject: %s\r\nDate: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s\r\n' \
+  "$FROM_NAME" "$FROM" "$TO" "$SUBJECT" "$(date -R 2>/dev/null)" "$BODY")"
 
 curl --silent --show-error --max-time 25 --ssl-reqd \
   --url "$url" --user "$USER:$PASS" \
