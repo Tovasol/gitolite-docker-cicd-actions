@@ -50,7 +50,7 @@ sudo -iu "$RUNNER_USER" bash -lc 'mkdir -p ~/.cache && crontab ~/src/crontab.sam
 
 echo "→ [4/5] gitolite hook + ci-job command (+ enable + sudo grant)"
 LOCAL_CODE="$(sudo -u "$GIT_USER" gitolite query-rc LOCAL_CODE)"
-install -Dm755 "$RUN/runner/bin/post-receive" "$LOCAL_CODE/hooks/common/post-receive"
+install -Dm755 "$RUN/runner/bin/post-receive" "$LOCAL_CODE/hooks/common/post-receive.h50-cicd"
 # ci-job: the git-side gitolite command (run/status/log over ssh, gitolite-authz, §34).
 install -Dm755 "$RUN/src/git/ci-job" "$LOCAL_CODE/commands/ci-job"
 chown -R "$GIT_USER:$GIT_USER" "$LOCAL_CODE"

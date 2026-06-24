@@ -55,7 +55,7 @@ vi ~/runner/etc/runner.conf               # DOCKER_HOST=<that>  RESOURCE_LIMITS=
 # LOCAL_CODE is already set in most gitolite installs — ask gitolite where it resolves
 # (don't assume ~git/local; some installs use $GL_ADMIN_BASE/local).
 LOCAL_CODE=$(sudo -u git gitolite query-rc LOCAL_CODE)        # e.g. /var/lib/gitolite/.gitolite/local
-install -Dm755 /home/cicd-runner/runner/bin/post-receive "$LOCAL_CODE/hooks/common/post-receive"
+install -Dm755 /home/cicd-runner/runner/bin/post-receive "$LOCAL_CODE/hooks/common/post-receive.h50-cicd"
 chown -R git:git "$LOCAL_CODE"
 # (if LOCAL_CODE printed empty, add to %RC in $(getent passwd git|cut -d: -f6)/.gitolite.rc:
 #    LOCAL_CODE => "$ENV{HOME}/local",   then re-run query-rc)
@@ -104,7 +104,7 @@ First-timer gotchas: **`DOCKER_HOST` mismatch** (every job fails instantly) and
 | Config | `$RUNNER_BASE/etc/runner.conf` (user-local; found via $CICD_BASE, sudo-safe). `/etc/cicd-runner/runner.conf` optional fallback only. Hook does NOT read it. |
 | Per-repo secrets (in git) | `<repo>/ci/secrets.enc.yaml` |
 | sops recipients config (in git) | `<repo>/.sops.yaml` |
-| Hook (gitolite) | `$LOCAL_CODE/hooks/common/post-receive` (find via `gitolite query-rc LOCAL_CODE`) |
+| Hook (gitolite) | `$LOCAL_CODE/hooks/common/post-receive.h50-cicd` — a multi-hook **hooklet** (the bare name `post-receive` is gitolite's dispatcher; never squat it). Find dir via `gitolite query-rc LOCAL_CODE`. |
 | Runner scripts | `$RUNNER_BASE/bin/` (`run-group.sh`, `unlock-ci`, `ci-status`, reapers…) |
 
 Key fact: **decrypt happens on the host; only decrypted VALUES enter the
@@ -231,7 +231,7 @@ it via `sudo -n -u cicd-runner cicd-ingest …` (archive-push). Set up the grant
 ```bash
 # 1) install the hook where gitolite's LOCAL_CODE resolves (don't assume the path)
 LOCAL_CODE=$(sudo -u git gitolite query-rc LOCAL_CODE)
-install -Dm755 /home/cicd-runner/runner/bin/post-receive "$LOCAL_CODE/hooks/common/post-receive"
+install -Dm755 /home/cicd-runner/runner/bin/post-receive "$LOCAL_CODE/hooks/common/post-receive.h50-cicd"
 chown -R git:git "$LOCAL_CODE"
 sudo -iu git gitolite setup --hooks-only
 
@@ -311,7 +311,7 @@ sudo -iu cicd-runner bash -lc 'crontab ~/src/crontab.sample' \
 && \
 # 4) gitolite post-receive hook
 LOCAL_CODE=$(sudo -u git gitolite query-rc LOCAL_CODE) \
-&& install -Dm755 "$RUN/runner/bin/post-receive" "$LOCAL_CODE/hooks/common/post-receive" \
+&& install -Dm755 "$RUN/runner/bin/post-receive" "$LOCAL_CODE/hooks/common/post-receive.h50-cicd" \
 && chown -R git:git "$LOCAL_CODE" \
 && sudo -u git gitolite setup --hooks-only \
 && \

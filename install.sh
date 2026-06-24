@@ -59,7 +59,7 @@ cat <<EOF
 
 Next (as root):
   1. Gitolite hook + sudo bridge (SOP §2.6):
-       install -Dm755 $BASE/bin/post-receive ~git/local/hooks/common/post-receive
+       install -Dm755 $BASE/bin/post-receive ~git/local/hooks/common/post-receive.h50-cicd
        # ~git/.gitolite.rc needs:  LOCAL_CODE => "\$ENV{HOME}/local",
        printf 'git ALL=(%s) NOPASSWD: %s/bin/cicd-ingest\nDefaults!%s/bin/cicd-ingest !requiretty\n' \
          "$(id -un)" "$BASE" "$BASE" > /etc/sudoers.d/cicd-runner

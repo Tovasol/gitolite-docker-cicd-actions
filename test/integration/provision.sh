@@ -78,7 +78,7 @@ chown cicd-runner:cicd-runner /home/cicd-runner/runner/etc/runner.conf
 # ---- the bridge: hook + ci-job command + sudoers -------------------------------------
 LOCAL_CODE="$(sudo -u git -H gitolite query-rc LOCAL_CODE)"
 [ -n "$LOCAL_CODE" ] || { echo "LOCAL_CODE empty - gitolite.rc not set"; exit 1; }
-install -Dm755 "$B/post-receive" "$LOCAL_CODE/hooks/common/post-receive"
+install -Dm755 "$B/post-receive" "$LOCAL_CODE/hooks/common/post-receive.h50-cicd"
 install -Dm755 "$SRC/git/ci-job" "$LOCAL_CODE/commands/ci-job"
 chown -R git:git "$LOCAL_CODE"
 sudo -u git -H gitolite setup --hooks-only
