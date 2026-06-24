@@ -38,8 +38,11 @@ esac
 [ -d "$RUNNER_REPO" ] || { echo "no bare repo at $RUNNER_REPO" >&2; exit 1; }
 
 echo "→ [1/5] source ← $RUNNER_REPO ($BRANCH)"
-git --git-dir="$RUNNER_REPO" archive "$BRANCH" cicd-runner \
-  | sudo -u "$RUNNER_USER" tar -x --strip-components=1 -C "$RUN/src"
+# This repo IS the runner (its tree is the source root — no cicd-runner/ subdir), so
+# archive the whole tree into ~/src. (Historically the runner lived under cicd-runner/
+# inside the agent-forge repo and was extracted with --strip-components=1.)
+git --git-dir="$RUNNER_REPO" archive "$BRANCH" \
+  | sudo -u "$RUNNER_USER" tar -x -C "$RUN/src"
 
 echo "→ [2/5] install.sh (scripts + dirs)"
 sudo -iu "$RUNNER_USER" bash -lc 'cd ~/src && ./install.sh'

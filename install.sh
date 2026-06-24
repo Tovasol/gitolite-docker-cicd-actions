@@ -2,7 +2,7 @@
 # install.sh — lay down the cicd-runner on a host. Run as the cicd-runner user
 # (NOT root) after rootless docker is working. Idempotent.
 #
-#   git clone <this repo> && cd cicd-runner && ./install.sh
+#   git clone <this repo> && cd gitolite-docker-cicd-actions && ./install.sh
 #
 # Then (as root) install the gitolite hook + crontab; see README.
 set -euo pipefail
