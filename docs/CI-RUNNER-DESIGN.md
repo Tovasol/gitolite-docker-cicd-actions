@@ -1925,7 +1925,7 @@ of concerns). On a dedicated CI box, colocation is acceptable — noted so the c
 ### Boot order
 ramfs mountpoint+mount+chown (docker service start_pre) → rootless docker up →
 `@reboot ci-recover` → **operator posts the key** → deferred pushes run. The repo
-ships the OpenRC init template (`cicd-runner/init/`) so this is version-controlled,
+ships the OpenRC init template (`init/`) so this is version-controlled,
 not just documented.
 
 ### Deferred-recovery (IMPLEMENTED)
@@ -1991,7 +1991,7 @@ ssh git@host ci-job log    <repo> (<branch>|<job>|<RUN-DIR>) [-f]
 `git` may run `ci-status`/`ci-log` as cicd-runner (read run *metadata* only; never
 secrets, never the age key). `run` needs nothing new. cicd-runner stays a dumb executor.
 
-**Install / self-contained**: `ci-job` ships in `cicd-runner/git/`, is archived out and
+**Install / self-contained**: `ci-job` ships in `git/`, is archived out and
 dropped into gitolite's `LOCAL_CODE/commands/` by `update-runner.sh` (root step, like
 the post-receive hook), and is enabled once in `~git/.gitolite.rc` (`ENABLE` list). The
 runner-side change is `run-group`'s manual-run handling + `ci-status --repos` — both

@@ -43,7 +43,7 @@ as `cicd-runner` (`docker info` shows rootless).
 GIT_HOME=$(getent passwd git | cut -d: -f6)          # /var/lib/gitolite or /home/git
 RUNNER_REPO=$GIT_HOME/repositories/<runner-repo>.git
 sudo -u cicd-runner mkdir -p /home/cicd-runner/src
-git --git-dir="$RUNNER_REPO" archive main cicd-runner | sudo -u cicd-runner tar -x --strip-components=1 -C /home/cicd-runner/src
+git --git-dir="$RUNNER_REPO" archive main | sudo -u cicd-runner tar -x -C /home/cicd-runner/src   # repo root IS the runner
 sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh'
 
 # ── B. point config at your socket (as cicd-runner; user-local, no sudo) ──────
@@ -86,8 +86,9 @@ First-timer gotchas: **`DOCKER_HOST` mismatch** (every job fails instantly) and
 
 ## 1. Conventions — where everything lives
 
-> **Authoritative source:** the scripts + paths live in the repo `cicd-runner/`
-> and are laid down by `cicd-runner/install.sh` (which reads `runner.conf`).
+> **Authoritative source:** the scripts + paths live at the root of the
+> `gitolite-docker-cicd-actions` repo and are laid down by its `install.sh`
+> (which reads `runner.conf`).
 > User = **`cicd-runner`**, base = **`/home/cicd-runner/runner`**.
 
 | Thing | Path |
@@ -176,14 +177,15 @@ GIT_HOME=$(getent passwd git | cut -d: -f6)          # /var/lib/gitolite or /hom
 RUNNER_REPO=$GIT_HOME/repositories/<runner-repo>.git
 sudo -u cicd-runner mkdir -p /home/cicd-runner/src
 # use the real default branch (gitolite's HEAD may be 'master' while you pushed 'main'):
-git --git-dir="$RUNNER_REPO" archive main cicd-runner \
-  | sudo -u cicd-runner tar -x --strip-components=1 -C /home/cicd-runner/src
-#   (own repo, not a cicd-runner/ subdir? drop the path + --strip-components)
+git --git-dir="$RUNNER_REPO" archive main \
+  | sudo -u cicd-runner tar -x -C /home/cicd-runner/src
+#   (the repo root IS the runner — no cicd-runner/ subdir. Back when it lived inside
+#    agent-forge it was a subdir: `archive main cicd-runner | tar --strip-components=1`.)
 sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh'
 # update later: re-run the pipe (latest HEAD) + ./install.sh — or dogfood it via CI.
 
 # (b) FALLBACK — only if the code isn't in gitolite yet: rsync from your Mac
-#   rsync -av ~/…/agent-forge/cicd-runner/ you@vps:/tmp/cicd-runner/
+#   rsync -av ~/…/gitolite-docker-cicd-actions/ you@vps:/tmp/cicd-runner/
 #   sudo -iu cicd-runner bash -lc 'cp -r /tmp/cicd-runner ~/src && cd ~/src && ./install.sh'
 ```
 `install.sh` fetches yq/sops/age into `~/.local/bin`, lays down all dirs (incl.
@@ -278,10 +280,10 @@ unlock-ci && ci-status
 One command, run as **root**, updates *everything regardless of what changed* —
 scripts, crontab, gitolite hook, and the boot/init file:
 ```bash
-sudo /home/cicd-runner/src/update-runner.sh <runner-repo-name>
+sudo /home/cicd-runner/src/update-runner.sh tovasol/gitolite-docker-cicd-actions
 #   add --restart ONLY when init/*.openrc changed (bounces docker, kills builds)
 ```
-`update-runner.sh` (ships in `cicd-runner/`) is idempotent, never clobbers
+`update-runner.sh` (ships at the repo root) is idempotent, never clobbers
 `runner.conf`, needs no key re-post (the live ramfs key survives — only **reboot**
 wipes it, §3), and drains deferred work (`ci-recover`) at the end. In-flight builds
 survive (`install` swaps inodes; a running `run-group.sh` keeps its copy).
@@ -299,9 +301,9 @@ if you'd rather not use the wrapper:
 GIT_HOME=$(getent passwd git | cut -d: -f6)
 RUNNER_REPO=$GIT_HOME/repositories/<runner-repo>.git     # <-- your repo name
 RUN=/home/cicd-runner
-# 1) source ← gitolite (same archive-push the system itself uses)
-git --git-dir="$RUNNER_REPO" archive main cicd-runner \
-  | sudo -u cicd-runner tar -x --strip-components=1 -C "$RUN/src" \
+# 1) source ← gitolite (same archive-push the system itself uses; repo root IS the runner)
+git --git-dir="$RUNNER_REPO" archive main \
+  | sudo -u cicd-runner tar -x -C "$RUN/src" \
 && \
 # 2) scripts + dirs (guards runner.conf, seeds slots)
 sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh' \
@@ -656,7 +658,7 @@ a per-user OpenRC 0.60 user service — but the system-level service above needs
 elogind and no user session.)
 
 ### Reboot survival — the production boot service (§33)
-Use the **version-controlled init script** (`cicd-runner/init/docker-rootless-cicd-runner.openrc`)
+Use the **version-controlled init script** (`init/docker-rootless-cicd-runner.openrc`)
 instead of the hand-rolled Variant B above — it adds the ramfs key-dir bring-up to
 `start_pre` (verify-mounted-as-ramfs + chown) and computes the uid, so docker AND the
 key dir come back together on every boot.
