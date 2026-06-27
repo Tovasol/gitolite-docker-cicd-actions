@@ -36,8 +36,8 @@ runlog="$TMP/output.log"; printf 'build failed\nboom\n' > "$runlog"
 printf '{"repo":"tovasol/x","branch":"main","sha":"deadbeef","job":"smoke","event":"push","pusher":"git"}\n' \
   > "$TMP/meta.json"
 
-PATH="$TMP/bin:$PATH" CICD_NOTIFY_ENV="$TMP/notify.env" \
-  bash "$HERE/../bin/notify-email" smoke "error: boom" "$runlog"
+audit="$(PATH="$TMP/bin:$PATH" CICD_NOTIFY_ENV="$TMP/notify.env" \
+  bash "$HERE/../bin/notify-email" smoke "error: boom" "$runlog")"
 
 args="$(cat "$TMP/curl.args" 2>/dev/null || true)"
 n="$(grep -c -- '--mail-rcpt' "$TMP/curl.args" 2>/dev/null || echo 0)"
@@ -46,5 +46,10 @@ assert_match   "first recipient on envelope"   "$args" 'tovasol\+cicdnotificatio
 assert_match   "second recipient on envelope"  "$args" 'notify2\+cicdnotification@gmail\.com'
 assert_no_match "addresses not comma-joined"   "$args" 'gmail\.com,'   # no single bogus rcpt
 assert_no_match "second addr has no leading ws" "$args" ' notify2'    # trimmed
+
+# audit line (captured by cicd_deliver into the run log) must record BOTH recipients
+assert_match "audit line reports sent"        "$audit" 'notify-email: sent'
+assert_match "audit names first recipient"    "$audit" 'tovasol\+cicdnotification@gmail\.com'
+assert_match "audit names second recipient"   "$audit" 'notify2\+cicdnotification@gmail\.com'
 
 summary

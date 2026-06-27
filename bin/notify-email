@@ -106,15 +106,25 @@ msg="$(printf 'From: %s <%s>\r\nTo: %s\r\nSubject: %s\r\nDate: %s\r\nMIME-Versio
 # NOTIFY_TO may list several recipients, comma-separated. curl needs ONE --mail-rcpt per
 # address (it does not split a comma list), so build the envelope args, trimming spaces.
 # The To: header above keeps the full comma list, so all recipients show in the message.
-rcpts=(); IFS=',' read -ra _addrs <<< "$TO"
+# addrs[] (bare, for the audit line) parallels rcpts[] (--mail-rcpt <addr> for curl).
+rcpts=(); addrs=(); IFS=',' read -ra _addrs <<< "$TO"
 for a in "${_addrs[@]}"; do
   a="${a#"${a%%[![:space:]]*}"}"; a="${a%"${a##*[![:space:]]}"}"   # trim lead/trail ws
-  [ -n "$a" ] && rcpts+=(--mail-rcpt "$a")
+  [ -n "$a" ] && { rcpts+=(--mail-rcpt "$a"); addrs+=("$a"); }
 done
 [ "${#rcpts[@]}" -gt 0 ] || exit 0                                 # no valid recipient -> skip
+joined="$(printf '%s, ' "${addrs[@]}")"; joined="${joined%, }"     # "a@x, b@y" for the log
 
-curl --silent --show-error --max-time 25 --ssl-reqd \
+# capture curl's outcome (stderr) so the caller can record WHO was mailed + OK/FAIL.
+# Never blocks or fails the runner: prints one audit line to stdout, always exit 0.
+err="$(curl --silent --show-error --max-time 25 --ssl-reqd \
   --url "$url" --user "$USER:$PASS" \
   --mail-from "$FROM" "${rcpts[@]}" \
-  --upload-file <(printf '%s' "$msg") >/dev/null 2>&1 || true
+  --upload-file <(printf '%s' "$msg") 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  printf 'notify-email: sent %s to %s via %s:%s\n' "$tag" "$joined" "$HOST" "$PORT"
+else
+  printf 'notify-email: DELIVERY FAILED (curl rc=%s) to %s via %s:%s — %s\n' \
+    "$rc" "$joined" "$HOST" "$PORT" "$err"
+fi
 exit 0

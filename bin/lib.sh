@@ -114,9 +114,14 @@ yq_keys() { yq -r "$2 // {} | keys | .[]" "$1" 2>/dev/null; }
 # decrypted secrets (secenv) let the notifier use repo-level SMTP creds; else host default.
 cicd_deliver() {  # cicd_deliver <level> <label> <message> <logpath> [secenv]
   [ -n "${NOTIFY_CMD:-}" ] || return 0
+  local out
+  # Capture the notifier's audit line (recipients + OK/FAIL) into the run log instead of
+  # discarding it, so `ci-log` shows WHO was notified. Still never blocks/fails the runner.
   # shellcheck disable=SC2086
-  CICD_NOTIFY_ENV="${5:-${CICD_NOTIFY_ENV:-/etc/cicd-runner/notify.env}}" \
-    $NOTIFY_CMD "$2" "$1: $3" "$4" </dev/null >/dev/null 2>&1 || true
+  out="$(CICD_NOTIFY_ENV="${5:-${CICD_NOTIFY_ENV:-/etc/cicd-runner/notify.env}}" \
+    $NOTIFY_CMD "$2" "$1: $3" "$4" </dev/null 2>&1 || true)"
+  [ -n "$out" ] && printf '%s\n' "$out" >> "$4"
+  return 0
 }
 
 # Flush a job's outbox (script-emitted notify_* lines) after the container exits,
