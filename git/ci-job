@@ -70,6 +70,12 @@ cmd_run() {
     --watch|-w) watch=1; shift ;;
     *) die "run: unknown arg '$1'" ;;
   esac; done
+  # F-1: validate branch as a real git ref + repo as a clean path BEFORE either becomes a
+  # filesystem path component in cicd-ingest. With --ref set, only the sha was rev-parsed,
+  # so an unvalidated branch (e.g. ../../..) would traverse out of queue/ and incoming/.
+  git check-ref-format "refs/heads/$branch" 2>/dev/null \
+    || die "invalid branch '$branch' (must be a valid git ref name)"
+  case "$repo" in ''|/*|*/|*..*) die "invalid repo '$repo'" ;; esac
   can "$repo" W || die "no WRITE access to '$repo' (gitolite) - cannot run jobs there"
   local gd; gd="$(repo_gitdir "$repo")"; [ -d "$gd" ] || die "no such repo '$repo'"
   local sha; sha="$(git --git-dir="$gd" rev-parse --verify "${ref:-$branch}^{commit}" 2>/dev/null)" \

@@ -39,7 +39,13 @@ esac
 EOF
 cat > "$STUB/git" <<EOF
 #!/usr/bin/env bash
-# only rev-parse + archive are used
+# rev-parse + archive + check-ref-format are used. check-ref-format must actually reject
+# traversal so the F-1 branch-validation test exercises real behavior.
+case " \$* " in
+  *" check-ref-format "*)
+    ref=""; for ref in "\$@"; do :; done  # ref = last arg = the candidate ref
+    case "\$ref" in ''|*..*|*' '*|*'~'*|*'^'*|*':'*) exit 1 ;; *) exit 0 ;; esac ;;
+esac
 for a in "\$@"; do case "\$a" in
   rev-parse) echo "deadbeefcafe1234567890aaaaaaaaaaaaaaaaaa"; exit 0 ;;
   archive)   echo "FAKE-TAR-BYTES"; exit 0 ;;
@@ -91,6 +97,22 @@ assert_match "denial mentions WRITE"             "$out" 'no WRITE access'
 assert_eq    "no ingest on denial"               "$(grep -c cicd-ingest "$REC")" 0
 : > "$REC"; run_cijob alice run tovasol/secret main >/dev/null 2>&1
 assert_eq    "no access at all -> no ingest"     "$(grep -c cicd-ingest "$REC")" 0
+
+suite "ci-job run (input validation, F-1 path traversal)"
+# A WRITE user must NOT be able to push a traversing branch through to cicd-ingest.
+# With --ref set, only the sha used to be validated; branch flowed verbatim into paths.
+: > "$REC"; out="$(run_cijob alice run tovasol/app '../../../../tmp/pwn' --ref deadbeef 2>&1)"; rc=$?
+assert_ne    "traversal branch rejected"         "$rc" 0
+assert_match "rejection names invalid branch"    "$out" 'invalid branch'
+assert_eq    "no ingest on traversal branch"     "$(grep -c cicd-ingest "$REC")" 0
+# repo with .. is rejected too
+: > "$REC"; out="$(run_cijob alice run 'tovasol/../etc' main 2>&1)"; rc=$?
+assert_ne    "traversal repo rejected"           "$rc" 0
+assert_eq    "no ingest on traversal repo"       "$(grep -c cicd-ingest "$REC")" 0
+# a normal branch with a slash (feature/x) is still accepted (not over-rejected)
+: > "$REC"; out="$(run_cijob alice run tovasol/app feature/x --job deploy 2>&1)"; rc=$?
+assert_eq    "valid slashed branch accepted"     "$rc" 0
+assert_match "ingest got feature/x branch"       "$(cat "$REC")" 'cicd-ingest tovasol/app feature/x run'
 
 suite "ci-job status (access-scoped)"
 : > "$REC"; run_cijob alice status >/dev/null 2>&1

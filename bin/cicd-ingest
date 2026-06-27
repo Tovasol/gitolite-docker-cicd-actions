@@ -14,6 +14,11 @@ CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
 . "$CICD_BASE/bin/lib.sh"; cicd_load_config || exit 1
 
 repo="$1"; branch="$2"; event="$3"; newrev="$4"; oldrev="$5"; pusher="${6:-unknown}"; onlyjob="${7:-}"
+# F-1 defense-in-depth: never trust the caller — reject repo/branch that would escape the
+# queue/incoming subtree as path components. post-receive derives branch from a git refname
+# and ci-job validates too, but the sudo target must fail closed regardless of the caller.
+case "$repo" in ''|/*|*/|*..*) die "cicd-ingest: invalid repo '$repo'" ;; esac
+git check-ref-format "refs/heads/$branch" 2>/dev/null || die "cicd-ingest: invalid branch '$branch'"
 ZERO=0000000000000000000000000000000000000000
 [ "$event" = delete ] && srcsha="$oldrev" || srcsha="$newrev"
 
