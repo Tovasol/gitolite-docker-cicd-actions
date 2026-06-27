@@ -51,20 +51,22 @@ echo "$DOCKER_HOST"                       # the value that makes `docker info` w
 vi ~/runner/etc/runner.conf               # DOCKER_HOST=<that>  RESOURCE_LIMITS=0  NOTIFY_CMD=""
                                           # SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt  (ramfs)
 
-# ── C. hook + sudo bridge (as root) ──────────────────────────────────────────
-# LOCAL_CODE is already set in most gitolite installs — ask gitolite where it resolves
-# (don't assume ~git/local; some installs use $GL_ADMIN_BASE/local).
-LOCAL_CODE=$(sudo -u git gitolite query-rc LOCAL_CODE)        # e.g. /var/lib/gitolite/.gitolite/local
-install -Dm755 /home/cicd-runner/runner/bin/post-receive "$LOCAL_CODE/hooks/common/post-receive.h50-cicd"
-chown -R git:git "$LOCAL_CODE"
-# (if LOCAL_CODE printed empty, add to %RC in $(getent passwd git|cut -d: -f6)/.gitolite.rc:
-#    LOCAL_CODE => "$ENV{HOME}/local",   then re-run query-rc)
+# ── C. hook (via gitolite-admin) + sudo bridge ───────────────────────────────
+# The post-receive CI hook is managed DECLARATIVELY in the gitolite-admin repo —
+# NOT installed by hand into LOCAL_CODE/hooks/common (that sidesteps gitolite's own
+# hook system). In a gitolite-admin checkout:
+#   cp <runner-repo>/bin/post-receive local/hooks/repo-specific/cicd && chmod 755 …
+#   # conf/gitolite.conf, under `repo @all`:  option hook.post-receive = echo cicd
+#   git commit -am 'cicd: add CI hook' && git push   # gitolite distributes to ALL repos
+# (Assumes LOCAL_CODE points into the admin repo's local/ — the gitolite default for
+#  GL_ADMIN_BASE-managed installs. Verify: `sudo -u git gitolite query-rc LOCAL_CODE`.)
+#
+# Sudo bridge (as ROOT) — lets the git user hand each push to cicd-ingest:
 cat > /etc/sudoers.d/cicd-runner <<'EOF'
 git ALL=(cicd-runner) NOPASSWD: /home/cicd-runner/runner/bin/cicd-ingest
 Defaults!/home/cicd-runner/runner/bin/cicd-ingest !requiretty
 EOF
 chmod 440 /etc/sudoers.d/cicd-runner && visudo -cf /etc/sudoers.d/cicd-runner
-sudo -iu git gitolite setup --hooks-only
 
 # ── D. smoke test (NO secrets) — in your repo on your Mac ─────────────────────
 mkdir -p .gitolite ci
@@ -105,7 +107,7 @@ First-timer gotchas: **`DOCKER_HOST` mismatch** (every job fails instantly) and
 | Config | `$RUNNER_BASE/etc/runner.conf` (user-local; found via $CICD_BASE, sudo-safe). `/etc/cicd-runner/runner.conf` optional fallback only. Hook does NOT read it. |
 | Per-repo secrets (in git) | `<repo>/ci/secrets.enc.yaml` |
 | sops recipients config (in git) | `<repo>/.sops.yaml` |
-| Hook (gitolite) | `$LOCAL_CODE/hooks/common/post-receive.h50-cicd` — a multi-hook **hooklet** (the bare name `post-receive` is gitolite's dispatcher; never squat it). Find dir via `gitolite query-rc LOCAL_CODE`. |
+| Hook (gitolite) | Managed in the **gitolite-admin** repo: `local/hooks/repo-specific/cicd`, wired via `option hook.post-receive = echo cicd` (`conf/gitolite.conf`, `repo @all`). Deployed by pushing gitolite-admin; gitolite distributes to all repos. Canonical source = `bin/post-receive` in the runner repo. |
 | Runner scripts | `$RUNNER_BASE/bin/` (`run-group.sh`, `unlock-ci`, `ci-status`, reapers…) |
 
 Key fact: **decrypt happens on the host; only decrypted VALUES enter the
@@ -231,11 +233,10 @@ The hook runs as **git**; the runner + rootless docker run as **cicd-runner**
 it via `sudo -n -u cicd-runner cicd-ingest …` (archive-push). Set up the grant:
 
 ```bash
-# 1) install the hook where gitolite's LOCAL_CODE resolves (don't assume the path)
-LOCAL_CODE=$(sudo -u git gitolite query-rc LOCAL_CODE)
-install -Dm755 /home/cicd-runner/runner/bin/post-receive "$LOCAL_CODE/hooks/common/post-receive.h50-cicd"
-chown -R git:git "$LOCAL_CODE"
-sudo -iu git gitolite setup --hooks-only
+# 1) the hook is managed in the gitolite-admin repo (NOT installed by hand). In a
+#    gitolite-admin checkout: drop bin/post-receive at local/hooks/repo-specific/cicd
+#    (chmod 755), wire `option hook.post-receive = echo cicd` under `repo @all` in
+#    conf/gitolite.conf, then commit + push — gitolite distributes it to all repos.
 
 # 2) the sudo bridge. git may run, as cicd-runner, ONLY: cicd-ingest (write: archive-push),
 #    and ci-status/ci-log (read-only, for the `ci-job status|log` inspect proxy, §34).
@@ -311,11 +312,11 @@ sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh' \
 # 3) crontab (new schedules, e.g. the */10 ci-recover backstop)
 sudo -iu cicd-runner bash -lc 'crontab ~/src/crontab.sample' \
 && \
-# 4) gitolite post-receive hook
+# 4) ci-job gitolite command (the post-receive HOOK is managed in gitolite-admin, not here)
 LOCAL_CODE=$(sudo -u git gitolite query-rc LOCAL_CODE) \
-&& install -Dm755 "$RUN/runner/bin/post-receive" "$LOCAL_CODE/hooks/common/post-receive.h50-cicd" \
+&& install -Dm755 "$RUN/src/git/ci-job" "$LOCAL_CODE/commands/ci-job" \
 && chown -R git:git "$LOCAL_CODE" \
-&& sudo -u git gitolite setup --hooks-only \
+&& sudo -u git gitolite setup \
 && \
 # 5) boot/init service FILE (copy only — restart separate)
 install -m755 "$RUN/src/init/docker-rootless-cicd-runner.openrc" \
