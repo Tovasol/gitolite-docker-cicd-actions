@@ -27,6 +27,14 @@ case "\$1" in
     grep -qx "\$3 \$5 \$4" "$M/access" && exit 0 || exit 1 ;;
   query-rc) [ "\$2" = GL_REPO_BASE ] && echo "$M/repositories" ;;
   list-phy-repos) cat "$M/repos" ;;
+  info)  # emulate \`gitolite info\`: header + "<flags>\t<repo>" per repo GL_USER can access
+    echo "hello \${GL_USER:-?}, this is git@test"; echo
+    while read -r r; do
+      perms=""
+      grep -qx "\$r R \${GL_USER:-}" "$M/access" && perms="R"
+      grep -qx "\$r W \${GL_USER:-}" "$M/access" && perms="\${perms:+\$perms }W"
+      [ -n "\$perms" ] && printf ' %s\t%s\n' "\$perms" "\$r"
+    done < "$M/repos" ;;
 esac
 EOF
 cat > "$STUB/git" <<EOF
