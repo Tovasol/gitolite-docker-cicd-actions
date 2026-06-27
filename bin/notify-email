@@ -103,8 +103,18 @@ FROM_NAME="$(read_var SMTP_FROM_NAME NOTIFY_FROM_NAME)"; FROM_NAME="${FROM_NAME:
 msg="$(printf 'From: %s <%s>\r\nTo: %s\r\nSubject: %s\r\nDate: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s\r\n' \
   "$FROM_NAME" "$FROM" "$TO" "$SUBJECT" "$(date -R 2>/dev/null)" "$BODY")"
 
+# NOTIFY_TO may list several recipients, comma-separated. curl needs ONE --mail-rcpt per
+# address (it does not split a comma list), so build the envelope args, trimming spaces.
+# The To: header above keeps the full comma list, so all recipients show in the message.
+rcpts=(); IFS=',' read -ra _addrs <<< "$TO"
+for a in "${_addrs[@]}"; do
+  a="${a#"${a%%[![:space:]]*}"}"; a="${a%"${a##*[![:space:]]}"}"   # trim lead/trail ws
+  [ -n "$a" ] && rcpts+=(--mail-rcpt "$a")
+done
+[ "${#rcpts[@]}" -gt 0 ] || exit 0                                 # no valid recipient -> skip
+
 curl --silent --show-error --max-time 25 --ssl-reqd \
   --url "$url" --user "$USER:$PASS" \
-  --mail-from "$FROM" --mail-rcpt "$TO" \
+  --mail-from "$FROM" "${rcpts[@]}" \
   --upload-file <(printf '%s' "$msg") >/dev/null 2>&1 || true
 exit 0
