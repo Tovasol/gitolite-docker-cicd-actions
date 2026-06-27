@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# gitolite common post-receive hook (deploy to ~git/local/hooks/common/post-receive).
+# gitolite post-receive CI hook. CANONICAL SOURCE — this file is copied verbatim into
+# the gitolite-admin repo as local/hooks/repo-specific/cicd and wired with
+# `option hook.post-receive = echo cicd` (conf/gitolite.conf). Deployed by pushing
+# gitolite-admin. If you edit this file, re-sync that copy.
 # Runs as the GIT user. ARCHIVE-PUSH model (DESIGN §31): the hook PRODUCES the source
 # (git archive) and PUSHES it through the sudo bridge to cicd-ingest — the runner has
 # zero repo access. Self-contained (sources no runner files). Opt-in: only repos with

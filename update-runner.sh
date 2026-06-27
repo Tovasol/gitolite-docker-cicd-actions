@@ -51,9 +51,13 @@ echo "→ [3/5] crontab"
 # some cron implementations stage a temp file under ~/.cache; ensure it exists first.
 sudo -iu "$RUNNER_USER" bash -lc 'mkdir -p ~/.cache && crontab ~/src/crontab.sample'
 
-echo "→ [4/5] gitolite hook + ci-job command (+ enable + sudo grant)"
+echo "→ [4/5] ci-job command (+ enable + sudo grant)"
+# NOTE: the post-receive CI hook is NOT installed here. It's managed declaratively in
+# the gitolite-admin repo as local/hooks/repo-specific/cicd, wired via
+# `option hook.post-receive = echo cicd` in conf/gitolite.conf, and deployed by pushing
+# gitolite-admin (gitolite distributes it to all repos, now + future). bin/post-receive
+# is the canonical source — re-sync the gitolite-admin copy if it ever changes.
 LOCAL_CODE="$(sudo -u "$GIT_USER" gitolite query-rc LOCAL_CODE)"
-install -Dm755 "$RUN/runner/bin/post-receive" "$LOCAL_CODE/hooks/common/post-receive.h50-cicd"
 # ci-job: the git-side gitolite command (run/status/log over ssh, gitolite-authz, §34).
 install -Dm755 "$RUN/src/git/ci-job" "$LOCAL_CODE/commands/ci-job"
 chown -R "$GIT_USER:$GIT_USER" "$LOCAL_CODE"
