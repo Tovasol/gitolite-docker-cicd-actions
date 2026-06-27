@@ -8,7 +8,7 @@
 #   1) source (archive-push out of the bare repo — same mechanism the system uses)
 #   2) scripts + dirs           (install.sh — guards runner.conf, seeds slots)
 #   3) crontab                  (new schedules, e.g. the */10 ci-recover backstop)
-#   4) gitolite post-receive    hook
+#   4) gitolite ci-job command (the post-receive HOOK is managed in gitolite-admin, not here)
 #   5) boot/init service FILE   (copy only; takes effect on --restart)
 #
 # Idempotent. Does NOT re-post the ramfs key (survives updates; only reboot wipes it).
