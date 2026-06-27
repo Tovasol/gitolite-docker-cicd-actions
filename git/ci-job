@@ -29,11 +29,16 @@ repo_gitdir() {  # <repo> -> bare repo path
   printf '%s/%s.git' "$base" "${1%.git}"
 }
 # repos the invoking user may access at <perm>, one per line (the trusted scope).
-# Robust under set -e/pipefail: a denied repo (can -> nonzero) must not abort the scan.
+# Authoritative + O(1) forks: `gitolite info` computes the user's WHOLE access set in a
+# single in-process pass (same authz engine as `gitolite access`, but no per-repo fork —
+# the old `list-phy-repos | per-repo access` loop cost 1+N gitolite processes and grew
+# with the server). Its output is `<flags>\t<repo>` (flags = space-separated R/W/C); keep
+# rows whose flags include the perm, then intersect with physical repos to drop the
+# wild-card pattern rows (CREATOR/..* etc). GL_USER is inherited from this command's env.
 accessible() {  # <R|W>
-  gitolite list-phy-repos 2>/dev/null | while IFS= read -r r; do
-    can "$r" "$1" && printf '%s\n' "$r" || :
-  done || :
+  gitolite info 2>/dev/null \
+    | awk -F '\t' -v p="$1" 'NF==2 && $1 ~ p {print $2}' \
+    | grep -Fxf <(gitolite list-phy-repos 2>/dev/null) || :
 }
 proxy() { sudo -n -u "$RUNNER_USER" "$RUNNER_BIN/$1" "${@:2}"; }   # read-only proxy into cicd-runner
 
