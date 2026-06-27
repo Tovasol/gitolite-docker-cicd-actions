@@ -57,17 +57,18 @@ command -v flock >/dev/null && echo "flock: ok" || echo "MISSING: flock (sys-app
 
 cat <<EOF
 
-Next (as root):
-  1. Gitolite hook + sudo bridge (SOP §2.6):
-       install -Dm755 $BASE/bin/post-receive ~git/local/hooks/common/post-receive.h50-cicd
-       # ~git/.gitolite.rc needs:  LOCAL_CODE => "\$ENV{HOME}/local",
+Next — ONE-TIME host setup (routine \`update-runner\` runs need NONE of this):
+  1. Sudo bridge (as ROOT) — lets the git user hand pushes to cicd-ingest (SOP §2.6).
+     update-runner.sh sets this up for you; do it by hand only for a manual install:
        printf 'git ALL=(%s) NOPASSWD: %s/bin/cicd-ingest\nDefaults!%s/bin/cicd-ingest !requiretty\n' \
          "$(id -un)" "$BASE" "$BASE" > /etc/sudoers.d/cicd-runner
        chmod 440 /etc/sudoers.d/cicd-runner && visudo -cf /etc/sudoers.d/cicd-runner
-       sudo -u git gitolite setup --hooks-only
        # (no chmod on cicd-runner's home needed: sudo execs run-group AS cicd-runner,
        #  who owns + can traverse its own 700 home; sudo's pre-exec stat runs as root.)
-  2. (config stays user-local at $BASE/etc/runner.conf — no /etc copy, no sudo)
-  3. Crontab (as $(id -un)):     crontab $SRC/crontab.sample
-  4. ramfs key + unlock:         SOP §2.3 / §3, then: unlock-ci && ci-status
+  2. Gitolite CI hook — NOT installed on the host. Managed in the gitolite-admin repo
+     (local/hooks/repo-specific/cicd, wired via \`option hook.post-receive = echo cicd\`);
+     deploy it by pushing gitolite-admin. The ci-job command is installed by update-runner.
+  3. Config stays user-local at $BASE/etc/runner.conf — no /etc copy, no sudo.
+  4. Crontab (as $(id -un)):     crontab $SRC/crontab.sample
+  5. ramfs key + unlock:         SOP §2.3 / §3, then: unlock-ci && ci-status
 EOF
