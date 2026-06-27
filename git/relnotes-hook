@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# cicd-relnotes — informational post-receive hooklet for the runner repo ONLY. On a push
+# it prints deploy guidance to the pusher's terminal (stderr -> gitolite 'remote:' lines),
+# so you never have to remember the procedure or where to run it.
+#
+# PURE OUTPUT: runs as the git user, no privilege, no side effects, never blocks the push.
+# The release runbook it prints is version-controlled IN the repo (deploy/RELEASE-STEPS.txt)
+# and read from the pushed tree, so the steps stay accurate without ever editing this hook.
+#
+# Canonical source: git/relnotes-hook in gitolite-docker-cicd-actions. Deployed copy:
+# gitolite-admin local/hooks/repo-specific/cicd-relnotes, wired for this repo via
+# `option hook.post-receive = echo cicd cicd-relnotes`. Re-sync the copy if this changes.
+set -uo pipefail
+BARE="$PWD"                                   # gitolite sets cwd to the bare repo
+ZERO=0000000000000000000000000000000000000000
+show() { git --git-dir="$BARE" cat-file -p "$1:$2" 2>/dev/null; }
+
+while read -r _old new ref; do
+  [ "$new" = "$ZERO" ] && continue            # branch delete -> nothing to say
+  case "$ref" in
+    refs/heads/release)
+      { echo; show "$new" deploy/RELEASE-STEPS.txt; echo; } >&2 || true
+      ;;
+    refs/heads/main)
+      {
+        echo
+        echo "▶ pushed to main — tested by CI (smoke + test). To DEPLOY this update,"
+        echo "  promote it: merge main -> release, then push release."
+        echo "    git push origin main:release      # or open a PR  main -> release"
+        echo "  (the release push prints the exact deploy steps.)"
+        echo
+      } >&2
+      ;;
+  esac
+done
+exit 0

@@ -1,0 +1,32 @@
+═══════════════════════════════════════════════════════════════════════════════
+  gitolite-docker-cicd-actions — RELEASE pushed.  To deploy this update:
+═══════════════════════════════════════════════════════════════════════════════
+  All steps run on the VPS:  ssh <you>@git.example.com   (the [tag] says AS WHOM)
+
+  1. [root] update the runner from the RELEASE branch — one command does it all
+            (refreshes ~cicd-runner/src, runs install.sh + crontab + ci-job,
+             dropping to the cicd-runner user internally; in-flight builds survive):
+
+         sudo env BRANCH=release /home/cicd-runner/src/update-runner.sh \
+              tovasol/gitolite-docker-cicd-actions
+
+         • add --restart ONLY if init/*.openrc changed (bounces docker, kills builds).
+         • if update-runner.sh ITSELF changed, refresh it first, then re-run step 1:
+             git --git-dir=/var/lib/gitolite/repositories/tovasol/gitolite-docker-cicd-actions.git \
+                 archive release | sudo -u cicd-runner tar -x -C /home/cicd-runner/src
+
+  2. [gitolite-admin]  git-side bits — the CI hook (bin/post-receive) and the ci-job
+            command — are MANAGED IN THE gitolite-admin REPO, not on the VPS. If you
+            changed either, sync the copies in gitolite-admin and `git push` it.
+            (Nothing to run on the VPS for these.)
+
+  3. [once, root]  /etc/sudoers.d/cicd-runner and /etc/init.d/*.openrc are one-time
+            setup — already done. Touch only if you changed the sudo bridge or the
+            init file (rare). The routine update above NEVER touches sudoers.
+
+  After a REBOOT only — re-post the age key (ramfs is wiped on boot):
+         pass show <key> | ssh <you>@git.example.com \
+              'sudo -n -u cicd-runner /home/cicd-runner/runner/bin/unlock-ci'
+
+  Verify:  ssh git@git.example.com ci-job status tovasol/gitolite-docker-cicd-actions
+═══════════════════════════════════════════════════════════════════════════════
