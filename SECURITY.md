@@ -86,7 +86,7 @@ These are deliberate trade-offs for a small-scale, trusted-operator tool:
    keep the host patched. Note the *confused-deputy* path is closed separately: **all**
    trusted host I/O on the RW `/envstate` and `/cicd/out` mounts after a container exits goes
    through symlink-rejecting helpers — `safe_persist` (source.tar), `safe_write` (branch,
-   teardown.cmd/image, meta.json, teardown-failed), `safe_read` (teardown.cmd/image),
+   teardown.cmd/image, meta.json, teardown-failed, last_attempt), `safe_read` (teardown.cmd/image),
    `cicd_flush_outbox` (notify outbox) — so a job can't make the runner read or write an
    attacker-chosen host path without an actual escape. State recovered from `/envstate` (the
    stored branch) is also re-validated with `git check-ref-format` before it is used as a

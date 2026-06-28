@@ -183,14 +183,20 @@ build_mask_script() {  # <envfile> <out_sedscript>
       \'*\') val="${val#\'}"; val="${val%\'}" ;;
     esac
     [ "${#val}" -ge 6 ] && _emit_mask_rule "$val" >> "$2"   # single-line (literal) form
-    # H6: a multi-line secret (PEM/SSH/age) materializes REAL newlines when a tool interprets the
-    # \n separators sops emits; mask each segment too. Split on the LITERAL \n ONLY (awk gsub) —
-    # NOT printf '%b', whose \c truncates the remaining segments and \x../\0.. mis-interpret,
-    # leaving real secret segments unmasked (a redaction bypass). Capped at 200 segments/key.
-    case "$val" in *\\n*)
-      printf '%s' "$val" | awk '{gsub(/\\n/,"\n")} 1' | head -n 200 | while IFS= read -r seg || [ -n "$seg" ]; do
-        [ "${#seg}" -ge 6 ] && _emit_mask_rule "$seg"
-      done >> "$2" ;;
+    # H6: `sops --output-type dotenv` backslash-escapes control bytes in a secret value (real TAB
+    # -> \t, CR -> \r, newline -> \n, etc). The container gets the LITERAL escaped bytes via
+    # --env-file, but any consumer that DECODES them (printf %b, echo -e, $'...', jq -r, tr -d '\r')
+    # prints the real control byte — which the literal-form rule above won't match -> the secret
+    # leaks. So also emit rules for the DECODED form: decode \n \t \r \v \f (the controls sops
+    # emits), split on the resulting newlines, mask each segment. Split with awk gsub, NOT printf
+    # '%b' (whose \c truncates remaining segments). Capped at 200 segments/key.
+    case "$val" in *\\[ntrvf]*)
+      printf '%s' "$val" \
+        | awk '{ gsub(/\\r/,"\r"); gsub(/\\t/,"\t"); gsub(/\\v/,"\013"); gsub(/\\f/,"\014"); gsub(/\\n/,"\n") } 1' \
+        | head -n 200 | while IFS= read -r seg || [ -n "$seg" ]; do
+            seg="${seg%$'\r'}"   # a decoded CRLF leaves a trailing CR on the segment; mask the bare line
+            [ "${#seg}" -ge 6 ] && _emit_mask_rule "$seg"
+          done >> "$2" ;;
     esac
   done < "$1"
 }
@@ -225,8 +231,11 @@ build_limits() {  # <mem> <pids>
   [ "$cg_mem" = 1 ]  && _LIMITS+=(--memory "$mem")
   [ "$cg_pids" = 1 ] && _LIMITS+=(--pids-limit "$pids")
   # M4: nproc + fsize ulimits are ALWAYS applied — cheap, cgroup-independent, and the only
-  # limits that bind if cgroup enforcement is mis-detected (fail-open). nproc blunts fork
-  # bombs, fsize blunts a single-file disk-fill. (Redundant-but-harmless when cgroups work.)
+  # limits that bind if cgroup enforcement is mis-detected (fail-open). nproc blunts fork bombs.
+  # NOTE fsize is PER-FILE and CONTAINER-only: it caps one file inside the job, NOT total disk —
+  # a loop of sub-limit files still fills /cache (size-capped only by the daily prune-disk cron),
+  # and the host-side output.log append is bounded separately by LOG_MAX_BYTES (head -c, above).
+  # For a hard total-disk bound, put /cache + runs on a quota'd filesystem (see HARDENING).
   _LIMITS+=(--ulimit "nproc=${ULIMIT_NPROC:-1024}")
   _LIMITS+=(--ulimit "fsize=${ULIMIT_FSIZE:-2147483648}")   # 2 GiB
 }
@@ -341,7 +350,7 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
       -v "$CACHE:/cache" -v "$work:/work" -w /work \
       ${envfile:+--env-file "$envfile"} \
       "$image" sh -c "$runcmd" 2>&1 \
-    | redact_log "$maskfile" >>"$dir/output.log"
+    | redact_log "$maskfile" | head -c "${LOG_MAX_BYTES:-52428800}" >>"$dir/output.log"
   rc=${PIPESTATUS[0]}
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; rc=124; fi
   if [ "$rc" -eq 124 ]; then status_word=timeout; else status_word="exit:$rc"; fi
@@ -479,7 +488,7 @@ run_teardown() {  # <oldrev> <pusher>
   fi
 
   mkdir -p "$ENVS"; outdir="$dir/cicd-out"; mkdir -p "$outdir"
-  date -u +%s > "$ENVS/last_attempt"
+  date -u +%s | safe_write "$ENVS/last_attempt"   # symlink-guarded like every other $ENVS write
   build_limits "$DEFAULT_MEMORY" "$DEFAULT_PIDS"; local tlimits=("${_LIMITS[@]}")
   log "$group: teardown $slug (mode=$([ -n "$work" ] && echo full-tree || echo minimal))"
   timeout --kill-after=30 "${DEFAULT_TIMEOUT}" \
@@ -496,7 +505,7 @@ run_teardown() {  # <oldrev> <pusher>
       "${mountwork[@]}" \
       ${envfile:+--env-file "$envfile"} \
       "$image" sh -c "$runcmd" 2>&1 \
-    | redact_log "$maskfile" >>"$dir/output.log"
+    | redact_log "$maskfile" | head -c "${LOG_MAX_BYTES:-52428800}" >>"$dir/output.log"
   rc=${PIPESTATUS[0]}
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; rc=1; fi
   end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))

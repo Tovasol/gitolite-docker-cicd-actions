@@ -131,8 +131,12 @@ fi
 DATA_CTE="WITH data AS (SELECT *, regexp_replace(filename,'/meta\.json\$','') AS dir
   FROM read_json($RUNS_SRC, format='newline_delimited', filename=true, ignore_errors=true, union_by_name=true)
   WHERE schema IS NOT NULL $REPO_FILTER
-  AND filename NOT LIKE '%/cicd-out/meta.json')"
-runsql() { duckdb -noheader -list -separator $'\t' -c "$DATA_CTE $1" 2>/dev/null; }  # <query on `data`>
+  AND filename NOT LIKE '%/cicd-out/%')"
+# Strip C0 control bytes (keep TAB=separator, LF=rows) from every rendered value: a job controls
+# its RW /cicd/out, so a forged meta.json with a JSON-escaped ESC decodes to a real ESC byte out
+# of duckdb and would inject ANSI into the operator terminal via `column -t`. (The filter above is
+# widened to '%/cicd-out/%' so a nested cicd-out/<sub>/meta.json can't smuggle in a forged record.)
+runsql() { duckdb -noheader -list -separator $'\t' -c "$DATA_CTE $1" 2>/dev/null | tr -d '\000-\010\013-\037\177'; }
 
 # =============================== render =====================================
 # Buffer the whole report and flush ONCE, so it snaps onto the screen instead of

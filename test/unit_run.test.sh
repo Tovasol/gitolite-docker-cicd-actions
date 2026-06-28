@@ -113,6 +113,21 @@ MASK_MAX_RULES=20 build_mask_script "$ENVF5" "$MASK5"
 n5="$(grep -c '^s/' "$MASK5")"
 assert_ok "total rules bounded near cap (got $n5)" test "$n5" -le 60   # emax + one key's ≤200 segs
 
+# #2: sops escapes a real TAB/CR as literal \t/\r in the env-file; a consumer that DECODES them
+# (printf %b, tr -d '\r') prints the real control byte, which the literal-form rule misses. The
+# decoded-form rule must still mask it.
+ENVF6="$W/env6"; MASK6="$W/mask6"
+printf 'TABKEY=PREFIXAAAA\\tSUFFIXBBBB_LIVE\n' > "$ENVF6"
+build_mask_script "$ENVF6" "$MASK6"
+dec="$(printf '%b' 'PREFIXAAAA\tSUFFIXBBBB_LIVE' | redact_log "$MASK6")"
+assert_no_match "decoded-tab secret masked (#2)" "$dec" 'SUFFIXBBBB_LIVE'
+ENVF7="$W/env7"; MASK7="$W/mask7"
+printf 'PEMKEY=LINEAAAA111\\r\\nLINEBBBB222\\r\\n\n' > "$ENVF7"
+build_mask_script "$ENVF7" "$MASK7"
+crlf="$(printf '%b' 'LINEAAAA111\r\nLINEBBBB222' | tr -d '\r' | redact_log "$MASK7")"
+assert_no_match "decoded CRLF line 1 masked (#2)" "$crlf" 'LINEAAAA111'
+assert_no_match "decoded CRLF line 2 masked (#2)" "$crlf" 'LINEBBBB222'
+
 suite "build_limits (cgroup when enforceable, ulimit fallback otherwise)"
 ULIMIT_NPROC=1024; ULIMIT_FSIZE=2147483648
 RESOURCE_LIMITS=1; build_limits 2g 512; got="${_LIMITS[*]}"

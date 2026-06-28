@@ -52,6 +52,10 @@ CACHE_MAX_GB=20                # then size-cap the whole cache (LRU eviction)
 CACHE_ISOLATION=shared        # shared | per-repo
 MASK_MAX_RULES=500            # cap secret-redaction rules per job (bounds a pathological secrets
                               #   file from forking the mask builder / sed thousands of times)
+LOG_MAX_BYTES=52428800        # cap per-run output.log bytes (50 MiB). The container --ulimit fsize
+                              #   does NOT bound this (the append runs host-side), so a `run: yes`
+                              #   flood would fill the disk; output past the cap is dropped. Raise
+                              #   for genuinely log-heavy builds. Total disk: use a quota'd FS.
 
 # --- behavior ---
 CANCEL_IN_PROGRESS=0                           # 1 = a new push kills the running job; 0 = coalesce
