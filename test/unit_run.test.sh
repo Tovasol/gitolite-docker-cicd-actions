@@ -79,6 +79,17 @@ assert_match    "short value left intact"  "$notmasked" 'label ab here'
 # no maskfile (no secrets) -> passthrough unchanged
 assert_eq "absent maskfile -> passthrough" "$(printf 'nothing secret\n' | redact_log /no/such/file)" "nothing secret"
 
+suite "secret redaction — multi-line keys materialize real newlines (H6)"
+ENVF2="$W/env2"; MASK2="$W/mask2"
+# a key stored single-line with literal \n, exactly as `sops -d --output-type dotenv` emits it
+printf 'GOOGLE_SA_KEY=-----BEGIN PRIVATE KEY-----\\nMIIabcdeflinetwo123\\nMIItulinethree456\\n-----END KEY-----\n' > "$ENVF2"
+build_mask_script "$ENVF2" "$MASK2"
+materialized="$(printf '%b' 'MIIabcdeflinetwo123\nMIItulinethree456')"   # what a tool prints (real \n)
+masked="$(printf '%s\n' "$materialized" | redact_log "$MASK2")"
+assert_no_match "multi-line key line 1 masked" "$masked" 'MIIabcdeflinetwo123'
+assert_no_match "multi-line key line 2 masked" "$masked" 'MIItulinethree456'
+assert_match    "multi-line key redacted"      "$masked" 'MASKED'
+
 suite "build_limits (cgroup when enforceable, ulimit fallback otherwise)"
 ULIMIT_NPROC=1024; ULIMIT_FSIZE=2147483648
 RESOURCE_LIMITS=1; build_limits 2g 512; got="${_LIMITS[*]}"

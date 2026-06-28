@@ -139,13 +139,13 @@ clamp_timeout() {  # <raw> -> echoes a safe integer
 
 # Build a sed script that masks every secret VALUE (>= 6 chars) from a decrypted dotenv file,
 # so a secret a job prints never reaches output.log — and thus never reaches `ci-log` or the
-# notify email's log tail (which reads the now-redacted log). env-file values are single-line
-# by construction, so per-line sed suffices. Short values (<6) are skipped to avoid masking
-# common tokens and corrupting logs.
+# notify email's log tail (which reads the now-redacted log). Short values (<6) are skipped to
+# avoid masking common tokens and corrupting logs.
+_emit_mask_rule() { printf 's/%s/[MASKED]/g\n' "$(printf '%s' "$1" | sed 's/[][\\/.^$*]/\\&/g')"; }
 build_mask_script() {  # <envfile> <out_sedscript>
   : > "$2"
   [ -f "$1" ] || return 0
-  local line val esc
+  local line val seg
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in '#'*|'') continue ;; esac
     case "$line" in *=*) ;; *) continue ;; esac
@@ -154,9 +154,15 @@ build_mask_script() {  # <envfile> <out_sedscript>
       \"*\") val="${val#\"}"; val="${val%\"}" ;;
       \'*\') val="${val#\'}"; val="${val%\'}" ;;
     esac
-    [ "${#val}" -ge 6 ] || continue
-    esc="$(printf '%s' "$val" | sed 's/[][\\/.^$*]/\\&/g')"   # escape BRE metachars + delim
-    printf 's/%s/[MASKED]/g\n' "$esc" >> "$2"
+    [ "${#val}" -ge 6 ] && _emit_mask_rule "$val" >> "$2"   # the single-line env-file form (literal \n)
+    # H6: multi-line secrets (PEM/SSH/age keys) materialize REAL newlines when a tool prints
+    # them (printf %b, openssl, writing to a file) — the single-line rule never matches that.
+    # Mask each \n-delimited segment too. (`*\\n*` matches a literal backslash-n in the value.)
+    case "$val" in *\\n*)
+      printf '%b\n' "$val" | while IFS= read -r seg || [ -n "$seg" ]; do
+        [ "${#seg}" -ge 6 ] && _emit_mask_rule "$seg"
+      done >> "$2" ;;
+    esac
   done < "$1"
 }
 # Redact stdin -> stdout via a mask script; passthrough (cat) when there are no secrets.
