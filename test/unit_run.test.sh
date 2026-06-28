@@ -79,5 +79,31 @@ assert_match    "short value left intact"  "$notmasked" 'label ab here'
 # no maskfile (no secrets) -> passthrough unchanged
 assert_eq "absent maskfile -> passthrough" "$(printf 'nothing secret\n' | redact_log /no/such/file)" "nothing secret"
 
+suite "build_limits (cgroup when enforceable, ulimit fallback otherwise)"
+ULIMIT_NPROC=1024; ULIMIT_FSIZE=2147483648
+RESOURCE_LIMITS=1; build_limits 2g 512; got="${_LIMITS[*]}"
+assert_match    "force: --memory present"      "$got" '\-\-memory 2g'
+assert_match    "force: --pids-limit present"  "$got" '\-\-pids-limit 512'
+assert_no_match "force: no ulimit nproc"       "$got" 'nproc'
+assert_match    "force: fsize cap always"      "$got" 'fsize=2147483648'
+
+RESOURCE_LIMITS=0; build_limits 2g 512; got="${_LIMITS[*]}"
+assert_no_match "off: no cgroup --memory"      "$got" '\-\-memory'
+assert_no_match "off: no cgroup --pids-limit"  "$got" 'pids-limit'
+assert_match    "off: ulimit nproc fallback"   "$got" 'nproc=1024'
+
+RESOURCE_LIMITS=auto; _CGROUP_DETECTED=1; CGROUP_MEM=0; CGROUP_PIDS=0; build_limits 2g 512; got="${_LIMITS[*]}"
+assert_no_match "auto/no-cg: no --memory"      "$got" '\-\-memory'
+assert_match    "auto/no-cg: nproc fallback"   "$got" 'nproc=1024'
+
+RESOURCE_LIMITS=auto; _CGROUP_DETECTED=1; CGROUP_MEM=1; CGROUP_PIDS=1; build_limits 2g 512; got="${_LIMITS[*]}"
+assert_match    "auto/cg: --memory present"    "$got" '\-\-memory 2g'
+assert_no_match "auto/cg: no nproc fallback"   "$got" 'nproc'
+
+RESOURCE_LIMITS=auto; _CGROUP_DETECTED=1; CGROUP_MEM=1; CGROUP_PIDS=0; build_limits 2g 512; got="${_LIMITS[*]}"
+assert_match    "mixed: --memory present"      "$got" '\-\-memory 2g'
+assert_no_match "mixed: no --pids-limit"       "$got" 'pids-limit'
+assert_match    "mixed: nproc fallback"        "$got" 'nproc=1024'
+
 rm -rf "$W"
 summary

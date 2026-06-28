@@ -30,11 +30,14 @@ DEFAULT_MEMORY=2g
 DEFAULT_PIDS=512
 DEFAULT_NETWORK=bridge                         # bridge | none
 
-# Per-container resource limits (--memory/--pids-limit) need cgroup v2 + systemd
-# under ROOTLESS docker. On OpenRC (no systemd) docker rootless CANNOT enforce them
-# (silently ignored). Set 0 so the runner omits those flags (avoids a false sense of
-# limits). cap-drop/no-new-privileges/network/timeout still apply. See DESIGN §29.
-RESOURCE_LIMITS=0                               # 0 = OpenRC rootless (no cgroups); 1 = systemd/rootful
+# Per-container cgroup limits (--memory/--pids-limit) need cgroup v2 + systemd under ROOTLESS
+# docker. The runner AUTO-DETECTS enforcement (`docker info` warns "No memory limit support"
+# etc. when it can't) and falls back to POSIX ulimits, which work WITHOUT cgroups: nproc blunts
+# fork bombs, fsize blunts disk fill. So you get the best available limits per host, and the
+# config self-upgrades when you move to a cgroup-v2/systemd box. See DESIGN §29.
+RESOURCE_LIMITS=auto                            # auto = detect (default) | 1 = force cgroup | 0 = no cgroup attempt
+ULIMIT_NPROC=1024                               # fallback process cap per job (fork-bomb blunt) when no cgroup pids
+ULIMIT_FSIZE=2147483648                         # fallback single-file size cap in bytes (disk-fill blunt); 2 GiB
 
 # --- dependency cache (ONE global, multi-ecosystem, content-addressed; DESIGN §32) ---
 # All package managers (npm/pnpm/yarn/bun/pip/poetry/uv/composer/go/cargo/ruby/nuget/

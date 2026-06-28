@@ -154,6 +154,37 @@ redact_log() {  # <sedscript>
   if [ -s "${1:-}" ]; then sed -f "$1"; else cat; fi
 }
 
+# Probe ONCE whether the (rootless) daemon can actually ENFORCE cgroup memory/pids limits.
+# Rootless docker needs cgroup v2 + systemd delegation; without it docker silently ignores
+# --memory/--pids-limit and prints "WARNING: No memory limit support" etc. in `docker info`.
+detect_cgroup_support() {
+  [ -n "${_CGROUP_DETECTED:-}" ] && return 0
+  _CGROUP_DETECTED=1
+  local info; info="$(docker info 2>/dev/null || true)"
+  case "$info" in *"No memory limit support"*) CGROUP_MEM=0 ;; *) CGROUP_MEM=1 ;; esac
+  case "$info" in *"No pids limit support"*)    CGROUP_PIDS=0 ;; *) CGROUP_PIDS=1 ;; esac
+}
+
+# Build resource-limit docker args into the global array _LIMITS. Prefer cgroup --memory/
+# --pids-limit when the daemon can enforce them; otherwise fall back to POSIX ulimits (nproc
+# blunts fork bombs, fsize blunts disk fill) which work WITHOUT cgroups -> portable + self-
+# upgrading. RESOURCE_LIMITS: auto (default, detect) | 1 (force cgroup) | 0 (no cgroup attempt).
+build_limits() {  # <mem> <pids>
+  _LIMITS=()
+  local mem="$1" pids="$2" cg_mem cg_pids
+  case "${RESOURCE_LIMITS:-auto}" in
+    0) cg_mem=0; cg_pids=0 ;;
+    1) cg_mem=1; cg_pids=1 ;;
+    *) detect_cgroup_support; cg_mem="${CGROUP_MEM:-0}"; cg_pids="${CGROUP_PIDS:-0}" ;;
+  esac
+  [ "$cg_mem" = 1 ]  && _LIMITS+=(--memory "$mem")
+  [ "$cg_pids" = 1 ] && _LIMITS+=(--pids-limit "$pids")
+  # ulimit fallback when cgroup pids can't be enforced: cap processes to blunt fork bombs.
+  [ "$cg_pids" = 1 ] || _LIMITS+=(--ulimit "nproc=${ULIMIT_NPROC:-1024}")
+  # always cap single-file size (cgroup-independent) to blunt a disk-fill via one huge file.
+  _LIMITS+=(--ulimit "fsize=${ULIMIT_FSIZE:-2147483648}")   # 2 GiB
+}
+
 # Fat, single-line meta.json — the SOURCE OF TRUTH for a run (path is a dumb bucket).
 # Identity (META_*) is set once per run by the caller; this writes/overwrites the line
 # with the dynamic status/timing. NDJSON-friendly: one object, one line, duckdb/jq/sqlite
@@ -191,8 +222,7 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   network="$(yq_str "$manifest" ".jobs.\"$job\".network")"; network="${network:-$DEFAULT_NETWORK}"
   runcmd="$(yq_str "$manifest" ".jobs.\"$job\".run")"
   [ -n "$runcmd" ] || { log "$group/$job: no run: command, skip"; return 0; }
-  local limits=()
-  [ "${RESOURCE_LIMITS:-1}" = "1" ] && limits=(--pids-limit "$pids" --memory "$mem")
+  build_limits "$mem" "$pids"; local limits=("${_LIMITS[@]}")
   # custom per-job env (.jobs.<job>.env): plaintext K=V injected as -e. Placed AFTER
   # CI_*/cache so it can override them (by design), BEFORE the secrets --env-file so a
   # secret still wins. See DESIGN §4 "Custom job env".
@@ -357,8 +387,7 @@ run_teardown() {  # <oldrev> <pusher>
 
   mkdir -p "$ENVS"; outdir="$dir/cicd-out"; mkdir -p "$outdir"
   date -u +%s > "$ENVS/last_attempt"
-  local tlimits=()
-  [ "${RESOURCE_LIMITS:-1}" = "1" ] && tlimits=(--pids-limit "$DEFAULT_PIDS" --memory "$DEFAULT_MEMORY")
+  build_limits "$DEFAULT_MEMORY" "$DEFAULT_PIDS"; local tlimits=("${_LIMITS[@]}")
   log "$group: teardown $slug (mode=$([ -n "$work" ] && echo full-tree || echo minimal))"
   timeout --kill-after=30 "${DEFAULT_TIMEOUT}" \
     docker run --rm --init --name "$name" \
