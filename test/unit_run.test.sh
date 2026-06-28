@@ -199,12 +199,19 @@ assert_eq    "safe_read reads a regular file"          "$(safe_read "$EV/real.cm
 rm -rf "$EV"
 
 suite "valid_branch — stored branch re-validation (F3)"
-assert_ok   "normal branch accepted"        valid_branch "main"
-assert_ok   "slashy feature branch accepted" valid_branch "feature/x-1"
-assert_fail "traversal branch rejected"     valid_branch "../../../../ESCAPED/run"
-assert_fail "dotdot component rejected"     valid_branch "a/../../etc"
-assert_fail "empty rejected"                valid_branch ""
-assert_fail "space rejected"                valid_branch "a b"
+# valid_branch wraps `git check-ref-format`; reap-envs/ci-teardown/run-group run on the gitolite
+# HOST (git always present). The CI test CONTAINER (node:20-alpine) may lack git — skip there (in
+# prod a missing git makes valid_branch fail-SAFE: the branch is rejected, teardown skipped).
+if command -v git >/dev/null 2>&1; then
+  assert_ok   "normal branch accepted"        valid_branch "main"
+  assert_ok   "slashy feature branch accepted" valid_branch "feature/x-1"
+  assert_fail "traversal branch rejected"     valid_branch "../../../../ESCAPED/run"
+  assert_fail "dotdot component rejected"     valid_branch "a/../../etc"
+  assert_fail "empty rejected"                valid_branch ""
+  assert_fail "space rejected"                valid_branch "a b"
+else
+  skip "valid_branch F3 checks" "git not in this environment (host-only code path)"
+fi
 
 suite "valid_env_key — custom env-key validation (F4)"
 assert_ok   "plain key accepted"            valid_env_key "API_KEY"

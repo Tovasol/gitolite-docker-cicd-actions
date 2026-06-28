@@ -13,16 +13,21 @@ UPDATE_RUNNER_LIB=1 . "$HERE/../update-runner.sh"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 
 suite "path_root_trusted — owner gate (real root requirement)"
-# With the PROD comparator (trusted owner == uid 0), a file the test user owns is never trusted.
-printf '#!/bin/sh\n' > "$T/upd.sh"; chmod 755 "$T/upd.sh"
-assert_fail "non-root-owned file rejected"        path_root_trusted "$T/upd.sh"
-# trusted-uid VALUE is load-bearing: it must be exactly 0, not merely "not the caller's uid"
 me="$(id -u)"
+# trusted-uid VALUE is load-bearing: it must be exactly 0, not merely "not the caller's uid"
 assert_ok   "prod comparator trusts only uid 0"   _prt_is_trusted_owner 0
 assert_fail "prod comparator rejects uid 1"       _prt_is_trusted_owner 1
-assert_fail "prod comparator rejects caller uid"  _prt_is_trusted_owner "$me"
 # a missing path canonicalizes to nothing -> reject (never trust what we can't stat)
 assert_fail "missing path rejected"               path_root_trusted "$T/does-not-exist"
+# Assertions that assume the CALLER is non-root (so a caller-owned file is NOT root-owned). The
+# CI test container runs as root, where caller-owned == root-owned == trusted — skip there.
+if [ "$me" != 0 ]; then
+  printf '#!/bin/sh\n' > "$T/upd.sh"; chmod 755 "$T/upd.sh"
+  assert_fail "non-root-owned file rejected"        path_root_trusted "$T/upd.sh"
+  assert_fail "prod comparator rejects caller uid"  _prt_is_trusted_owner "$me"
+else
+  skip "non-root-caller owner-gate checks" "test runs as root (caller-owned == root-owned)"
+fi
 
 # To exercise the mode-mask, ancestor-walk and canonicalization (which the owner gate would
 # otherwise short-circuit on a non-root host), hold the owner comparator constant: accept uid 0
@@ -57,9 +62,14 @@ acc="$T/acc"; mkdir -p "$acc"; printf '#!/bin/sh\n' > "$acc/ok.sh"; chmod 0755 "
 clean=1; q="$T"; while :; do am="$(stat -c '%a' "$q" 2>/dev/null || stat -f '%Lp' "$q" 2>/dev/null)"; [ "$(( 8#${am:-0} & 0022 ))" -eq 0 ] || { clean=0; break; }; [ "$q" = / ] && break; q="$(dirname "$q")"; done
 [ "$clean" = 1 ] && assert_ok "clean caller-owned chain accepted" path_root_trusted "$acc/ok.sh"
 
-# restore prod comparator; the same clean chain now FAILS (owner gate demands uid 0 again)
+# restore prod comparator; the same clean chain now FAILS (owner gate demands uid 0 again) —
+# only meaningful when the caller is NON-root (under root, caller-owned IS root-owned == trusted).
 _prt_is_trusted_owner() { [ "${1:-}" = 0 ]; }
-assert_fail "owner gate restored (uid-0) rejects caller-owned" path_root_trusted "$acc/ok.sh"
+if [ "$me" != 0 ]; then
+  assert_fail "owner gate restored (uid-0) rejects caller-owned" path_root_trusted "$acc/ok.sh"
+else
+  skip "owner-gate-restored reject" "test runs as root (caller-owned == root-owned)"
+fi
 
 # sanity: LIB mode ran no deploy
 assert_eq   "LIB mode ran no deploy"              "${REPO:-unset}" "unset"
