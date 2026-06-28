@@ -55,11 +55,36 @@ cicd_audit() {  # <event> [k=v ...]
   if command -v flock >/dev/null 2>&1; then
     { flock 9 2>/dev/null || true; _cicd_audit_append "$logf" "$payload"; } 9>>"${logf}.lock" 2>/dev/null || true
   else
-    local _ld="${logf}.lock.d" _n=0
-    while ! mkdir "$_ld" 2>/dev/null; do _n=$((_n + 1)); [ "$_n" -gt 300 ] && break; sleep 0.02 2>/dev/null || sleep 1; done
+    # No flock: portable mkdir-mutex. A writer killed mid-audit leaks the lockdir; the old code
+    # then spun ~6s and failed OPEN (unlocked append -> concurrent writers FORK the hash chain,
+    # destroying tamper-evidence). Now: stamp the owner pid, and a later writer RECLAIMS a lock
+    # whose owner is dead OR whose dir is older than AUDIT_LOCK_STALE_SECS. If serialization still
+    # can't be had, append a 'serialization=lost' sentinel so a resulting fork is attributable to
+    # a lock loss, not silent tampering. (No EXIT trap — it would clobber the caller's trap.)
+    local _ld="${logf}.lock.d" _n=0 _owner
+    while ! mkdir "$_ld" 2>/dev/null; do
+      _owner="$(cat "$_ld/pid" 2>/dev/null || true)"
+      if { [ -n "$_owner" ] && ! kill -0 "$_owner" 2>/dev/null; } || _audit_lock_stale "$_ld"; then
+        rm -rf "$_ld" 2>/dev/null || true; continue          # reclaim a leaked/stale lock
+      fi
+      _n=$((_n + 1))
+      if [ "$_n" -gt 300 ]; then
+        _cicd_audit_append "$logf" "$(printf '%s\tserialization=lost' "$payload")"; return 0
+      fi
+      sleep 0.02 2>/dev/null || sleep 1
+    done
+    printf '%s' "$$" > "$_ld/pid" 2>/dev/null || true
     _cicd_audit_append "$logf" "$payload"
-    rmdir "$_ld" 2>/dev/null || true
+    rm -rf "$_ld" 2>/dev/null || true
   fi
+}
+# A mkdir-mutex lockdir is stale if older than AUDIT_LOCK_STALE_SECS (a held lock is refreshed by
+# being short-lived; anything older leaked). BSD `stat -f %m` / GNU `stat -c %Y`.
+_audit_lock_stale() {  # <lockdir>
+  local d="$1" now mtime
+  now="$(date +%s 2>/dev/null)" || return 1
+  mtime="$(stat -f %m "$d" 2>/dev/null || stat -c %Y "$d" 2>/dev/null)" || return 1
+  [ "$(( now - mtime ))" -gt "${AUDIT_LOCK_STALE_SECS:-30}" ]
 }
 # Append one chained entry. Caller MUST hold the audit lock (serializes read-prev + append).
 _cicd_audit_append() {  # <logf> <payload>
@@ -190,7 +215,14 @@ cicd_deliver() {  # cicd_deliver <level> <label> <message> <logpath> [secenv]
 # OOM/SIGKILL). Notifications are also copied into the run's output.log.
 cicd_flush_outbox() {  # cicd_flush_outbox <outboxfile> <rc> <logdir> <label> [secenv] [maskfile]
   local box="$1" rc="$2" dir="$3" label="$4" secenv="${5:-}" maskfile="${6:-}" had_terminal=0 line level msg
-  if [ -f "$box" ]; then
+  # The outbox lives in the RW /cicd/out mount the job container controls. A job can plant
+  # `notify -> /run/ci-keys/age-keys.txt` (the SOPS age MASTER key) so this host-side read
+  # follows the link and echoes the key into output.log (readable via `ci-job log`). lstat-reject
+  # any symlink before reading — the per-job redactor wouldn't mask a cross-repo key anyway (H2).
+  if [ -L "$box" ]; then
+    echo "[notify] outbox was a symlink — refused to read (H2 exfil guard)" >> "$dir/output.log"
+    rm -f "$box"
+  elif [ -f "$box" ]; then
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       level="$(printf '%s' "$line" | cut -f1)"; msg="$(printf '%s' "$line" | cut -f2-)"

@@ -68,4 +68,19 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do AUDIT_LOG="$CL" cicd_audit ev "n=$i" & d
 assert_ok    "concurrent appends verify"  cicd_audit_verify "$CL"
 assert_eq    "all 12 concurrent entries"  "$(grep -c '' "$CL")" "12"
 
+# H5-audit: a leaked lock (writer killed mid-audit) must be RECLAIMED, not fail open / hang
+suite "audit mkdir-mutex reclaims a leaked lock (H5-audit)"
+SL="$T/stale.log"
+if command -v flock >/dev/null 2>&1; then
+  # flock path: mkdir lockdir is unused — just pin that the append still chains correctly
+  AUDIT_LOG="$SL" cicd_audit ingest "repo=x"
+  assert_ok "append verifies (flock path)" cicd_audit_verify "$SL"
+else
+  LD="$SL.lock.d"; mkdir -p "$LD"; printf '999999\n' > "$LD/pid"   # leaked lock, owner pid dead
+  AUDIT_LOCK_STALE_SECS=0 AUDIT_LOG="$SL" cicd_audit ingest "repo=x"
+  assert_ok   "append after reclaim verifies" cicd_audit_verify "$SL"
+  assert_eq   "exactly one entry written"     "$(grep -c '' "$SL")" "1"
+  assert_fail "stale lockdir was reclaimed"   test -d "$LD"
+fi
+
 summary

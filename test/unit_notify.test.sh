@@ -78,4 +78,33 @@ out2="$(PATH="$RT/bin:$PATH" CICD_NOTIFY_ENV="$RT/proj.env" CICD_NOTIFY_HOST_ENV
 assert_eq    "project-own-creds allowed"   "$([ -f "$RT/curl.args" ] && echo sent || echo none)" "sent"
 rm -rf "$RT"
 
+suite "notify-email guard covers endpoint + headers (H3 / M1)"
+NG="$(mktemp -d)"; mkdir -p "$NG/bin"
+cat > "$NG/bin/curl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > "$NG/curl.args"; exit 0
+EOF
+chmod +x "$NG/bin/curl"
+# operator creds live host-side; the To is host-tier too (no open-relay by itself)
+printf 'SMTP_USER_NAME=operator-ci@company.com\nSMTP_USER_PWD=OperatorAppPassword\nNOTIFY_TO=ops@company.com\n' > "$NG/host.env"
+rl2="$NG/output.log"; printf 'boom\n' > "$rl2"
+printf '{"repo":"x","branch":"main","sha":"d","job":"smoke","event":"push","pusher":"git"}\n' > "$NG/meta.json"
+runne() {  # <projenv-content with \n escapes> -> stdout of notify-email
+  printf '%b' "$1" > "$NG/proj.env"; rm -f "$NG/curl.args"
+  PATH="$NG/bin:$PATH" CICD_NOTIFY_ENV="$NG/proj.env" CICD_NOTIFY_HOST_ENV="$NG/host.env" \
+    bash "$HERE/../bin/notify-email" smoke "error: boom" "$rl2"
+}
+# each of these, supplied by the PROJECT while creds are host-tier, must REFUSE (no curl)
+assert_match "endpoint addr override refused"    "$(runne 'SMTP_HOST_ADDR=attacker.evil.example\n')" 'REFUSED'
+assert_match "endpoint port override refused"    "$(runne 'SMTP_HOST_PORT=2525\n')"                   'REFUSED'
+assert_match "From display-name override refused" "$(runne 'SMTP_FROM_NAME=Google Security <no-reply@accounts.google.com>\n')" 'REFUSED'
+assert_match "Subject override refused"          "$(runne 'NOTIFY_SUBJECT=pwn\n')"                     'REFUSED'
+assert_match "Body override refused"             "$(runne 'NOTIFY_BODY=pwn\n')"                        'REFUSED'
+assert_eq    "no curl on any refusal"            "$([ -f "$NG/curl.args" ] && echo sent || echo none)" "none"
+# a benign project that touches NOTHING host-sensitive must still send (no false refusal)
+out_ok="$(runne 'NOTIFY_LOGLINES=10\n')"
+assert_no_match "benign project not refused"     "$out_ok" 'REFUSED'
+assert_eq       "benign project still sends"     "$([ -f "$NG/curl.args" ] && echo sent || echo none)" "sent"
+rm -rf "$NG"
+
 summary

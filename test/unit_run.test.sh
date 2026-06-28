@@ -136,5 +136,28 @@ d="$(make_rundir 20260628T000000Z deadbeef 'build/a')"   # slash would ENOENT-lo
 assert_ok       "rundir created despite slash in job" test -d "$d"
 assert_no_match "job component sanitized (no slash in leaf)" "${d##*/}" '/'
 
+suite "safe_persist (symlink-guarded host write — H1)"
+SP="$(mktemp -d)"
+printf 'ATTACKER-PAYLOAD\n' > "$SP/src.tar"
+printf 'VICTIM-ORIGINAL\n'  > "$SP/victim"
+ln -sf "$SP/victim" "$SP/dst"                 # container planted dst -> a host file (e.g. authorized_keys)
+safe_persist "$SP/src.tar" "$SP/dst"
+assert_eq    "victim NOT overwritten through the symlink" "$(cat "$SP/victim")" "VICTIM-ORIGINAL"
+assert_fail  "dst is no longer a symlink"                 test -L "$SP/dst"
+assert_eq    "dst holds the real source bytes"            "$(cat "$SP/dst")" "ATTACKER-PAYLOAD"
+# a planted symlink AT THE TEMP NAME can't be followed either
+ln -sf "$SP/victim" "$SP/dst2.tmp.$$"; printf 'X\n' > "$SP/src2"
+safe_persist "$SP/src2" "$SP/dst2"
+assert_eq    "temp-name symlink didn't hit victim"        "$(cat "$SP/victim")" "VICTIM-ORIGINAL"
+rm -rf "$SP"
+
+suite "per-repo cache path flattens '/' (no nesting — H4)"
+flat() { printf '%s' "$1" | tr '/' '%'; }
+assert_eq "team -> team"          "$(flat team)"     "team"
+assert_eq "team/app -> team%app"  "$(flat team/app)" "team%app"
+# the parent-named repo's dir must NOT be a path-prefix DIR of the child's (the H4 bug)
+case "$(flat team/app)" in "$(flat team)"/*) nested=yes ;; *) nested=no ;; esac
+assert_eq "team%app is not nested under team" "$nested" "no"
+
 rm -rf "$W"
 summary

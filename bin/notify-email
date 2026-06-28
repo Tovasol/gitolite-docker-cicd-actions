@@ -45,15 +45,24 @@ TO="$(read_var NOTIFY_TO MAILER_EMAIL)"; [ -z "$TO" ] && TO="$USER"
 FROM="$(read_var MAILER_EMAIL NOTIFY_FROM)"; FROM="${FROM:-$USER}"
 [ -n "$USER" ] && [ -n "$PASS" ] && [ -n "$TO" ] || exit 0   # not configured -> skip silently
 
-# H5 open-relay guard: a repo's secrets MUST NOT borrow the operator's HOST SMTP credentials to
-# mail a project-chosen recipient or spoof a project-chosen From (authenticated relay that passes
-# the operator's SPF/DKIM/DMARC). If the creds are the host's but recipient/From came from the
-# project tier, refuse. A repo that brings its OWN SMTP creds (project tier) may use its own To/From.
+# H5 open-relay guard: when the SMTP CREDENTIALS are the operator's (host tier), a repo's secrets
+# MUST NOT steer the authenticated, SPF/DKIM/DMARC-aligned session. That means NONE of these may
+# come from the project tier:
+#   * recipient / From      -> open relay (mail anywhere as the operator)
+#   * SMTP endpoint addr/port-> credential THEFT (curl AUTHs the operator's user+pass to an
+#                               attacker SMTP server before it ever checks where it's sending)
+#   * From display-name / Subject / Body -> aligned-but-spoofed phish (e.g. From: "Google
+#                               Security <no-reply@accounts.google.com>" on operator-DKIM mail)
+# A repo that brings its OWN creds (project tier) may set all of these. Refuse any mix (H3, M1).
 if [ "$(tier SMTP_USER_NAME SMTP_USER)" = host ]; then
-  if [ "$(tier NOTIFY_TO MAILER_EMAIL)" = project ] || [ "$(tier MAILER_EMAIL NOTIFY_FROM)" = project ]; then
-    printf 'notify-email: REFUSED — project-supplied recipient/From with host SMTP creds (open-relay guard, H5)\n'
-    exit 0
-  fi
+  for pair in NOTIFY_TO:MAILER_EMAIL MAILER_EMAIL:NOTIFY_FROM \
+              SMTP_HOST_ADDR:SMTP_HOST SMTP_HOST_PORT:SMTP_PORT \
+              SMTP_FROM_NAME:NOTIFY_FROM_NAME NOTIFY_SUBJECT: NOTIFY_BODY:; do
+    if [ "$(tier "${pair%%:*}" "${pair#*:}")" = project ]; then
+      printf 'notify-email: REFUSED — project override of %s with host SMTP creds (open-relay/cred-theft guard, H5)\n' "${pair%%:*}"
+      exit 0
+    fi
+  done
 fi
 
 # scheme by port: 465 = implicit TLS (smtps); else STARTTLS on smtp:// (587/25)
@@ -85,8 +94,10 @@ LOGTAIL="$(tail -n "$LOGLINES" "$logpath" 2>/dev/null)"
 # custom templates ({{VAR}} tokens) — per-project or host default, else built-ins.
 SUBJECT_TMPL="$(read_var NOTIFY_SUBJECT)"
 BODY_TMPL="$(read_var NOTIFY_BODY)"
-SUBJECT_TMPL="${SUBJECT_TMPL:-{{TAG}} {{REPO}}/{{BRANCH}} {{JOB}} — {{STATUS}}}"
-BODY_TMPL="${BODY_TMPL:-CI {{STATUS}} on {{HOST}}
+# NB: do NOT fold these defaults into ${VAR:-{{TAG}}…} — the `}}` of a {{TOKEN}} closes the
+# parameter expansion early and mangles the template. Assign explicitly when empty.
+[ -n "$SUBJECT_TMPL" ] || SUBJECT_TMPL='{{TAG}} {{REPO}}/{{BRANCH}} {{JOB}} — {{STATUS}}'
+[ -n "$BODY_TMPL" ] || BODY_TMPL="CI {{STATUS}} on {{HOST}}
 
 repo:    {{REPO}}
 branch:  {{BRANCH}}
@@ -98,7 +109,7 @@ time:    {{NOW}}
 message: {{MESSAGE}}
 
 --- last $LOGLINES log lines ---
-{{LOGTAIL}}}"
+{{LOGTAIL}}"
 
 # literal token substitution (NO eval — message/logtail are untrusted)
 render() {
@@ -116,6 +127,7 @@ SUBJECT="$(render "$SUBJECT_TMPL")"; SUBJECT="${SUBJECT//$'\n'/ }"
 BODY="$(render "$BODY_TMPL")"
 
 FROM_NAME="$(read_var SMTP_FROM_NAME NOTIFY_FROM_NAME)"; FROM_NAME="${FROM_NAME:-cicd-runner}"
+FROM_NAME="$(printf '%s' "$FROM_NAME" | tr -d '\r\n<>')"   # strip CR/LF + angle-brackets: no header injection / fake-address display name
 msg="$(printf 'From: %s <%s>\r\nTo: %s\r\nSubject: %s\r\nDate: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s\r\n' \
   "$FROM_NAME" "$FROM" "$TO" "$SUBJECT" "$(date -R 2>/dev/null)" "$BODY")"
 

@@ -38,7 +38,12 @@ if [ "$_CICD_MAIN" = 1 ]; then
   # GRADLE_USER_HOME, npm/pip caches all live under /cache), at the cost of dedup. repo is a
   # safe gitolite name (validated upstream); mkdir below is the only writer.
   if [ "${CACHE_ISOLATION:-shared}" = per-repo ]; then
-    CACHE="$RUNNER_BASE/cache/_per-repo/$repo"; mkdir -p "$CACHE" 2>/dev/null || true
+    # Gitolite repo names contain '/' (team/app), so the RAW name makes _per-repo/team a PARENT
+    # of _per-repo/team/app — a 'team' writer's cache subtree overlaps 'team/app' and poisons its
+    # CARGO_HOME/GRADLE_USER_HOME (H4). Flatten '/' -> '%' (never in a valid repo name, so the map
+    # is injective + non-nesting): each repo gets ONE sibling dir, no prefix overlap.
+    CACHE="$RUNNER_BASE/cache/_per-repo/$(printf '%s' "$repo" | tr '/' '%')"
+    mkdir -p "$CACHE" 2>/dev/null || true
   else
     CACHE="$RUNNER_BASE/cache"
   fi
@@ -249,6 +254,10 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   mem="$(yq_str "$manifest" ".jobs.\"$job\".memory")";      mem="${mem:-$DEFAULT_MEMORY}"
   pids="$(yq_str "$manifest" ".jobs.\"$job\".pids")";       pids="${pids:-$DEFAULT_PIDS}"
   network="$(yq_str "$manifest" ".jobs.\"$job\".network")"; network="${network:-$DEFAULT_NETWORK}"
+  # docs promise only bridge|none. Without an allowlist a job could ask for `host` (rootless
+  # netns -> loopback services / the rootless docker API) or `container:<name>` (share another
+  # live CI container's netns); reject anything else to a safe default (L1).
+  case "$network" in bridge|none) ;; *) log "$group/$job: network '$network' not allowed -> bridge"; network=bridge ;; esac
   runcmd="$(yq_str "$manifest" ".jobs.\"$job\".run")"
   [ -n "$runcmd" ] || { log "$group/$job: no run: command, skip"; return 0; }
   build_limits "$mem" "$pids"; local limits=("${_LIMITS[@]}")
@@ -328,6 +337,19 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   return "$rc"
 }
 
+# Copy <src> to a host path the job container could have pre-populated with a planted symlink
+# (the RW /envstate mount): lstat-reject any symlink at the destination, then write through a
+# fresh temp inode + atomic rename. Defeats H1 — `cp -f` straight onto $ENVS/source.tar would
+# FOLLOW a container-planted `source.tar -> ~/.ssh/authorized_keys` and write attacker bytes
+# through it. `cp --no-dereference` is not enough; the symlink must be removed before the write.
+safe_persist() {  # <src> <dst>
+  local src="$1" dst="$2" tmp="$2.tmp.$$"
+  [ -n "$src" ] && [ -f "$src" ] || return 0
+  [ -L "$dst" ] && rm -f "$dst"            # never cp THROUGH a planted symlink
+  rm -f "$tmp" 2>/dev/null || true         # the temp name could be planted too
+  cp -f "$src" "$tmp" 2>/dev/null && mv -f "$tmp" "$dst" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
 # Persist what teardown needs, so a delete (hook OR reaper) can run without repo access.
 persist_env_for_teardown() {  # <work> <manifest> <srctar>
   local work="$1" manifest="$2" srctar="$3" tjob tscript timage
@@ -342,7 +364,7 @@ persist_env_for_teardown() {  # <work> <manifest> <srctar>
     printf '%s\n' "$timage"  > "$ENVS/teardown.image"
     printf '{"repo":"%s","branch":"%s","slug":"%s","saved":"%s"}\n' \
       "$repo" "$branch" "$slug" "$(_ts)" > "$ENVS/meta.json"
-    [ -n "$srctar" ] && [ -f "$srctar" ] && cp -f "$srctar" "$ENVS/source.tar"  # latest tree for teardown
+    safe_persist "$srctar" "$ENVS/source.tar"   # latest tree for teardown (symlink-guarded, H1)
     log "$group: persisted teardown plan for $slug (job=$tjob)"
     return 0
   done
@@ -449,7 +471,7 @@ run_teardown() {  # <oldrev> <pusher>
     log "$group: teardown done"
   else
     # KEEP the tree + state for operator retry — copy the delivered tar into the env dir.
-    [ -n "$srctar" ] && cp -f "$srctar" "$ENVS/source.tar" 2>/dev/null || true
+    safe_persist "$srctar" "$ENVS/source.tar" || true   # symlink-guarded (H1)
     printf '%s' "$branch" > "$ENVS/branch"
     printf 'exit:%s @ %s\nlog: %s\n' "$rc" "$(_ts)" "$dir/output.log" > "$ENVS/teardown-failed"
     cicd_flush_outbox "$outdir/notify" "$rc" "$dir" "$group teardown NEEDS OPERATOR (ci-teardown)" "$envfile" "$maskfile"

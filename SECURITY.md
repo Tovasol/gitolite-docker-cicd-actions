@@ -64,7 +64,9 @@ These are deliberate trade-offs for a small-scale, trusted-operator tool:
    package). It can also read another repo's cached packages. *Mitigation: set
    **`CACHE_ISOLATION=per-repo`** (now implemented — each repo gets its own cache subtree,
    trading dedup for isolation) when running repos you don't mutually trust; otherwise only
-   run trusted repos.*
+   run trusted repos. The per-repo subtree flattens `/` in the repo name (`team/app` →
+   `team%app`), so a parent-named repo's subtree never nests inside a child's — nested
+   gitolite names get true sibling isolation, not prefix overlap.*
 2. **Age key blast radius.** One key decrypts all repos' secrets. *Mitigation: back it
    up out-of-band (e.g. `pass`); rotate per SOP; consider per-repo recipients if you
    onboard less-trusted repos.*
@@ -73,12 +75,19 @@ These are deliberate trade-offs for a small-scale, trusted-operator tool:
    (`RESOURCE_LIMITS=0`), so a job can OOM or fork-bomb the host. *Mitigation: run on a
    cgroup-v2/systemd host, or apply ulimit fallbacks; see DESIGN §29.*
 4. **Egress is allowed by default** (`network: bridge`). A job can exfiltrate anything
-   it can read. *Mitigation: set `network: none` for jobs that need no internet.*
+   it can read. The `network:` field is allowlisted to **`bridge` | `none`** only — `host`
+   and `container:<name>` are rejected (fall back to `bridge`), so a job can't share the
+   host/another container's netns. *Mitigation: set `network: none` for jobs that need no
+   internet.*
 5. **Mutable base-image tags.** `image: node:lts` etc. resolve to whatever the registry
    serves. *Mitigation: pin by digest (`@sha256:…`).*
 6. **Container code runs as root-in-namespace.** Mapped to an unprivileged host uid, but
-   a job has root *within* its container. Escapes rely on a docker/kernel CVE; keep the
-   host patched.
+   a job has root *within* its container. A genuine escape relies on a docker/kernel CVE;
+   keep the host patched. Note the *confused-deputy* path is closed separately: the trusted
+   host code that touches the RW `/envstate` and `/cicd/out` mounts after a container exits
+   (`cp` into `source.tar`, reading the notify outbox) lstat-rejects container-planted
+   symlinks, so a job can't make the runner read/write an attacker-chosen host path without
+   an actual escape.
 7. **The runner-repo deploy branch is a ROOT trust boundary.** `update-runner.sh` extracts
    that branch's tree and runs/installs it **as root**, so **whoever can push the deploy
    branch (default `release`) effectively gets root on the runner host** — by design, no

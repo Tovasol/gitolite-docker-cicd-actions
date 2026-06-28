@@ -51,4 +51,15 @@ DIR2="$T/run2"; mkdir -p "$DIR2"; : > "$DIR2/output.log"
 NOTIFY_CMD="" cicd_flush_outbox "$T/box" 0 "$DIR2" "x" ""
 assert_match "no maskfile -> raw msg in log"  "$(cat "$DIR2/output.log")" 'supersecretvalue123'
 
+suite "cicd_flush_outbox rejects a symlink outbox (H2 exfil guard)"
+# a job plants notify -> the host age MASTER key; the host-side read must NOT follow it
+DIRs="$T/runs"; mkdir -p "$DIRs"; : > "$DIRs/output.log"
+SECRET="$T/host-age-key"; printf 'AGE-SECRET-KEY-A1B2C3\n' > "$SECRET"
+ln -sf "$SECRET" "$T/sbox"; : > "$REC"
+NOTIFY_CMD="$T/notify" cicd_flush_outbox "$T/sbox" 0 "$DIRs" "tovasol/app/smoke" ""
+assert_no_match "master key NOT read into output.log" "$(cat "$DIRs/output.log")" 'AGE-SECRET-KEY-A1B2C3'
+assert_match    "refusal noted in the log"            "$(cat "$DIRs/output.log")" 'symlink'
+assert_eq       "nothing delivered from symlink box"  "$(cat "$REC")" ""
+assert_fail     "symlink box removed"                 test -e "$T/sbox"
+
 summary
