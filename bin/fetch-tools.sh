@@ -20,6 +20,22 @@ sha_of() {
 }
 fetch() { if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"; else wget -qO "$2" "$1"; fi; }
 
+# A cached copy is trustworthy only if the installed binary STILL hashes to what we recorded
+# at install — re-verified EVERY run, so a poisoned shared /cache that swapped the binary (and
+# even forged the marker) is caught. For 'bin' tools we anchor to the script PIN directly
+# (marker-independent, unforgeable); for extracted tools we anchor to the recorded installed
+# sha (tamper-evident). A bare marker==pin check (the old behavior) re-hashed nothing.
+cache_ok() {  # <out> <marker> <pin> <fmt>
+  [ -x "$1" ] || return 1
+  _cur="$(sha_of "$1")"; _rec="$(cat "$2" 2>/dev/null || true)"
+  [ "$_cur" = "$_rec" ] || return 1
+  [ "$4" != bin ] || [ "$_cur" = "$3" ] || return 1
+  return 0
+}
+
+# tests can load just the helpers above:  FETCH_TOOLS_LIB=1 . fetch-tools.sh
+[ -n "${FETCH_TOOLS_LIB:-}" ] && return 0
+
 n_ok=0; n_cached=0
 # The loop reads its manifest from the heredoc at the bottom. Columns are whitespace-
 # separated: <name> <arch> <url> <sha256> <format>. Comment/blank lines are skipped.
@@ -29,8 +45,9 @@ while read -r name a url sha fmt; do
   [ -z "$want" ] || case " $want " in *" $name "*) ;; *) continue ;; esac
 
   out="$DEST/$name"; marker="$DEST/.$name.sha"
-  # cache: a present binary whose recorded source-sha matches the pin -> skip (no download)
-  if [ -x "$out" ] && [ "$(cat "$marker" 2>/dev/null || true)" = "$sha" ]; then
+  # cache: re-hash the installed binary every run (a marker match alone is forgeable in a
+  # shared /cache; cache_ok catches a swapped tool by re-verifying the bytes).
+  if cache_ok "$out" "$marker" "$sha" "$fmt"; then
     n_cached=$((n_cached + 1)); echo "  cached    $name"; continue
   fi
 
@@ -47,7 +64,7 @@ while read -r name a url sha fmt; do
     tarxz:*)  d="$(mktemp -d)"; tar -xJf "$tmp" -C "$d";  install -m755 "$d/${fmt#tarxz:}" "$out"; rm -rf "$d" ;;
     *) echo "fetch-tools: unknown format '$fmt' for $name" >&2; rm -f "$tmp"; exit 1 ;;
   esac
-  rm -f "$tmp"; printf '%s' "$sha" > "$marker"
+  rm -f "$tmp"; sha_of "$out" > "$marker"   # record the INSTALLED binary's sha for re-verify
   n_ok=$((n_ok + 1)); echo "  installed $name (sha256 verified)"
 done <<'TOOLS'
 # ============================================================================
