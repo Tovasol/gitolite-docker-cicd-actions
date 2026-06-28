@@ -24,7 +24,7 @@ RESTART=0; [ "${2:-}" = "--restart" ] && RESTART=1
 
 RUNNER_USER="${RUNNER_USER:-cicd-runner}"
 GIT_USER="${GIT_USER:-git}"
-BRANCH="${BRANCH:-main}"                 # gitolite HEAD may be 'master'; we pushed 'main'
+BRANCH="${BRANCH:-release}"              # deploy from the promoted, admin-PROTECTED release branch
 RUN="$(getent passwd "$RUNNER_USER" | cut -d: -f6)"
 GIT_HOME="$(getent passwd "$GIT_USER" | cut -d: -f6)"
 [ -n "$RUN" ]      || { echo "no home for user $RUNNER_USER" >&2; exit 1; }
@@ -36,6 +36,24 @@ case "$REPO" in
   *)  RUNNER_REPO="$GIT_HOME/repositories/${REPO%.git}.git" ;;
 esac
 [ -d "$RUNNER_REPO" ] || { echo "no bare repo at $RUNNER_REPO" >&2; exit 1; }
+
+# H4 — integrity gate. This script extracts the runner-repo tree and runs/installs it AS ROOT,
+# so whoever can push $BRANCH effectively gets root here. Two defenses, both operator-owned:
+#   * PROTECT the deploy branch (admin-only) — see SECURITY.md.
+#   * UPDATE_REQUIRE_SIGNED=1 + import the trusted signer's key into root's gpg keyring; we then
+#     verify the $BRANCH tip is a valid signed commit before touching anything.
+if [ "${UPDATE_REQUIRE_SIGNED:-0}" = 1 ]; then
+  if git --git-dir="$RUNNER_REPO" verify-commit "$BRANCH" >/dev/null 2>&1; then
+    echo "  verified: $BRANCH tip is a trusted signed commit"
+  else
+    echo "update-runner: REFUSING — $BRANCH tip is not a valid SIGNED commit (UPDATE_REQUIRE_SIGNED=1)." >&2
+    echo "               import the signer's key into root's gpg keyring, or unset to deploy unverified." >&2
+    exit 1
+  fi
+else
+  echo "  WARNING: deploying UNVERIFIED '$BRANCH' — anyone who can push it gets ROOT on this host." >&2
+  echo "           Protect the deploy branch (admin-only) and set UPDATE_REQUIRE_SIGNED=1 with a trusted key." >&2
+fi
 
 echo "→ [1/5] source ← $RUNNER_REPO ($BRANCH)"
 SRC="$RUN/src"
@@ -63,9 +81,18 @@ if [ -z "${_UR_REEXEC:-}" ] && [ -f "$SELF" ]; then
   post="$( (sha256sum "$SELF" 2>/dev/null || true) | cut -d' ' -f1)"
   if [ -n "$post" ] && [ "$post" != "$pre" ]; then
     echo "  update-runner.sh changed in this release — re-exec'ing the new version"
-    exec env _UR_REEXEC=1 RUNNER_USER="$RUNNER_USER" GIT_USER="$GIT_USER" BRANCH="$BRANCH" "$SELF" "$@"
+    exec env _UR_REEXEC=1 RUNNER_USER="$RUNNER_USER" GIT_USER="$GIT_USER" BRANCH="$BRANCH" \
+      UPDATE_REQUIRE_SIGNED="${UPDATE_REQUIRE_SIGNED:-0}" "$SELF" "$@"
   fi
 fi
+
+# H4 leg-2: snapshot the files ROOT installs into a root-owned dir NOW, before dropping to the
+# cicd-runner user for install.sh — so a cicd-runner foothold during install.sh cannot swap what
+# root installs. ~/src stays cicd-runner-owned (install.sh writes it); these snapshot copies do not.
+ROOTSNAP="$(mktemp -d)"; chmod 700 "$ROOTSNAP"
+trap 'rm -rf "$ROOTSNAP"' EXIT
+cp -f "$SRC/git/ci-job" "$ROOTSNAP/ci-job"
+cp -f "$SRC/init/docker-rootless-cicd-runner.openrc" "$ROOTSNAP/openrc"
 
 echo "→ [2/5] install.sh (scripts + dirs)"
 sudo -iu "$RUNNER_USER" bash -lc 'cd ~/src && ./install.sh'
@@ -82,7 +109,7 @@ echo "→ [4/5] ci-job command (+ enable + sudo grant)"
 # is the canonical source — re-sync the gitolite-admin copy if it ever changes.
 LOCAL_CODE="$(sudo -u "$GIT_USER" gitolite query-rc LOCAL_CODE)"
 # ci-job: the git-side gitolite command (run/status/log over ssh, gitolite-authz, §34).
-install -Dm755 "$RUN/src/git/ci-job" "$LOCAL_CODE/commands/ci-job"
+install -Dm755 "$ROOTSNAP/ci-job" "$LOCAL_CODE/commands/ci-job"   # from the root-owned snapshot (H4)
 chown -R "$GIT_USER:$GIT_USER" "$LOCAL_CODE"
 
 # enable ci-job in gitolite.rc (idempotent) so `ssh git@host ci-job …` is allowed
@@ -112,8 +139,7 @@ fi
 rm -f "$_su"
 
 echo "→ [5/5] boot/init service file"
-install -m755 "$RUN/src/init/docker-rootless-cicd-runner.openrc" \
-        /etc/init.d/docker-rootless-cicd-runner
+install -m755 "$ROOTSNAP/openrc" /etc/init.d/docker-rootless-cicd-runner   # from the root-owned snapshot (H4)
 
 if [ "$RESTART" -eq 1 ]; then
   echo "→ restart docker-rootless-cicd-runner (bounces docker, KILLS in-flight builds)"

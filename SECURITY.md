@@ -77,14 +77,22 @@ These are deliberate trade-offs for a small-scale, trusted-operator tool:
 6. **Container code runs as root-in-namespace.** Mapped to an unprivileged host uid, but
    a job has root *within* its container. Escapes rely on a docker/kernel CVE; keep the
    host patched.
+7. **The runner-repo deploy branch is a ROOT trust boundary.** `update-runner.sh` extracts
+   that branch's tree and runs/installs it **as root**, so **whoever can push the deploy
+   branch (default `release`) effectively gets root on the runner host** — by design, no
+   container escape needed. *Mitigation: protect the deploy branch (admin-only) **and** set
+   `UPDATE_REQUIRE_SIGNED=1` with the trusted signer's key in root's gpg keyring (the script
+   then verifies the branch tip is a signed commit before any root action). Treat deploy-
+   branch write access as equivalent to root.*
 
 ## Operator responsibilities
 
 - Grant repo **write access only** to people you'd trust to run code as `cicd-runner`.
+- **Protect the runner-repo deploy branch** (admin-only) and prefer `UPDATE_REQUIRE_SIGNED=1`
+  — pushing it = root on the host.
 - Use **lockfiles** in builds so package managers verify integrity.
 - Keep the **host and docker patched** (the escape boundary).
 - **Back up the age key**; know your rotation runbook (SOP §6).
-- Protect deploy/`release` branches if collaborators have write access.
 - Treat job logs as potentially sensitive (a job may print secrets); see secret
   redaction in the log/notify path.
 
