@@ -95,6 +95,24 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do printf 'SECRET_%s=valuevalueval
 MASK_MAX_RULES=5 build_mask_script "$ENVF3" "$MASK3"
 assert_eq "mask rules capped at MASK_MAX_RULES" "$(grep -c '^s/' "$MASK3")" "5"
 
+# H6 escape-bypass: a \c escape inside a multi-line value must NOT drop the segments AFTER it.
+# printf '%b' stops at \c -> no mask rule for TAILSEGMENT789 (leak); the awk \n-split emits a rule
+# for every \n-delimited segment, so a clean segment after the \c-bearing one is still masked.
+ENVF4="$W/env4"; MASK4="$W/mask4"
+printf 'K=FIRSTSEGMENT123\\nMIDDLE\\cWITHESCAPE\\nTAILSEGMENT789\n' > "$ENVF4"
+build_mask_script "$ENVF4" "$MASK4"
+assert_match    "rule emitted for post-\\c segment" "$(cat "$MASK4")" 'TAILSEGMENT789'
+t4="$(printf '%s\n' 'TAILSEGMENT789' | redact_log "$MASK4")"
+assert_no_match "segment after \\c is masked"       "$t4" 'TAILSEGMENT789'
+
+# DoS: TOTAL rules (not entry count) are capped — a few keys with many \n-segments can't blow past
+ENVF5="$W/env5"; MASK5="$W/mask5"
+seg=""; for i in $(seq 1 50); do seg="${seg}SEGMENTVALUE$i\\n"; done
+printf 'BIGKEY1=%s\nBIGKEY2=%s\nBIGKEY3=%s\n' "$seg" "$seg" "$seg" > "$ENVF5"
+MASK_MAX_RULES=20 build_mask_script "$ENVF5" "$MASK5"
+n5="$(grep -c '^s/' "$MASK5")"
+assert_ok "total rules bounded near cap (got $n5)" test "$n5" -le 60   # emax + one key's ≤200 segs
+
 suite "build_limits (cgroup when enforceable, ulimit fallback otherwise)"
 ULIMIT_NPROC=1024; ULIMIT_FSIZE=2147483648
 RESOURCE_LIMITS=1; build_limits 2g 512; got="${_LIMITS[*]}"

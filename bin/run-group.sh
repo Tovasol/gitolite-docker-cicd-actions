@@ -158,12 +158,13 @@ _emit_mask_rule() { printf 's/%s/[MASKED]/g\n' "$(printf '%s' "$1" | sed 's/[][\
 build_mask_script() {  # <envfile> <out_sedscript>
   : > "$2"
   [ -f "$1" ] || return 0
-  # L2/L3: cap the number of secret ENTRIES processed and the multi-line SEGMENTS per entry, so
-  # a pathological secrets file (e.g. 20k keys) can't make build_mask_script fork thousands of
-  # times or the redactor's sed run thousands of rules per log line (host CPU / slot DoS).
-  local line val seg entries=0 emax="${MASK_MAX_RULES:-500}"
+  # L2/L3 + DoS: cap the TOTAL number of emitted rules (recount the output each pass), so a
+  # pathological secrets file — many keys, OR a few keys each with thousands of \n-segments —
+  # can't make the redactor's sed run an unbounded number of rules per log line (host CPU / slot
+  # DoS). Counting ENTRIES alone was bypassable: 500 entries x 200 segments = 100k rules.
+  local line val seg emax="${MASK_MAX_RULES:-500}"
   while IFS= read -r line || [ -n "$line" ]; do
-    [ "$entries" -ge "$emax" ] && { log "${group:-?}: secrets exceed MASK_MAX_RULES=$emax — redaction capped"; break; }
+    [ "$(grep -c '' "$2" 2>/dev/null || echo 0)" -ge "$emax" ] && { log "${group:-?}: secrets exceed MASK_MAX_RULES=$emax — redaction capped"; break; }
     case "$line" in '#'*|'') continue ;; esac
     case "$line" in *=*) ;; *) continue ;; esac
     val="${line#*=}"
@@ -171,11 +172,13 @@ build_mask_script() {  # <envfile> <out_sedscript>
       \"*\") val="${val#\"}"; val="${val%\"}" ;;
       \'*\') val="${val#\'}"; val="${val%\'}" ;;
     esac
-    [ "${#val}" -ge 6 ] && { _emit_mask_rule "$val" >> "$2"; entries=$((entries + 1)); }   # single-line form
-    # H6: multi-line secrets (PEM/SSH/age) materialize REAL newlines when a tool prints them;
-    # the single-line rule won't match. Mask each \n-segment too (capped at 200 lines/key).
+    [ "${#val}" -ge 6 ] && _emit_mask_rule "$val" >> "$2"   # single-line (literal) form
+    # H6: a multi-line secret (PEM/SSH/age) materializes REAL newlines when a tool interprets the
+    # \n separators sops emits; mask each segment too. Split on the LITERAL \n ONLY (awk gsub) —
+    # NOT printf '%b', whose \c truncates the remaining segments and \x../\0.. mis-interpret,
+    # leaving real secret segments unmasked (a redaction bypass). Capped at 200 segments/key.
     case "$val" in *\\n*)
-      printf '%b\n' "$val" | head -n 200 | while IFS= read -r seg || [ -n "$seg" ]; do
+      printf '%s' "$val" | awk '{gsub(/\\n/,"\n")} 1' | head -n 200 | while IFS= read -r seg || [ -n "$seg" ]; do
         [ "${#seg}" -ge 6 ] && _emit_mask_rule "$seg"
       done >> "$2" ;;
     esac
