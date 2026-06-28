@@ -105,15 +105,21 @@ iso_age() {  # <iso> -> seconds since (GNU date; '?' if unparseable)
 ENGINE=none; have duckdb && ENGINE=duckdb
 # read_json source: a single glob, OR (when --repos given) a DuckDB list of per-repo
 # globs so the scan covers exactly the allowed repos. Empty allowlist -> [] -> no rows.
+# For an access-scoped (--repos) request, glob ALL runs ONCE and filter to the allowed repos
+# in SQL. A per-repo glob LIST errors as a whole if ANY listed repo has no runs yet (most of a
+# user's repos never ran CI), which silently emptied the scoped dashboard. cicd-runner may read
+# every run; the SQL filter restricts OUTPUT to the repos gitolite says the user can read.
+REPO_FILTER=""
 if [ -n "$REPOS" ]; then
-  _globs=""; for _rp in $REPOS; do _globs="${_globs:+$_globs,}'$RUNNER_BASE/runs/$_rp/**/meta.json'"; done
-  RUNS_SRC="[$_globs]"
+  RUNS_SRC="'$RUNNER_BASE/runs/**/meta.json'"
+  _in=""; for _rp in $REPOS; do _in="${_in:+$_in,}'$_rp'"; done
+  [ -n "$_in" ] && REPO_FILTER="AND repo IN ($_in)"
 else
   RUNS_SRC="'$RUNNER_BASE/runs/${SCOPE:+$SCOPE/}**/meta.json'"
 fi
 DATA_CTE="WITH data AS (SELECT *, regexp_replace(filename,'/meta\.json\$','') AS dir
   FROM read_json($RUNS_SRC, format='newline_delimited', filename=true, ignore_errors=true, union_by_name=true)
-  WHERE schema IS NOT NULL)"
+  WHERE schema IS NOT NULL $REPO_FILTER)"
 runsql() { duckdb -noheader -list -separator $'\t' -c "$DATA_CTE $1" 2>/dev/null; }  # <query on `data`>
 
 # =============================== render =====================================
