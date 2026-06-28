@@ -46,6 +46,10 @@ ULIMIT_FSIZE=2147483648                         # fallback single-file size cap 
 # prune-disk reaper age-evicts then size-caps it (the only formerly-unbounded vector).
 CACHE_MAX_AGE_DAYS=30          # delete cache entries untouched this long
 CACHE_MAX_GB=20                # then size-cap the whole cache (LRU eviction)
+# Cache isolation. 'shared' (default) = one global cache for max dedup. 'per-repo' gives each
+# repo its OWN cache subtree — closes cross-repo code-exec via shared tool config (CARGO_HOME,
+# GRADLE_USER_HOME, …), at the cost of dedup. Use per-repo if you run mutually-distrusting repos.
+CACHE_ISOLATION=shared        # shared | per-repo
 
 # --- behavior ---
 CANCEL_IN_PROGRESS=0                           # 1 = a new push kills the running job; 0 = coalesce

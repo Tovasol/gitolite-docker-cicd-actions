@@ -57,12 +57,14 @@ secrets of every repo. Grant repo write access accordingly.
 
 These are deliberate trade-offs for a small-scale, trusted-operator tool:
 
-1. **Shared `/cache` across repos** (same uid). Maximizes dedup; provides **no
-   cross-repo confidentiality**. A malicious job can read another repo's cached
-   packages. *Mitigation: only run trusted repos; use lockfiles so package managers
-   verify integrity (`npm ci`, `pip --require-hashes`, `cargo`/`go` checksums).* An
-   opt-in `CACHE_ISOLATION=per-repo` knob may be offered for the rare multi-collaborator
-   case (trades dedup for isolation).
+1. **Shared `/cache` across repos** (same uid, default). Maximizes dedup, but `/cache`
+   also holds every tool's **config/HOME** (`CARGO_HOME`, `GRADLE_USER_HOME`, npm/pip
+   caches), so a malicious job can plant config (e.g. `cargo`'s `rustc-wrapper`) that runs
+   **as code** in another repo's build — **lockfiles do NOT stop this** (it's not a
+   package). It can also read another repo's cached packages. *Mitigation: set
+   **`CACHE_ISOLATION=per-repo`** (now implemented — each repo gets its own cache subtree,
+   trading dedup for isolation) when running repos you don't mutually trust; otherwise only
+   run trusted repos.*
 2. **Age key blast radius.** One key decrypts all repos' secrets. *Mitigation: back it
    up out-of-band (e.g. `pass`); rotate per SOP; consider per-repo recipients if you
    onboard less-trusted repos.*

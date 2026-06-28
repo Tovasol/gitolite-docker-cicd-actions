@@ -20,18 +20,15 @@ sha_of() {
 }
 fetch() { if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"; else wget -qO "$2" "$1"; fi; }
 
-# A cached copy is trustworthy only if the installed binary STILL hashes to what we recorded
-# at install — re-verified EVERY run, so a poisoned shared /cache that swapped the binary (and
-# even forged the marker) is caught. For 'bin' tools we anchor to the script PIN directly
-# (marker-independent, unforgeable); for extracted tools we anchor to the recorded installed
-# sha (tamper-evident). A bare marker==pin check (the old behavior) re-hashed nothing.
-cache_ok() {  # <out> <marker> <pin> <fmt>
-  [ -x "$1" ] || return 1
-  _cur="$(sha_of "$1")"; _rec="$(cat "$2" 2>/dev/null || true)"
-  [ "$_cur" = "$_rec" ] || return 1
-  [ "$4" != bin ] || [ "$_cur" = "$3" ] || return 1
-  return 0
-}
+# Cache trust is anchored to the SCRIPT PIN (unforgeable), re-verified every run, so a poisoned
+# shared /cache can never pass a swapped tool:
+#   * bin tools     — the installed binary IS the pinned artifact: re-hash it vs the pin.
+#   * extracted     — the pin is the ARCHIVE sha: re-hash the cached ARCHIVE vs the pin, then
+#                     re-extract from it (M3). A forged archive can't match the pin; a planted
+#                     trojan binary is overwritten by the re-extract. (No marker — markers in
+#                     the job-writable cache are forgeable, which defeated the old check.)
+bin_cached()     { [ -x "$1" ] && [ "$(sha_of "$1")" = "$2" ]; }   # <out> <pin>
+archive_cached() { [ -f "$1" ] && [ "$(sha_of "$1")" = "$2" ]; }   # <archive> <pin>
 
 # tests can load just the helpers above:  FETCH_TOOLS_LIB=1 . fetch-tools.sh
 [ -n "${FETCH_TOOLS_LIB:-}" ] && return 0
@@ -44,28 +41,37 @@ while read -r name a url sha fmt; do
   [ "$a" = "$arch" ] || continue
   [ -z "$want" ] || case " $want " in *" $name "*) ;; *) continue ;; esac
 
-  out="$DEST/$name"; marker="$DEST/.$name.sha"
-  # cache: re-hash the installed binary every run (a marker match alone is forgeable in a
-  # shared /cache; cache_ok catches a swapped tool by re-verifying the bytes).
-  if cache_ok "$out" "$marker" "$sha" "$fmt"; then
-    n_cached=$((n_cached + 1)); echo "  cached    $name"; continue
+  out="$DEST/$name"
+  if [ "$fmt" = bin ]; then
+    if bin_cached "$out" "$sha"; then n_cached=$((n_cached + 1)); echo "  cached    $name"; continue; fi
+    tmp="$(mktemp)"; fetch "$url" "$tmp"
+    got="$(sha_of "$tmp")"
+    [ "$got" = "$sha" ] || { echo "fetch-tools: SHA256 MISMATCH for $name ($arch)" >&2; \
+      echo "  expected $sha" >&2; echo "  got      $got" >&2; rm -f "$tmp"; exit 1; }
+    install -m755 "$tmp" "$out"; rm -f "$tmp"
+    n_ok=$((n_ok + 1)); echo "  installed $name (sha256 verified)"
+    continue
   fi
 
-  tmp="$(mktemp)"
-  fetch "$url" "$tmp"
-  got="$(sha_of "$tmp")"
-  [ "$got" = "$sha" ] || { echo "fetch-tools: SHA256 MISMATCH for $name ($arch)" >&2; \
-    echo "  expected $sha" >&2; echo "  got      $got" >&2; rm -f "$tmp"; exit 1; }
-
+  # extracted tools — anchor to the pinned ARCHIVE; re-extract from it every run (M3).
+  archive="$DEST/.$name.archive"; fresh=0
+  if ! archive_cached "$archive" "$sha"; then
+    tmp="$(mktemp)"; fetch "$url" "$tmp"
+    got="$(sha_of "$tmp")"
+    [ "$got" = "$sha" ] || { echo "fetch-tools: SHA256 MISMATCH for $name ($arch)" >&2; \
+      echo "  expected $sha" >&2; echo "  got      $got" >&2; rm -f "$tmp"; exit 1; }
+    mv -f "$tmp" "$archive"; fresh=1
+  fi
+  d="$(mktemp -d)"
   case "$fmt" in
-    bin)      install -m755 "$tmp" "$out" ;;
-    zip:*)    d="$(mktemp -d)"; unzip -oq "$tmp" -d "$d"; install -m755 "$d/${fmt#zip:}"   "$out"; rm -rf "$d" ;;
-    targz:*)  d="$(mktemp -d)"; tar -xzf "$tmp" -C "$d";  install -m755 "$d/${fmt#targz:}" "$out"; rm -rf "$d" ;;
-    tarxz:*)  d="$(mktemp -d)"; tar -xJf "$tmp" -C "$d";  install -m755 "$d/${fmt#tarxz:}" "$out"; rm -rf "$d" ;;
-    *) echo "fetch-tools: unknown format '$fmt' for $name" >&2; rm -f "$tmp"; exit 1 ;;
+    zip:*)    unzip -oq "$archive" -d "$d"; install -m755 "$d/${fmt#zip:}"   "$out" ;;
+    targz:*)  tar -xzf "$archive" -C "$d";  install -m755 "$d/${fmt#targz:}" "$out" ;;
+    tarxz:*)  tar -xJf "$archive" -C "$d";  install -m755 "$d/${fmt#tarxz:}" "$out" ;;
+    *) echo "fetch-tools: unknown format '$fmt' for $name" >&2; rm -rf "$d"; exit 1 ;;
   esac
-  rm -f "$tmp"; sha_of "$out" > "$marker"   # record the INSTALLED binary's sha for re-verify
-  n_ok=$((n_ok + 1)); echo "  installed $name (sha256 verified)"
+  rm -rf "$d"
+  if [ "$fresh" = 1 ]; then n_ok=$((n_ok + 1)); echo "  installed $name (sha256 verified)"
+  else n_cached=$((n_cached + 1)); echo "  cached    $name (re-extracted from verified archive)"; fi
 done <<'TOOLS'
 # ============================================================================
 #  PACKAGES — add / update / remove tools here.  Whitespace-separated columns:

@@ -33,7 +33,15 @@ if [ "$_CICD_MAIN" = 1 ]; then
   # in meta.json (the truth), NOT in the path; the slash-free leaf anchors the repo.
   RUNS="$RUNNER_BASE/runs/$repo"
   ENVS="$RUNNER_BASE/envs/$repo/$slug"
-  CACHE="$RUNNER_BASE/cache"                  # GLOBAL cache, shared all repos (§32)
+  # Cache: GLOBAL by default (max dedup, §32). CACHE_ISOLATION=per-repo gives each repo its own
+  # cache subtree (M2) — closes cross-repo code-exec via shared tool config dirs (CARGO_HOME,
+  # GRADLE_USER_HOME, npm/pip caches all live under /cache), at the cost of dedup. repo is a
+  # safe gitolite name (validated upstream); mkdir below is the only writer.
+  if [ "${CACHE_ISOLATION:-shared}" = per-repo ]; then
+    CACHE="$RUNNER_BASE/cache/_per-repo/$repo"; mkdir -p "$CACHE" 2>/dev/null || true
+  else
+    CACHE="$RUNNER_BASE/cache"
+  fi
   INC="$RUNNER_BASE/incoming/$group"          # cicd-ingest drops <sha>.tar + <sha>.changed
   export SOPS_AGE_KEY_FILE
   [ -n "${DOCKER_HOST:-}" ] && export DOCKER_HOST
