@@ -57,4 +57,15 @@ A3="$T/a3.log"
 AUDIT_ENABLED=0 AUDIT_LOG="$A3" cicd_audit ingest repo=x
 assert_eq    "disabled writes no log"     "$([ -f "$A3" ] && echo yes || echo no)" "no"
 
+# L4: control bytes (CR/ESC/...) in a field must be stripped, not just NL/TAB
+AUDIT_LOG="$T/l4.log" cicd_audit ev "job=build$(printf '\r')FAKEpusher$(printf '\033')[31m"
+assert_no_match "no CR in audit line"     "$(cat -v "$T/l4.log" 2>/dev/null)" '\^M'
+assert_no_match "no ESC in audit line"    "$(cat -v "$T/l4.log" 2>/dev/null)" '\^\['
+
+# L1: concurrent writers must NOT fork the chain (the bare fd-redirect didn't serialize)
+CL="$T/conc.log"
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do AUDIT_LOG="$CL" cicd_audit ev "n=$i" & done; wait
+assert_ok    "concurrent appends verify"  cicd_audit_verify "$CL"
+assert_eq    "all 12 concurrent entries"  "$(grep -c '' "$CL")" "12"
+
 summary

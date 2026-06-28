@@ -43,18 +43,30 @@ cicd_audit() {  # <event> [k=v ...]
   [ "${AUDIT_ENABLED:-1}" = 1 ] || return 0
   local logf="${AUDIT_LOG:-${RUNNER_BASE:-$HOME/runner}/audit.log}"
   local ev="${1:-?}"; shift 2>/dev/null || true
-  local ts fields payload prev h
+  local ts fields payload
   ts="$(_ts)"
-  fields="$(printf '%s' "$*" | tr '\n\t' '  ')"   # fields stay 1 line: no tab can forge a column
+  # L4: strip ALL control bytes from fields (not just NL/TAB) — CR/VT/FF/ESC could overwrite or
+  # color the line at the `ci-audit tail` render layer, spoofing which job/pusher an event names.
+  fields="$(printf '%s' "$*" | tr -d '[:cntrl:]')"
   payload="$(printf '%s\t%s\t%s' "$ts" "$ev" "$fields")"
-  {
-    command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null || true   # serialize on Linux; skip if absent
-    prev=""
-    [ -f "$logf" ] && prev="$(tail -n1 "$logf" 2>/dev/null | sed -n 's/.*[[:space:]]hash=\([0-9a-f]*\).*/\1/p')"
-    prev="${prev:-GENESIS}"
-    h="$(printf '%s%s' "$prev" "$payload" | _sha256_stdin)"
-    printf '%s\tprev=%s\thash=%s\n' "$payload" "$prev" "$h" >> "$logf"
-  } 9>>"${logf}.lock" 2>/dev/null || true
+  # L1: serialize the read-prev + append so concurrent writers can't fork the chain. flock on
+  # Linux; a portable mkdir-mutex where flock is absent (macOS/busybox) — the bare fd redirect
+  # alone does NOT serialize, which silently broke the chain under concurrent pushes.
+  if command -v flock >/dev/null 2>&1; then
+    { flock 9 2>/dev/null || true; _cicd_audit_append "$logf" "$payload"; } 9>>"${logf}.lock" 2>/dev/null || true
+  else
+    local _ld="${logf}.lock.d" _n=0
+    while ! mkdir "$_ld" 2>/dev/null; do _n=$((_n + 1)); [ "$_n" -gt 300 ] && break; sleep 0.02 2>/dev/null || sleep 1; done
+    _cicd_audit_append "$logf" "$payload"
+    rmdir "$_ld" 2>/dev/null || true
+  fi
+}
+# Append one chained entry. Caller MUST hold the audit lock (serializes read-prev + append).
+_cicd_audit_append() {  # <logf> <payload>
+  local prev=""
+  [ -f "$1" ] && prev="$(tail -n1 "$1" 2>/dev/null | sed -n 's/.*[[:space:]]hash=\([0-9a-f]*\).*/\1/p')"
+  prev="${prev:-GENESIS}"
+  printf '%s\tprev=%s\thash=%s\n' "$2" "$prev" "$(printf '%s%s' "$prev" "$2" | _sha256_stdin)" >> "$1"
 }
 # Verify the chain. Echoes "audit: OK (N entries)" + returns 0, or reports the first broken
 # entry + returns 1. Extracts prev/hash from the LAST \tprev=/\thash= so a field value that

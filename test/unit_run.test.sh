@@ -89,6 +89,11 @@ masked="$(printf '%s\n' "$materialized" | redact_log "$MASK2")"
 assert_no_match "multi-line key line 1 masked" "$masked" 'MIIabcdeflinetwo123'
 assert_no_match "multi-line key line 2 masked" "$masked" 'MIItulinethree456'
 assert_match    "multi-line key redacted"      "$masked" 'MASKED'
+# L2/L3: the rule count is bounded so a pathological secrets file can't fork unboundedly
+ENVF3="$W/env3"; MASK3="$W/mask3"; : > "$ENVF3"
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do printf 'SECRET_%s=valuevaluevalue%s\n' "$i" "$i" >> "$ENVF3"; done
+MASK_MAX_RULES=5 build_mask_script "$ENVF3" "$MASK3"
+assert_eq "mask rules capped at MASK_MAX_RULES" "$(grep -c '^s/' "$MASK3")" "5"
 
 suite "build_limits (cgroup when enforceable, ulimit fallback otherwise)"
 ULIMIT_NPROC=1024; ULIMIT_FSIZE=2147483648

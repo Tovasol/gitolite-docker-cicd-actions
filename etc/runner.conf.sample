@@ -50,6 +50,8 @@ CACHE_MAX_GB=20                # then size-cap the whole cache (LRU eviction)
 # repo its OWN cache subtree — closes cross-repo code-exec via shared tool config (CARGO_HOME,
 # GRADLE_USER_HOME, …), at the cost of dedup. Use per-repo if you run mutually-distrusting repos.
 CACHE_ISOLATION=shared        # shared | per-repo
+MASK_MAX_RULES=500            # cap secret-redaction rules per job (bounds a pathological secrets
+                              #   file from forking the mask builder / sed thousands of times)
 
 # --- behavior ---
 CANCEL_IN_PROGRESS=0                           # 1 = a new push kills the running job; 0 = coalesce

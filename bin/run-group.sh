@@ -153,8 +153,12 @@ _emit_mask_rule() { printf 's/%s/[MASKED]/g\n' "$(printf '%s' "$1" | sed 's/[][\
 build_mask_script() {  # <envfile> <out_sedscript>
   : > "$2"
   [ -f "$1" ] || return 0
-  local line val seg
+  # L2/L3: cap the number of secret ENTRIES processed and the multi-line SEGMENTS per entry, so
+  # a pathological secrets file (e.g. 20k keys) can't make build_mask_script fork thousands of
+  # times or the redactor's sed run thousands of rules per log line (host CPU / slot DoS).
+  local line val seg entries=0 emax="${MASK_MAX_RULES:-500}"
   while IFS= read -r line || [ -n "$line" ]; do
+    [ "$entries" -ge "$emax" ] && { log "${group:-?}: secrets exceed MASK_MAX_RULES=$emax — redaction capped"; break; }
     case "$line" in '#'*|'') continue ;; esac
     case "$line" in *=*) ;; *) continue ;; esac
     val="${line#*=}"
@@ -162,12 +166,11 @@ build_mask_script() {  # <envfile> <out_sedscript>
       \"*\") val="${val#\"}"; val="${val%\"}" ;;
       \'*\') val="${val#\'}"; val="${val%\'}" ;;
     esac
-    [ "${#val}" -ge 6 ] && _emit_mask_rule "$val" >> "$2"   # the single-line env-file form (literal \n)
-    # H6: multi-line secrets (PEM/SSH/age keys) materialize REAL newlines when a tool prints
-    # them (printf %b, openssl, writing to a file) — the single-line rule never matches that.
-    # Mask each \n-delimited segment too. (`*\\n*` matches a literal backslash-n in the value.)
+    [ "${#val}" -ge 6 ] && { _emit_mask_rule "$val" >> "$2"; entries=$((entries + 1)); }   # single-line form
+    # H6: multi-line secrets (PEM/SSH/age) materialize REAL newlines when a tool prints them;
+    # the single-line rule won't match. Mask each \n-segment too (capped at 200 lines/key).
     case "$val" in *\\n*)
-      printf '%b\n' "$val" | while IFS= read -r seg || [ -n "$seg" ]; do
+      printf '%b\n' "$val" | head -n 200 | while IFS= read -r seg || [ -n "$seg" ]; do
         [ "${#seg}" -ge 6 ] && _emit_mask_rule "$seg"
       done >> "$2" ;;
     esac
