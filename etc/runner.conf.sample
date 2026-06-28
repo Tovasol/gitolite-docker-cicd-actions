@@ -23,6 +23,9 @@ SLOT_WAIT_SECS=2                               # poll interval while waiting for
 # --- defaults (overridable per-job in .gitolite/ci.yml) ---
 DEFAULT_IMAGE=node:20-alpine
 DEFAULT_TIMEOUT=900                            # seconds; wall-clock kill
+TIMEOUT_MAX=86400                              # hard ceiling on a job's timeout (seconds): the
+                                               # per-job value is clamped to this, and 0/garbage
+                                               # falls back to DEFAULT_TIMEOUT (can't disable kill)
 DEFAULT_MEMORY=2g
 DEFAULT_PIDS=512
 DEFAULT_NETWORK=bridge                         # bridge | none

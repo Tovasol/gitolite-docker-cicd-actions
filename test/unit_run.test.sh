@@ -47,5 +47,16 @@ assert_eq "run: paths bypassed -> both branch-matching jobs"         "$(pb run)"
 assert_eq "run --job deploy-site: force just that one"               "$(pb run deploy-site)" "deploy-site"
 assert_eq "run --job smoke: force just that one"                     "$(pb run smoke)"       "smoke"
 
+suite "clamp_timeout (job timeout can't disable the wall-clock kill)"
+DEFAULT_TIMEOUT=900; TIMEOUT_MAX=86400
+assert_eq "normal value passes through"        "$(clamp_timeout 600)"          "600"
+assert_eq "empty -> default"                   "$(clamp_timeout '')"           "900"
+assert_eq "zero -> default (would disable)"    "$(clamp_timeout 0)"            "900"
+assert_eq "leading-zero zero -> default"       "$(clamp_timeout 00)"           "900"
+assert_eq "non-numeric -> default"             "$(clamp_timeout 'sleep')"      "900"
+assert_eq "suffix form rejected -> default"    "$(clamp_timeout '10m')"        "900"
+assert_eq "absurd value capped at MAX"         "$(clamp_timeout 999999999999)" "86400"
+assert_eq "exactly MAX allowed"                "$(clamp_timeout 86400)"        "86400"
+
 rm -rf "$W"
 summary

@@ -117,6 +117,16 @@ make_rundir() {  # <ts> <sha8> <job>
 # JSON string escape (backslash + doublequote) for the hand-rolled meta writer.
 jesc() { printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
+# clamp a job-controlled timeout (seconds) to a safe integer in 1..TIMEOUT_MAX. Empty / 0 /
+# non-numeric -> DEFAULT_TIMEOUT (a bare `timeout 0`/garbage would DISABLE the wall-clock kill).
+clamp_timeout() {  # <raw> -> echoes a safe integer
+  local t="${1:-}"
+  case "$t" in ''|*[!0-9]*) t="$DEFAULT_TIMEOUT" ;; esac
+  [ "$t" -ge 1 ] 2>/dev/null || t="$DEFAULT_TIMEOUT"
+  [ "$t" -le "${TIMEOUT_MAX:-86400}" ] 2>/dev/null || t="${TIMEOUT_MAX:-86400}"
+  printf '%s' "$t"
+}
+
 # Fat, single-line meta.json — the SOURCE OF TRUTH for a run (path is a dumb bucket).
 # Identity (META_*) is set once per run by the caller; this writes/overwrites the line
 # with the dynamic status/timing. NDJSON-friendly: one object, one line, duckdb/jq/sqlite
@@ -146,7 +156,9 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   local image timeout mem pids network runcmd ts dir name envfile rc outdir status_word
   local start_iso start_ns end_iso end_ns dur
   image="$(yq_str "$manifest" ".jobs.\"$job\".image")";     image="${image:-$DEFAULT_IMAGE}"
-  timeout="$(yq_str "$manifest" ".jobs.\"$job\".timeout")"; timeout="${timeout:-$DEFAULT_TIMEOUT}"
+  # job-controlled timeout (seconds): clamp_timeout rejects 0/garbage (which would DISABLE the
+  # wall-clock kill -> a job runs forever + exhausts a slot) and caps absurd values at TIMEOUT_MAX.
+  timeout="$(clamp_timeout "$(yq_str "$manifest" ".jobs.\"$job\".timeout")")"
   mem="$(yq_str "$manifest" ".jobs.\"$job\".memory")";      mem="${mem:-$DEFAULT_MEMORY}"
   pids="$(yq_str "$manifest" ".jobs.\"$job\".pids")";       pids="${pids:-$DEFAULT_PIDS}"
   network="$(yq_str "$manifest" ".jobs.\"$job\".network")"; network="${network:-$DEFAULT_NETWORK}"
