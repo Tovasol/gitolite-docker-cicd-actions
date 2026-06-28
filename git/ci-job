@@ -122,17 +122,19 @@ watch_status() {  # <repo> <sha> [job]
 }
 
 cmd_status() {
-  local scope="${1:-}"
-  # ci-status defaults to the lean view (jobs + recent + running) — no operator health probe,
-  # no leaking runner state to repo readers. Operators add --full on the box for the rest.
+  # over `ssh git@host ci-job status` there is no tty, so ci-status auto-detects no color.
+  # Forward an explicit --color/--no-color so `ci-job status --color` works without `ssh -t`.
+  # (NOT --full: that's the operator-only view; users get the lean, leak-free dashboard.)
+  local scope="" copt=""
+  while [ $# -gt 0 ]; do case "$1" in --color|--no-color) copt="$1" ;; *) scope="$1" ;; esac; shift; done
   if [ -n "$scope" ]; then
     valid_repo "$scope" || die "invalid repo '$scope'"
     can "$scope" R || die "no READ access to '$scope'"
-    proxy ci-status --repos "$scope"
+    proxy ci-status ${copt:+"$copt"} --repos "$scope"
   else
     local repos; repos="$(accessible R | tr '\n' ' ')"
     [ -n "${repos// }" ] || { echo "ci-job: you have no readable repos"; return 0; }
-    proxy ci-status --repos "$repos"
+    proxy ci-status ${copt:+"$copt"} --repos "$repos"
   fi
 }
 
