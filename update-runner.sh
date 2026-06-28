@@ -38,11 +38,34 @@ esac
 [ -d "$RUNNER_REPO" ] || { echo "no bare repo at $RUNNER_REPO" >&2; exit 1; }
 
 echo "→ [1/5] source ← $RUNNER_REPO ($BRANCH)"
-# This repo IS the runner (its tree is the source root — no cicd-runner/ subdir), so
-# archive the whole tree into ~/src. (Historically the runner lived under cicd-runner/
-# inside the agent-forge repo and was extracted with --strip-components=1.)
-git --git-dir="$RUNNER_REPO" archive "$BRANCH" \
-  | sudo -u "$RUNNER_USER" tar -x -C "$RUN/src"
+SRC="$RUN/src"
+# Guard the path before any rm/mv (a wrong/empty $RUN must never delete arbitrary dirs):
+case "$RUN" in /home/*|/var/lib/*) ;; *) echo "update-runner: refusing unexpected runner home '$RUN'" >&2; exit 1 ;; esac
+[ "$(basename "$SRC")" = src ] || { echo "update-runner: refusing src path '$SRC'" >&2; exit 1; }
+# Capture the running updater's hash BEFORE we overwrite ~/src, so we can detect a self-update.
+SELF="$SRC/update-runner.sh"
+pre=""; [ -f "$SELF" ] && pre="$( (sha256sum "$SELF" 2>/dev/null || true) | cut -d' ' -f1)"
+# Atomic-swap refresh: extract into a staging dir, then RENAME into place. The live ~/src is
+# renamed to ~/src.prev (never deleted in place -> instant rollback), and the only rm targets
+# are uniquely-suffixed derived paths. This also drops files deleted upstream (no ghosts) —
+# unlike a `tar -x` overlay onto the existing tree, which leaves stale files behind.
+STAGE="$SRC.stage.$$"
+sudo -u "$RUNNER_USER" rm -rf -- "$STAGE"
+sudo -u "$RUNNER_USER" mkdir -p -- "$STAGE"
+git --git-dir="$RUNNER_REPO" archive "$BRANCH" | sudo -u "$RUNNER_USER" tar -x -C "$STAGE"
+sudo -u "$RUNNER_USER" rm -rf -- "$SRC.prev"
+[ -d "$SRC" ] && sudo -u "$RUNNER_USER" mv -- "$SRC" "$SRC.prev"
+sudo -u "$RUNNER_USER" mv -- "$STAGE" "$SRC"
+
+# Self-update: if update-runner.sh itself changed in this release, hand off to the new copy so
+# it applies on THIS run (ends the "run it twice" chicken-and-egg). _UR_REEXEC guards a loop.
+if [ -z "${_UR_REEXEC:-}" ] && [ -f "$SELF" ]; then
+  post="$( (sha256sum "$SELF" 2>/dev/null || true) | cut -d' ' -f1)"
+  if [ -n "$post" ] && [ "$post" != "$pre" ]; then
+    echo "  update-runner.sh changed in this release — re-exec'ing the new version"
+    exec env _UR_REEXEC=1 RUNNER_USER="$RUNNER_USER" GIT_USER="$GIT_USER" BRANCH="$BRANCH" "$SELF" "$@"
+  fi
+fi
 
 echo "→ [2/5] install.sh (scripts + dirs)"
 sudo -iu "$RUNNER_USER" bash -lc 'cd ~/src && ./install.sh'
