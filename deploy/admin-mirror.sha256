@@ -1,0 +1,5 @@
+# Canonical sha256 of files MIRRORED into the gitolite-admin repo. If a line's hash
+# no longer matches the file, you changed a mirrored source: re-sync the gitolite-admin
+# copy AND regenerate this manifest (see test/unit_adminmirror.test.sh for the command).
+bin/post-receive	1b64c4db049079292bf97a17784fbd78d5cdc541ed6c940bd04da88555438495
+git/relnotes-hook	536575113e338f5d02a5f743656df39a167315e9fd3540b72ce5a755d678bdf6
