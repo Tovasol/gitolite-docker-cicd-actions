@@ -54,4 +54,28 @@ assert_match "audit names first recipient"    "$audit" 'tovasol\+cicdnotificatio
 assert_match "audit names second recipient"   "$audit" 'notify2\+cicdnotification@gmail\.com'
 assert_match "audit joins recipients with comma+space" "$audit" 'gmail\.com, notify2'
 
+suite "notify-email open-relay guard (H5)"
+RT="$(mktemp -d)"; mkdir -p "$RT/bin"
+cat > "$RT/bin/curl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > "$RT/curl.args"; exit 0
+EOF
+chmod +x "$RT/bin/curl"
+# project supplies recipient + spoofed From but NO smtp creds; host supplies the OPERATOR creds
+printf 'NOTIFY_TO=attacker@evil.example\nMAILER_EMAIL=ceo@trusted-bank.example\n' > "$RT/proj.env"
+printf 'SMTP_USER_NAME=operator-ci@company.com\nSMTP_USER_PWD=OperatorAppPassword\n'  > "$RT/host.env"
+rl="$RT/output.log"; printf 'boom\n' > "$rl"
+printf '{"repo":"x","branch":"main","sha":"d","job":"smoke","event":"push","pusher":"git"}\n' > "$RT/meta.json"
+out="$(PATH="$RT/bin:$PATH" CICD_NOTIFY_ENV="$RT/proj.env" CICD_NOTIFY_HOST_ENV="$RT/host.env" \
+  bash "$HERE/../bin/notify-email" smoke "error: boom" "$rl")"
+assert_match "open-relay refused"          "$out" 'REFUSED'
+assert_eq    "no curl call when refused"   "$([ -f "$RT/curl.args" ] && echo sent || echo none)" "none"
+# control: a repo that brings its OWN smtp creds may mail its own recipient (curl runs)
+printf 'SMTP_USER_NAME=proj-ci@evil.example\nSMTP_USER_PWD=projpass\n' >> "$RT/proj.env"
+rm -f "$RT/curl.args"
+out2="$(PATH="$RT/bin:$PATH" CICD_NOTIFY_ENV="$RT/proj.env" CICD_NOTIFY_HOST_ENV="$RT/host.env" \
+  bash "$HERE/../bin/notify-email" smoke "error: boom" "$rl")"
+assert_eq    "project-own-creds allowed"   "$([ -f "$RT/curl.args" ] && echo sent || echo none)" "sent"
+rm -rf "$RT"
+
 summary

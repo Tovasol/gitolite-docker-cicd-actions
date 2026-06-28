@@ -15,7 +15,7 @@ set -uo pipefail
 
 group="${1:-?}"; status="${2:-?}"; logpath="${3:-}"
 PROJ="${CICD_NOTIFY_ENV:-}"
-HOST_DEF="/etc/cicd-runner/notify.env"
+HOST_DEF="${CICD_NOTIFY_HOST_ENV:-/etc/cicd-runner/notify.env}"
 
 # getval KEY FILE — extract KEY=val from a dotenv/KEY=VAL file (no sourcing; quote-safe)
 getval() {
@@ -31,6 +31,11 @@ read_var() {
     [ -n "${2:-}" ] && { v="$(getval "$2" "$f")"; [ -n "$v" ] && { printf '%s' "$v"; return; }; }
   done
 }
+# which tier supplied KEY (or ALIAS): 'project' | 'host' | '' — used to forbid mixing tiers (H5)
+tier() {
+  [ -n "$(getval "$1" "$PROJ")" ] || { [ -n "${2:-}" ] && [ -n "$(getval "$2" "$PROJ")" ]; } && { printf project; return; }
+  [ -n "$(getval "$1" "$HOST_DEF")" ] || { [ -n "${2:-}" ] && [ -n "$(getval "$2" "$HOST_DEF")" ]; } && { printf host; return; }
+}
 
 HOST="$(read_var SMTP_HOST_ADDR SMTP_HOST)"; HOST="${HOST:-smtp.gmail.com}"
 PORT="$(read_var SMTP_HOST_PORT SMTP_PORT)"; PORT="${PORT:-587}"
@@ -39,6 +44,17 @@ PASS="$(read_var SMTP_USER_PWD  SMTP_PASS)"
 TO="$(read_var NOTIFY_TO MAILER_EMAIL)"; [ -z "$TO" ] && TO="$USER"
 FROM="$(read_var MAILER_EMAIL NOTIFY_FROM)"; FROM="${FROM:-$USER}"
 [ -n "$USER" ] && [ -n "$PASS" ] && [ -n "$TO" ] || exit 0   # not configured -> skip silently
+
+# H5 open-relay guard: a repo's secrets MUST NOT borrow the operator's HOST SMTP credentials to
+# mail a project-chosen recipient or spoof a project-chosen From (authenticated relay that passes
+# the operator's SPF/DKIM/DMARC). If the creds are the host's but recipient/From came from the
+# project tier, refuse. A repo that brings its OWN SMTP creds (project tier) may use its own To/From.
+if [ "$(tier SMTP_USER_NAME SMTP_USER)" = host ]; then
+  if [ "$(tier NOTIFY_TO MAILER_EMAIL)" = project ] || [ "$(tier MAILER_EMAIL NOTIFY_FROM)" = project ]; then
+    printf 'notify-email: REFUSED — project-supplied recipient/From with host SMTP creds (open-relay guard, H5)\n'
+    exit 0
+  fi
+fi
 
 # scheme by port: 465 = implicit TLS (smtps); else STARTTLS on smtp:// (587/25)
 if [ "$PORT" = "465" ]; then url="smtps://$HOST:$PORT"; else url="smtp://$HOST:$PORT"; fi
