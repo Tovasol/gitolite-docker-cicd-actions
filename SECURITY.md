@@ -94,7 +94,12 @@ These are deliberate trade-offs for a small-scale, trusted-operator tool:
    container escape needed. *Mitigation: protect the deploy branch (admin-only) **and** set
    `UPDATE_REQUIRE_SIGNED=1` with the trusted signer's key in root's gpg keyring (the script
    then verifies the branch tip is a signed commit before any root action). Treat deploy-
-   branch write access as equivalent to root.*
+   branch write access as equivalent to root.* Note the **root-executed entrypoint itself is
+   hardened**: root runs the root-owned `/usr/local/sbin/cicd-update-runner` (refreshed from the
+   signature-verified tree each run), and the script REFUSES to run as root from a non-root-owned
+   path — so a cicd-runner foothold (any repo writer, via CI) can no longer trojan the updater on
+   disk to escalate to root *without* pushing the protected branch. The deploy branch stays the
+   only path to root.
 
 ## Operator responsibilities
 

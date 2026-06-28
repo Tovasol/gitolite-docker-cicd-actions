@@ -281,20 +281,30 @@ unlock-ci && ci-status
 One command, run as **root**, updates *everything regardless of what changed* —
 scripts, crontab, gitolite hook, and the boot/init file:
 ```bash
-sudo /home/cicd-runner/src/update-runner.sh tovasol/gitolite-docker-cicd-actions
+sudo /usr/local/sbin/cicd-update-runner tovasol/gitolite-docker-cicd-actions
 #   add --restart ONLY when init/*.openrc changed (bounces docker, kills builds)
 ```
-`update-runner.sh` (ships at the repo root) is idempotent, never clobbers
-`runner.conf`, needs no key re-post (the live ramfs key survives — only **reboot**
-wipes it, §3), and drains deferred work (`ci-recover`) at the end. In-flight builds
-survive (`install` swaps inodes; a running `run-group.sh` keeps its copy).
+Root runs the **root-owned** `/usr/local/sbin/cicd-update-runner`, never the
+cicd-runner-writable `~cicd-runner/src/update-runner.sh` (a CI job runs as cicd-runner
+and could trojan that copy → root). The script refuses to run as root from a
+non-root-owned path and re-installs the root-owned entrypoint from the
+signature-verified tree on every run. It is idempotent, never clobbers `runner.conf`,
+needs no key re-post (the live ramfs key survives — only **reboot** wipes it, §3), and
+drains deferred work (`ci-recover`) at the end. In-flight builds survive (`install`
+swaps inodes; a running `run-group.sh` keeps its copy).
 
 It takes a single input — the bare repo name (or a full path). Override the defaults
-via env if your setup differs: `RUNNER_USER`, `GIT_USER`, `BRANCH` (default `main`).
+via env if your setup differs: `RUNNER_USER`, `GIT_USER`, `BRANCH` (default `release`).
 
-> **First time / bootstrapping the script itself:** if `~cicd-runner/src/update-runner.sh`
-> isn't there yet, refresh the source once by hand (step 1 below), then use the
-> one-liner above for every update after.
+> **First time / bootstrapping the entrypoint:** if `/usr/local/sbin/cicd-update-runner`
+> isn't there yet, install it once from a **root-owned** checkout (NOT the live
+> `~cicd-runner/src`, which a CI job could have tampered with):
+> ```bash
+> sudo git clone <runner-repo>.git /root/cicd-bootstrap
+> sudo sh -c 'cd /root/cicd-bootstrap && git checkout release \
+>   && install -Dm755 -o root -g root ./update-runner.sh /usr/local/sbin/cicd-update-runner'
+> ```
+> then use the one-liner above for every update after.
 
 What it does, as the equivalent manual block (run as **root**) — useful for audit or
 if you'd rather not use the wrapper:

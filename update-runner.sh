@@ -2,7 +2,15 @@
 # update-runner.sh — refresh the WHOLE cicd-runner install from gitolite, in one shot.
 # Run as ROOT (install ops are root's job; a separated admin can't reach git's dirs).
 #
-#   sudo /home/cicd-runner/src/update-runner.sh <runner-repo-name> [--restart]
+#   sudo /usr/local/sbin/cicd-update-runner <runner-repo-name> [--restart]
+#
+# Root runs the ROOT-OWNED installed copy, never ~cicd-runner/src/update-runner.sh (which a CI
+# job, running as cicd-runner, could trojan -> root). This script refuses to run as root from a
+# non-root-owned path and re-installs the root-owned entrypoint from the signature-verified tree
+# on every run. BOOTSTRAP (one-time, as root, from a TRUSTED checkout — NOT the live ~/src):
+#   git clone <runner-repo> /root/cicd-bootstrap && cd /root/cicd-bootstrap && git checkout <signed-release>
+#   install -Dm755 -o root -g root ./update-runner.sh /usr/local/sbin/cicd-update-runner
+#   sudo /usr/local/sbin/cicd-update-runner <runner-repo-name>
 #
 # Updates everything regardless of what changed:
 #   1) source (archive-push out of the bare repo — same mechanism the system uses)
@@ -17,10 +25,47 @@
 # script itself changed.
 set -euo pipefail
 
+TRUSTED_ENTRYPOINT=/usr/local/sbin/cicd-update-runner
+
+# CRITICAL (deploy escalation): the script ROOT executes must not be writable by any non-root
+# user. ~cicd-runner/src is cicd-runner-owned, and CI jobs run AS cicd-runner — so a repo writer
+# could overwrite ~cicd-runner/src/update-runner.sh and get ROOT the next time the operator runs
+# `sudo update-runner`. UPDATE_REQUIRE_SIGNED can't stop that: it verifies the git BRANCH, not the
+# on-disk file root is currently executing (the gate lives INSIDE the file under question). So
+# root must invoke the installed, root-owned copy ($TRUSTED_ENTRYPOINT). Refuse any path whose
+# file or ancestor dirs are non-root-owned or group/other-writable.
+path_root_trusted() {  # <path>
+  local p; p="$(readlink -f "$1" 2>/dev/null)" || return 1
+  [ -n "$p" ] || return 1
+  while :; do
+    local own mode
+    own="$(stat -c '%u' "$p" 2>/dev/null || stat -f '%u' "$p" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$p" 2>/dev/null || stat -f '%Lp' "$p" 2>/dev/null)" || return 1
+    [ "$own" = 0 ] || return 1                       # must be owned by root
+    [ "$(( 8#$mode & 0022 ))" -eq 0 ] || return 1    # reject group/other-writable
+    [ "$p" = / ] && break
+    p="$(dirname "$p")"
+  done
+}
+
+# testability: `UPDATE_RUNNER_LIB=1 . update-runner.sh` loads the helpers above, runs nothing.
+if [ -n "${UPDATE_RUNNER_LIB:-}" ]; then return 0 2>/dev/null || exit 0; fi
+
 [ "$(id -u)" -eq 0 ] || { echo "update-runner: run as root" >&2; exit 1; }
 
 REPO="${1:?usage: update-runner <runner-repo-name> [--restart]}"
 RESTART=0; [ "${2:-}" = "--restart" ] && RESTART=1
+
+if [ -z "${UPDATE_TRUST_OK:-}" ] && ! path_root_trusted "$0"; then
+  echo "update-runner: REFUSING to run as root from a non-root-owned path:" >&2
+  echo "    $0" >&2
+  echo "  A non-root user can modify this file (e.g. a CI job running as cicd-runner), so running" >&2
+  echo "  it as root is a privilege-escalation vector. Install + run the root-owned copy instead:" >&2
+  echo "    sudo install -Dm755 -o root -g root '$0' $TRUSTED_ENTRYPOINT   # one-time, from a TRUSTED checkout" >&2
+  echo "    sudo $TRUSTED_ENTRYPOINT $REPO" >&2
+  echo "  (UPDATE_TRUST_OK=1 bypasses this only for an initial bootstrap from a root-owned clone.)" >&2
+  exit 1
+fi
 
 RUNNER_USER="${RUNNER_USER:-cicd-runner}"
 GIT_USER="${GIT_USER:-git}"
@@ -75,24 +120,33 @@ sudo -u "$RUNNER_USER" rm -rf -- "$SRC.prev"
 [ -d "$SRC" ] && sudo -u "$RUNNER_USER" mv -- "$SRC" "$SRC.prev"
 sudo -u "$RUNNER_USER" mv -- "$STAGE" "$SRC"
 
-# Self-update: if update-runner.sh itself changed in this release, hand off to the new copy so
-# it applies on THIS run (ends the "run it twice" chicken-and-egg). _UR_REEXEC guards a loop.
-if [ -z "${_UR_REEXEC:-}" ] && [ -f "$SELF" ]; then
-  post="$( (sha256sum "$SELF" 2>/dev/null || true) | cut -d' ' -f1)"
-  if [ -n "$post" ] && [ "$post" != "$pre" ]; then
-    echo "  update-runner.sh changed in this release — re-exec'ing the new version"
-    exec env _UR_REEXEC=1 RUNNER_USER="$RUNNER_USER" GIT_USER="$GIT_USER" BRANCH="$BRANCH" \
-      UPDATE_REQUIRE_SIGNED="${UPDATE_REQUIRE_SIGNED:-0}" "$SELF" "$@"
-  fi
-fi
-
-# H4 leg-2: snapshot the files ROOT installs into a root-owned dir NOW, before dropping to the
-# cicd-runner user for install.sh — so a cicd-runner foothold during install.sh cannot swap what
-# root installs. ~/src stays cicd-runner-owned (install.sh writes it); these snapshot copies do not.
+# H4 leg-2 + deploy-escalation fix: snapshot the files ROOT installs/executes into a ROOT-OWNED
+# dir NOW, straight from the just-extracted (signature-gated) $SRC — before dropping to the
+# cicd-runner user for install.sh, so a cicd-runner foothold during install.sh cannot swap what
+# root installs. This INCLUDES update-runner.sh itself: root must never execute/re-exec the
+# cicd-runner-writable ~/src copy (a CI job could trojan it -> root). ~/src stays cicd-runner-owned
+# (install.sh writes it); these snapshot copies + the installed entrypoint do not.
 ROOTSNAP="$(mktemp -d)"; chmod 700 "$ROOTSNAP"
 trap 'rm -rf "$ROOTSNAP"' EXIT
 cp -f "$SRC/git/ci-job" "$ROOTSNAP/ci-job"
 cp -f "$SRC/init/docker-rootless-cicd-runner.openrc" "$ROOTSNAP/openrc"
+cp -f "$SRC/update-runner.sh" "$ROOTSNAP/update-runner.sh"
+
+# Refresh the ROOT-OWNED entrypoint from the verified tree — the only copy root should ever run.
+install -Dm755 -o root -g root "$ROOTSNAP/update-runner.sh" "$TRUSTED_ENTRYPOINT"
+
+# Self-update: if update-runner.sh changed in this release, hand off to the freshly-installed
+# ROOT-OWNED entrypoint (NOT ~/src) so it applies on THIS run without trusting a writable file.
+# _UR_REEXEC guards the loop; UPDATE_TRUST_OK lets the re-exec'd root-owned copy pass the guard.
+if [ -z "${_UR_REEXEC:-}" ]; then
+  post="$( (sha256sum "$ROOTSNAP/update-runner.sh" 2>/dev/null || true) | cut -d' ' -f1)"
+  if [ -n "$post" ] && [ "$post" != "$pre" ]; then
+    echo "  update-runner.sh changed — re-exec'ing the root-owned $TRUSTED_ENTRYPOINT"
+    exec env _UR_REEXEC=1 UPDATE_TRUST_OK=1 RUNNER_USER="$RUNNER_USER" GIT_USER="$GIT_USER" \
+      BRANCH="$BRANCH" UPDATE_REQUIRE_SIGNED="${UPDATE_REQUIRE_SIGNED:-0}" \
+      "$TRUSTED_ENTRYPOINT" "$@"
+  fi
+fi
 
 echo "→ [2/5] install.sh (scripts + dirs)"
 sudo -iu "$RUNNER_USER" bash -lc 'cd ~/src && ./install.sh'
