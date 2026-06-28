@@ -58,5 +58,26 @@ assert_eq "suffix form rejected -> default"    "$(clamp_timeout '10m')"        "
 assert_eq "absurd value capped at MAX"         "$(clamp_timeout 999999999999)" "86400"
 assert_eq "exactly MAX allowed"                "$(clamp_timeout 86400)"        "86400"
 
+suite "secret redaction (build_mask_script + redact_log)"
+ENVF="$W/env"; MASK="$W/mask"
+cat > "$ENVF" <<'DOTENV'
+# a comment line is ignored
+CLOUDFLARE_API_TOKEN=supersecrettoken123
+SHORT=ab
+QUOTED="quoted-secret-value"
+WITH_SLASH=aa/bb/cc/dd
+DOTENV
+build_mask_script "$ENVF" "$MASK"
+masked="$(printf 'tok=supersecrettoken123 q=quoted-secret-value s=aa/bb/cc/dd end\n' | redact_log "$MASK")"
+assert_no_match "long token masked"        "$masked" 'supersecrettoken123'
+assert_no_match "quoted value masked"      "$masked" 'quoted-secret-value'
+assert_no_match "value with slashes masked" "$masked" 'aa/bb/cc/dd'
+assert_match    "MASKED marker present"    "$masked" 'MASKED'
+# short value (<6) is NOT masked — would corrupt logs by masking common tokens
+notmasked="$(printf 'label ab here\n' | redact_log "$MASK")"
+assert_match    "short value left intact"  "$notmasked" 'label ab here'
+# no maskfile (no secrets) -> passthrough unchanged
+assert_eq "absent maskfile -> passthrough" "$(printf 'nothing secret\n' | redact_log /no/such/file)" "nothing secret"
+
 rm -rf "$W"
 summary

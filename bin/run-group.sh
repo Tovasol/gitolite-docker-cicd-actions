@@ -127,6 +127,33 @@ clamp_timeout() {  # <raw> -> echoes a safe integer
   printf '%s' "$t"
 }
 
+# Build a sed script that masks every secret VALUE (>= 6 chars) from a decrypted dotenv file,
+# so a secret a job prints never reaches output.log — and thus never reaches `ci-log` or the
+# notify email's log tail (which reads the now-redacted log). env-file values are single-line
+# by construction, so per-line sed suffices. Short values (<6) are skipped to avoid masking
+# common tokens and corrupting logs.
+build_mask_script() {  # <envfile> <out_sedscript>
+  : > "$2"
+  [ -f "$1" ] || return 0
+  local line val esc
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '#'*|'') continue ;; esac
+    case "$line" in *=*) ;; *) continue ;; esac
+    val="${line#*=}"
+    case "$val" in
+      \"*\") val="${val#\"}"; val="${val%\"}" ;;
+      \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    [ "${#val}" -ge 6 ] || continue
+    esc="$(printf '%s' "$val" | sed 's/[][\\/.^$*]/\\&/g')"   # escape BRE metachars + delim
+    printf 's/%s/[MASKED]/g\n' "$esc" >> "$2"
+  done < "$1"
+}
+# Redact stdin -> stdout via a mask script; passthrough (cat) when there are no secrets.
+redact_log() {  # <sedscript>
+  if [ -s "${1:-}" ]; then sed -f "$1"; else cat; fi
+}
+
 # Fat, single-line meta.json — the SOURCE OF TRUTH for a run (path is a dumb bucket).
 # Identity (META_*) is set once per run by the caller; this writes/overwrites the line
 # with the dynamic status/timing. NDJSON-friendly: one object, one line, duckdb/jq/sqlite
@@ -195,6 +222,13 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
     fi
     rm -f "$dir/secrets.err"
   fi
+  # Build the secret-redaction filter from the decrypted env so anything the job prints that
+  # contains a secret value is masked before it lands in output.log (and the notify log tail).
+  local maskfile=""
+  if [ -n "$envfile" ]; then
+    maskfile="$(mktemp -p "${SHM_DIR:-/dev/shm}" cicd.mask.XXXXXX)"
+    build_mask_script "$envfile" "$maskfile"
+  fi
 
   outdir="$dir/cicd-out"; mkdir -p "$outdir"
   {
@@ -220,16 +254,16 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
       -v "$RUNNER_BASE/lib/cicd.sh:/cicd/lib.sh:ro" -v "$outdir:/cicd/out" \
       -v "$CACHE:/cache" -v "$work:/work" -w /work \
       ${envfile:+--env-file "$envfile"} \
-      "$image" sh -c "$runcmd" \
-      >>"$dir/output.log" 2>&1
-  rc=$?
+      "$image" sh -c "$runcmd" 2>&1 \
+    | redact_log "$maskfile" >>"$dir/output.log"
+  rc=${PIPESTATUS[0]}
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; rc=124; fi
   if [ "$rc" -eq 124 ]; then status_word=timeout; else status_word="exit:$rc"; fi
   end_iso="$(_ts)"; end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))
   emit_meta "$dir/meta.json" "$status_word" "$rc" "$end_iso" "$end_ns" "$dur"
   cicd_flush_outbox "$outdir/notify" "$rc" "$dir" "$group/$job" "$envfile"
   [ "$rc" -eq 0 ] && log "$group/$job: done" || log "$group/$job: FAILED $status_word"
-  [ -n "$envfile" ] && rm -f "$envfile"
+  [ -n "$envfile" ] && rm -f "$envfile"; [ -n "$maskfile" ] && rm -f "$maskfile"
   return "$rc"
 }
 
@@ -315,6 +349,11 @@ run_teardown() {  # <oldrev> <pusher>
     envfile="$(mktemp -p "${SHM_DIR:-/dev/shm}" cicd.env.XXXXXX)"
     sops -d --output-type dotenv "$secsrc" > "$envfile" 2>/dev/null || { rm -f "$envfile"; envfile=""; }
   fi
+  local maskfile=""
+  if [ -n "$envfile" ]; then
+    maskfile="$(mktemp -p "${SHM_DIR:-/dev/shm}" cicd.mask.XXXXXX)"
+    build_mask_script "$envfile" "$maskfile"
+  fi
 
   mkdir -p "$ENVS"; outdir="$dir/cicd-out"; mkdir -p "$outdir"
   date -u +%s > "$ENVS/last_attempt"
@@ -334,9 +373,9 @@ run_teardown() {  # <oldrev> <pusher>
       -v "$RUNNER_BASE/lib/cicd.sh:/cicd/lib.sh:ro" -v "$outdir:/cicd/out" \
       "${mountwork[@]}" \
       ${envfile:+--env-file "$envfile"} \
-      "$image" sh -c "$runcmd" \
-      >>"$dir/output.log" 2>&1
-  rc=$?
+      "$image" sh -c "$runcmd" 2>&1 \
+    | redact_log "$maskfile" >>"$dir/output.log"
+  rc=${PIPESTATUS[0]}
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; rc=1; fi
   end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))
   emit_meta "$dir/meta.json" "exit:$rc" "$rc" "$(_ts)" "$end_ns" "$dur"
@@ -354,7 +393,7 @@ run_teardown() {  # <oldrev> <pusher>
     cicd_flush_outbox "$outdir/notify" "$rc" "$dir" "$group teardown NEEDS OPERATOR (ci-teardown)" "$envfile"
     log "$group: teardown FAILED ($rc) — source+state KEPT, no auto-retry"
   fi
-  [ -n "$envfile" ] && rm -f "$envfile"
+  [ -n "$envfile" ] && rm -f "$envfile"; [ -n "$maskfile" ] && rm -f "$maskfile"
   [ -n "$work" ] && rm -rf "$work"
   return "$rc"
 }
