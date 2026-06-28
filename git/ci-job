@@ -23,6 +23,10 @@ ZERO=0000000000000000000000000000000000000000
 
 die() { echo "ci-job: $*" >&2; exit 1; }
 can() { gitolite access -q "$1" "$GL_USER" "$2" >/dev/null 2>&1; }   # can <repo> <R|W>
+# A safe gitolite repo name: only [A-Za-z0-9._/-], no traversal, no leading/trailing slash.
+# Everything downstream (cicd-ingest paths, ci-status duckdb `repo IN (...)`) trusts this, so
+# a status/log/run arg MUST pass before it ever reaches a path or a SQL literal (closes H1).
+valid_repo() { case "${1:-}" in ''|*[!A-Za-z0-9._/-]*|*..*|/*|*/) return 1 ;; *) return 0 ;; esac; }
 repo_gitdir() {  # <repo> -> bare repo path
   local base; base="$(gitolite query-rc GL_REPO_BASE 2>/dev/null || true)"
   [ -n "$base" ] || base="$HOME/repositories"
@@ -36,11 +40,12 @@ repo_gitdir() {  # <repo> -> bare repo path
 # rows whose flags include the perm, then intersect with physical repos to drop the
 # wild-card pattern rows (CREATOR/..* etc). GL_USER is inherited from this command's env.
 accessible() {  # <R|W>
-  # ONE `gitolite info` pass (authoritative; same engine as `gitolite access`). We no longer
-  # intersect with list-phy-repos to strip wildcard patterns (CREATOR/..* etc): ci-status
-  # scopes by `repo IN (...)` EXACT-match, so pattern strings are inert (match no runs).
-  # One fork, not two — shaves a gitolite startup off every no-arg `ci-job status`.
-  gitolite info 2>/dev/null | awk -F '\t' -v p="$1" 'NF==2 && $1 ~ p {print $2}' || :
+  # ONE `gitolite info` pass (authoritative; same engine as `gitolite access`), then keep only
+  # well-formed CONCRETE repo names. `gitolite info` also lists wildcard PATTERN rows
+  # (CREATOR/..*, dev/..*) which contain glob metacharacters; valid_repo drops them so a
+  # pattern string can never reach ci-status's SQL or a path (H1 hardening).
+  gitolite info 2>/dev/null | awk -F '\t' -v p="$1" 'NF==2 && $1 ~ p {print $2}' \
+    | while IFS= read -r r; do valid_repo "$r" && printf '%s\n' "$r"; done || :
 }
 proxy() { sudo -n -u "$RUNNER_USER" "$RUNNER_BIN/$1" "${@:2}"; }   # read-only proxy into cicd-runner
 
@@ -121,6 +126,7 @@ cmd_status() {
   # ci-status defaults to the lean view (jobs + recent + running) — no operator health probe,
   # no leaking runner state to repo readers. Operators add --full on the box for the rest.
   if [ -n "$scope" ]; then
+    valid_repo "$scope" || die "invalid repo '$scope'"
     can "$scope" R || die "no READ access to '$scope'"
     proxy ci-status --repos "$scope"
   else
@@ -133,6 +139,7 @@ cmd_status() {
 cmd_log() {
   [ $# -ge 1 ] || die "usage: ci-job log <repo> (<branch>|<job>|<RUN-DIR>) [-f]"
   local repo="$1"; shift
+  valid_repo "$repo" || die "invalid repo '$repo'"
   can "$repo" R || die "no READ access to '$repo'"
   proxy ci-log "$repo" "$@"
 }

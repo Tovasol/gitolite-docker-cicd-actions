@@ -141,6 +141,16 @@ assert_match "log proxies ci-log for R-only repo"   "$(cat "$REC")" 'ci-log tova
 assert_ne    "log on unreadable repo fails"     "$rc" 0
 assert_eq    "no ci-log call on denial"         "$(grep -c '^ci-log' "$REC")" 0
 
+suite "ci-job status/log reject injection args (H1 SQLi)"
+# a SQLi payload as the repo/scope arg must be rejected BEFORE it reaches ci-status's SQL.
+: > "$REC"; out="$(run_cijob alice status "tovasol/app')OR(1=1)AND(''='" 2>&1)"; rc=$?
+assert_ne    "SQLi scope rejected"              "$rc" 0
+assert_match "names invalid repo"               "$out" 'invalid repo'
+assert_eq    "no ci-status call on bad scope"   "$(grep -c '^ci-status' "$REC")" 0
+: > "$REC"; out="$(run_cijob alice log "tovasol/app')OR(1=1" deploy 2>&1)"; rc=$?
+assert_ne    "SQLi log repo rejected"           "$rc" 0
+assert_eq    "no ci-log call on bad repo"       "$(grep -c '^ci-log' "$REC")" 0
+
 suite "ci-job run --watch (polls status, no queue bypass)"
 rm -f "$M/poll.n"
 out="$(GL_USER=alice PATH="$STUB:$PATH" HOME="$M" CICD_RUNNER_BIN="$RB" \

@@ -115,9 +115,17 @@ ENGINE=none; have duckdb && ENGINE=duckdb
 REPO_FILTER=""
 if [ -n "$REPOS" ]; then
   RUNS_SRC="'$RUNNER_BASE/runs/**/meta.json'"
-  _in=""; for _rp in $REPOS; do _in="${_in:+$_in,}'$_rp'"; done
+  _in=""
+  for _rp in $REPOS; do
+    # H1: the git->cicd-runner sudo bridge lets `git` invoke ci-status DIRECTLY, so --repos is
+    # untrusted. A repo name is only [A-Za-z0-9._/-]; drop anything else before it becomes a
+    # DuckDB string literal — no quote/paren/space can reach the SQL, so no injection.
+    case "$_rp" in ''|*[!A-Za-z0-9._/-]*|*..*) continue ;; esac
+    _in="${_in:+$_in,}'$_rp'"
+  done
   [ -n "$_in" ] && REPO_FILTER="AND repo IN ($_in)"
 else
+  case "$SCOPE" in *[!A-Za-z0-9._/-]*|*..*) SCOPE="" ;; esac   # scope feeds a glob-path literal — sanitize
   RUNS_SRC="'$RUNNER_BASE/runs/${SCOPE:+$SCOPE/}**/meta.json'"
 fi
 DATA_CTE="WITH data AS (SELECT *, regexp_replace(filename,'/meta\.json\$','') AS dir
