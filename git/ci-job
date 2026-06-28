@@ -36,9 +36,11 @@ repo_gitdir() {  # <repo> -> bare repo path
 # rows whose flags include the perm, then intersect with physical repos to drop the
 # wild-card pattern rows (CREATOR/..* etc). GL_USER is inherited from this command's env.
 accessible() {  # <R|W>
-  gitolite info 2>/dev/null \
-    | awk -F '\t' -v p="$1" 'NF==2 && $1 ~ p {print $2}' \
-    | grep -Fxf <(gitolite list-phy-repos 2>/dev/null) || :
+  # ONE `gitolite info` pass (authoritative; same engine as `gitolite access`). We no longer
+  # intersect with list-phy-repos to strip wildcard patterns (CREATOR/..* etc): ci-status
+  # scopes by `repo IN (...)` EXACT-match, so pattern strings are inert (match no runs).
+  # One fork, not two — shaves a gitolite startup off every no-arg `ci-job status`.
+  gitolite info 2>/dev/null | awk -F '\t' -v p="$1" 'NF==2 && $1 ~ p {print $2}' || :
 }
 proxy() { sudo -n -u "$RUNNER_USER" "$RUNNER_BIN/$1" "${@:2}"; }   # read-only proxy into cicd-runner
 
