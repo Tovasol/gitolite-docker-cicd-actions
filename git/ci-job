@@ -118,15 +118,15 @@ watch_status() {  # <repo> <sha> [job]
 
 cmd_status() {
   local scope="${1:-}"
-  # --no-health: a user's status query shouldn't pay for (or see) operator health (docker
-  # info probe, key state). Saves ~0.1-0.2s and avoids leaking runner state to repo readers.
+  # ci-status defaults to the lean view (jobs + recent + running) — no operator health probe,
+  # no leaking runner state to repo readers. Operators add --full on the box for the rest.
   if [ -n "$scope" ]; then
     can "$scope" R || die "no READ access to '$scope'"
-    proxy ci-status --no-health --repos "$scope"
+    proxy ci-status --repos "$scope"
   else
     local repos; repos="$(accessible R | tr '\n' ' ')"
     [ -n "${repos// }" ] || { echo "ci-job: you have no readable repos"; return 0; }
-    proxy ci-status --no-health --repos "$repos"
+    proxy ci-status --repos "$repos"
   fi
 }
 

@@ -14,8 +14,10 @@ ci-status - health + analytics dashboard for the CI runner.
 Shows: key/docker/slots, per-job rollups, recent runs, running/orphaned, pending,
 and failed teardowns. Analytics need duckdb; the basics are pure shell.
 
-usage: ci-status [repo-prefix] [--color|--no-color]
+usage: ci-status [repo-prefix] [--full] [--color|--no-color]
   repo-prefix   scope to one repo   (e.g. tovasol/agent-forge)
+  --full        add operator sections: health (key/docker/slots), pending, failed teardowns.
+                Default is the lean view (jobs + recent + running) — fast, no docker probe.
   --color       force ANSI color (e.g. under: watch --color 'ci-status --color')
   --no-color    disable color
   -h, --help
@@ -34,12 +36,12 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # args: [repo-scope] [--color|--no-color] [--repos "<space-separated allowlist>"]
 # --repos is the access-scoped form used by the `ci-job` gitolite command: it restricts
 # the dashboard to exactly the repos gitolite says the user may read.
-SCOPE=""; force_color=auto; REPOS=""; show_health=1
+SCOPE=""; force_color=auto; REPOS=""; full=0
 while [ $# -gt 0 ]; do case "$1" in
   --color)     force_color=on ;;
   --no-color)  force_color=off ;;
   --repos)     REPOS="${2:-}"; shift ;;
-  --no-health) show_health=0 ;;          # skip the operator health probe (docker info etc.)
+  --full)      full=1 ;;                  # add operator sections (health probe, pending, teardowns)
   -*)          ;;                         # ignore unknown flags
   *)           SCOPE="$1" ;;
 esac; shift; done
@@ -131,9 +133,10 @@ exec 3>&1; _BUF="$(mktemp)"; trap 'cat "$_BUF" >&3 2>/dev/null; rm -f "$_BUF"' E
 
 printf '%s== cicd-runner ==%s  %s%s\n' "$cB" "$c0" "$(_ts)" "${SCOPE:+   scope=$SCOPE}"
 
-# Operator health (key/docker/slots). Skipped with --no-health (the `ci-job` proxy path):
-# it costs a `docker info` (~0.1-0.2s) and exposes operator state to any repo reader.
-if [ "$show_health" = 1 ]; then
+# Operator health (key/docker/slots) — only with --full. It costs a `docker info` (~0.1-0.2s)
+# and exposes operator state, neither of which a user's scoped status query needs. Default is
+# the lean view (jobs + recent + running); operators run `ci-status --full` for the rest.
+if [ "$full" = 1 ]; then
   rule health
   if [ -s "$SOPS_AGE_KEY_FILE" ]; then ok "age key loaded ($SOPS_AGE_KEY_FILE)"
   else no "age key NOT loaded - run: unlock-ci   (did the box reboot?)"; fi
@@ -209,17 +212,18 @@ if [ "$ENGINE" != none ]; then
   fi
 fi
 
-# --- pending (target != last) ----------------------------------------------------
-pend="$(find "$RUNNER_BASE/queue" -name target 2>/dev/null | while read -r t; do
-  g="$(dirname "$t")"; [ "$(cat "$t" 2>/dev/null)" != "$(cat "$g/last" 2>/dev/null)" ] && \
-    printf '  %s -> %s\n' "${g#"$RUNNER_BASE"/queue/}" "$(cat "$t")"; done)"
-if [ -n "$pend" ]; then rule "pending (target != last - ci-recover will retry)"; printf '%s\n' "$pend"; fi
+# --- operator sections (pending + failed teardowns): --full only -----------------
+if [ "$full" = 1 ]; then
+  pend="$(find "$RUNNER_BASE/queue" -name target 2>/dev/null | while read -r t; do
+    g="$(dirname "$t")"; [ "$(cat "$t" 2>/dev/null)" != "$(cat "$g/last" 2>/dev/null)" ] && \
+      printf '  %s -> %s\n' "${g#"$RUNNER_BASE"/queue/}" "$(cat "$t")"; done)"
+  if [ -n "$pend" ]; then rule "pending (target != last - ci-recover will retry)"; printf '%s\n' "$pend"; fi
 
-# --- failed teardowns ------------------------------------------------------------
-td="$(find "$RUNNER_BASE/envs" -name teardown-failed 2>/dev/null)"
-if [ -n "$td" ]; then
-  rule "FAILED teardowns (need operator - ci-teardown retry|abandon)"
-  printf '%s\n' "$td" | while read -r f; do
-    d="$(dirname "$f")"; printf '  %s\n' "${d#"$RUNNER_BASE"/envs/}"; sed 's/^/      /' "$f"
-  done
+  td="$(find "$RUNNER_BASE/envs" -name teardown-failed 2>/dev/null)"
+  if [ -n "$td" ]; then
+    rule "FAILED teardowns (need operator - ci-teardown retry|abandon)"
+    printf '%s\n' "$td" | while read -r f; do
+      d="$(dirname "$f")"; printf '  %s\n' "${d#"$RUNNER_BASE"/envs/}"; sed 's/^/      /' "$f"
+    done
+  fi
 fi
