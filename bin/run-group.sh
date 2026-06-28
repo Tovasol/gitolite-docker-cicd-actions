@@ -293,7 +293,7 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   end_iso="$(_ts)"; end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))
   emit_meta "$dir/meta.json" "$status_word" "$rc" "$end_iso" "$end_ns" "$dur"
   cicd_audit job-end "repo=$repo" "branch=$branch" "job=$job" "sha=$newrev" "status=$status_word" "pusher=$pusher"
-  cicd_flush_outbox "$outdir/notify" "$rc" "$dir" "$group/$job" "$envfile"
+  cicd_flush_outbox "$outdir/notify" "$rc" "$dir" "$group/$job" "$envfile" "$maskfile"
   [ "$rc" -eq 0 ] && log "$group/$job: done" || log "$group/$job: FAILED $status_word"
   [ -n "$envfile" ] && rm -f "$envfile"; [ -n "$maskfile" ] && rm -f "$maskfile"
   return "$rc"
@@ -412,7 +412,7 @@ run_teardown() {  # <oldrev> <pusher>
   emit_meta "$dir/meta.json" "exit:$rc" "$rc" "$(_ts)" "$end_ns" "$dur"
 
   if [ "$rc" -eq 0 ]; then
-    cicd_flush_outbox "$outdir/notify" 0 "$dir" "$group teardown" "$envfile"
+    cicd_flush_outbox "$outdir/notify" 0 "$dir" "$group teardown" "$envfile" "$maskfile"
     rm -rf "$ENVS"                                    # env destroyed; state + source.tar gone
     [ -n "$srctar" ] && [ "$srctar" = "$INC/$oldrev.tar" ] && rm -f "$INC/$oldrev.tar" "$INC/$oldrev.changed"
     log "$group: teardown done"
@@ -421,7 +421,7 @@ run_teardown() {  # <oldrev> <pusher>
     [ -n "$srctar" ] && cp -f "$srctar" "$ENVS/source.tar" 2>/dev/null || true
     printf '%s' "$branch" > "$ENVS/branch"
     printf 'exit:%s @ %s\nlog: %s\n' "$rc" "$(_ts)" "$dir/output.log" > "$ENVS/teardown-failed"
-    cicd_flush_outbox "$outdir/notify" "$rc" "$dir" "$group teardown NEEDS OPERATOR (ci-teardown)" "$envfile"
+    cicd_flush_outbox "$outdir/notify" "$rc" "$dir" "$group teardown NEEDS OPERATOR (ci-teardown)" "$envfile" "$maskfile"
     log "$group: teardown FAILED ($rc) — source+state KEPT, no auto-retry"
   fi
   [ -n "$envfile" ] && rm -f "$envfile"; [ -n "$maskfile" ] && rm -f "$maskfile"

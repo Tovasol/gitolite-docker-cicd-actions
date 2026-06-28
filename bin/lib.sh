@@ -176,12 +176,15 @@ cicd_deliver() {  # cicd_deliver <level> <label> <message> <logpath> [secenv]
 # Flush a job's outbox (script-emitted notify_* lines) after the container exits,
 # then apply the failure backstop (alert even if the script emitted nothing — e.g.
 # OOM/SIGKILL). Notifications are also copied into the run's output.log.
-cicd_flush_outbox() {  # cicd_flush_outbox <outboxfile> <rc> <logdir> <label> [secenv]
-  local box="$1" rc="$2" dir="$3" label="$4" secenv="${5:-}" had_terminal=0 line level msg
+cicd_flush_outbox() {  # cicd_flush_outbox <outboxfile> <rc> <logdir> <label> [secenv] [maskfile]
+  local box="$1" rc="$2" dir="$3" label="$4" secenv="${5:-}" maskfile="${6:-}" had_terminal=0 line level msg
   if [ -f "$box" ]; then
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       level="$(printf '%s' "$line" | cut -f1)"; msg="$(printf '%s' "$line" | cut -f2-)"
+      # a script-authored notify message bypasses the container-stream redactor, so mask it
+      # here too before it hits output.log / the email (closes the last redaction gap).
+      [ -s "$maskfile" ] && msg="$(printf '%s' "$msg" | sed -f "$maskfile" 2>/dev/null)"
       echo "[notify:$level] $msg" >> "$dir/output.log"
       case "$level" in success|error) had_terminal=1 ;; esac
       cicd_deliver "$level" "$label" "$msg" "$dir/output.log" "$secenv"
