@@ -38,6 +38,7 @@ cat > "$INC/$srcsha.tar.tmp" && mv -f "$INC/$srcsha.tar.tmp" "$INC/$srcsha.tar"
 printf '%s %s %s %s %s\n' "$event" "$newrev" "$oldrev" "$pusher" "$onlyjob" > "$Q/target.tmp"
 mv -f "$Q/target.tmp" "$Q/target"
 log "ingest $event $repo/$branch src=$srcsha bytes=$(wc -c < "$INC/$srcsha.tar")"
+cicd_audit ingest "repo=$repo" "branch=$branch" "event=$event" "sha=$srcsha" "pusher=$pusher"
 
 setsid "$CICD_BASE/bin/run-group.sh" "$repo" "$branch" </dev/null >>"$RUNNER_BASE/runner.log" 2>&1 &
 exit 0

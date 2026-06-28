@@ -59,6 +59,14 @@ DELETE_SUPERSEDES=1                            # a branch-delete cancels/overrid
 REPORT_STALE_DAYS=30                           # log envs idle this long as "verify + ci-teardown"
 AUTO_REAP_STALE_DAYS=0                          # 0 = report only; >0 = auto-teardown after N idle days
 
+# --- audit log (append-only, hash-chained / tamper-evident) ---
+# Every ingest / job-start / job-end / key-unlock is recorded with hash=sha256(prev+payload),
+# so any edit, delete, or reorder of a past line breaks the chain. Inspect with `ci-audit
+# verify` / `ci-audit tail`. Grows unbounded — rotate it yourself if needed (the hash chain
+# tolerates truncating from the FRONT only if you keep the new first line's prev as a new root).
+AUDIT_ENABLED=1                                # 1 = record security events; 0 = off
+AUDIT_LOG=/home/cicd-runner/runner/audit.log   # default: $RUNNER_BASE/audit.log
+
 # --- retries + notify are NOT runner concerns ---
 # They live in the ci/*.sh script via the mounted /cicd/lib.sh helpers
 # (retry, notify_success/error). The runner owns only the safety bounds

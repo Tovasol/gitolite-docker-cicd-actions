@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# ci-audit — inspect the tamper-evident audit log.
+#   ci-audit verify       # walk the hash chain; nonzero + reports the first broken entry
+#   ci-audit tail [N]     # show the last N entries (default 20)
+#   ci-audit              # = tail 20
+set -euo pipefail
+CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
+# shellcheck disable=SC1090
+. "$CICD_BASE/bin/lib.sh"; cicd_load_config >/dev/null 2>&1 || true
+LOG="${AUDIT_LOG:-${RUNNER_BASE:-$CICD_BASE}/audit.log}"
+
+case "${1:-tail}" in
+  verify) cicd_audit_verify "$LOG" ;;
+  tail)   n="${2:-20}"; if [ -f "$LOG" ]; then tail -n "$n" "$LOG"; else echo "no audit log at $LOG"; fi ;;
+  *)      echo "usage: ci-audit [verify | tail [N]]" >&2; exit 1 ;;
+esac

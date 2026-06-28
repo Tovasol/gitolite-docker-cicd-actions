@@ -239,6 +239,7 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   META_repo="$repo"; META_branch="$branch"; META_job="$job"; META_event="$event"
   META_sha="$newrev"; META_pusher="$pusher"; META_start="$start_iso"; META_startns="$start_ns"
   emit_meta "$dir/meta.json" running
+  cicd_audit job-start "repo=$repo" "branch=$branch" "job=$job" "sha=$newrev" "pusher=$pusher"
 
   envfile=""
   if [ -f "$work/ci/secrets.enc.yaml" ]; then
@@ -291,6 +292,7 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   if [ "$rc" -eq 124 ]; then status_word=timeout; else status_word="exit:$rc"; fi
   end_iso="$(_ts)"; end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))
   emit_meta "$dir/meta.json" "$status_word" "$rc" "$end_iso" "$end_ns" "$dur"
+  cicd_audit job-end "repo=$repo" "branch=$branch" "job=$job" "sha=$newrev" "status=$status_word" "pusher=$pusher"
   cicd_flush_outbox "$outdir/notify" "$rc" "$dir" "$group/$job" "$envfile"
   [ "$rc" -eq 0 ] && log "$group/$job: done" || log "$group/$job: FAILED $status_word"
   [ -n "$envfile" ] && rm -f "$envfile"; [ -n "$maskfile" ] && rm -f "$maskfile"

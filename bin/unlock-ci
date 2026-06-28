@@ -31,6 +31,7 @@ chmod 600 "$DEST"
 pub="$(age-keygen -y "$DEST" 2>/dev/null || true)"
 [ -n "$pub" ] || { rm -f "$DEST"; die "not a valid age key — nothing loaded"; }
 log "runner key loaded into $DEST  (pub: $pub)  — clears on reboot"
+cicd_audit key-unlock "pub=$pub" "by=$(id -un 2>/dev/null || echo '?')"
 
 # key is now available → re-run anything deferred while it was missing (deferred-recovery,
 # §10.6/§33). ci-recover re-triggers every group whose target != last (no-op if none).

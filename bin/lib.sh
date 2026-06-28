@@ -30,6 +30,55 @@ _ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log()  { printf '%s %s\n' "$(_ts)" "$*"; }
 die()  { printf '%s ERROR: %s\n' "$(_ts)" "$*" >&2; exit 1; }
 
+# --- audit log (append-only, hash-chained / tamper-evident) -------------------
+_sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+  else shasum -a 256 | cut -d' ' -f1; fi
+}
+# Append a security-audit entry. Each line carries hash=sha256(prev_hash + payload), so any
+# edit/delete/reorder of a past line breaks the chain (cicd_audit_verify detects it). Appends
+# are serialized with flock so concurrent writers (ingest/run-group/unlock) can't fork the
+# chain. Best-effort — never aborts the caller. Line: <ts>\t<event>\t<fields>\tprev=H\thash=H
+cicd_audit() {  # <event> [k=v ...]
+  [ "${AUDIT_ENABLED:-1}" = 1 ] || return 0
+  local logf="${AUDIT_LOG:-${RUNNER_BASE:-$HOME/runner}/audit.log}"
+  local ev="${1:-?}"; shift 2>/dev/null || true
+  local ts fields payload prev h
+  ts="$(_ts)"
+  fields="$(printf '%s' "$*" | tr '\n\t' '  ')"   # fields stay 1 line: no tab can forge a column
+  payload="$(printf '%s\t%s\t%s' "$ts" "$ev" "$fields")"
+  {
+    command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null || true   # serialize on Linux; skip if absent
+    prev=""
+    [ -f "$logf" ] && prev="$(tail -n1 "$logf" 2>/dev/null | sed -n 's/.*[[:space:]]hash=\([0-9a-f]*\).*/\1/p')"
+    prev="${prev:-GENESIS}"
+    h="$(printf '%s%s' "$prev" "$payload" | _sha256_stdin)"
+    printf '%s\tprev=%s\thash=%s\n' "$payload" "$prev" "$h" >> "$logf"
+  } 9>>"${logf}.lock" 2>/dev/null || true
+}
+# Verify the chain. Echoes "audit: OK (N entries)" + returns 0, or reports the first broken
+# entry + returns 1. Extracts prev/hash from the LAST \tprev=/\thash= so a field value that
+# happens to contain "prev="/"hash=" can't fool it.
+cicd_audit_verify() {  # [logfile]
+  local logf="${1:-${AUDIT_LOG:-${RUNNER_BASE:-$HOME/runner}/audit.log}}"
+  [ -f "$logf" ] || { echo "audit: no log at $logf"; return 0; }
+  local prev="GENESIS" n=0 line rest payload rec_prev rec_hash calc
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    n=$((n + 1))
+    rec_hash="${line##*$'\t'hash=}"
+    rest="${line%$'\t'hash=*}"
+    rec_prev="${rest##*$'\t'prev=}"
+    payload="${rest%$'\t'prev=*}"
+    calc="$(printf '%s%s' "$prev" "$payload" | _sha256_stdin)"
+    if [ "$rec_prev" != "$prev" ] || [ "$rec_hash" != "$calc" ]; then
+      echo "audit: CHAIN BROKEN at entry $n: $payload" >&2; return 1
+    fi
+    prev="$rec_hash"
+  done < "$logf"
+  echo "audit: OK ($n entries)"; return 0
+}
+
 # --- GitHub-ish glob matching -------------------------------------------------
 # `*` matches within a path segment (not `/`); `**` matches across; `?` one char.
 glob_to_regex() {
