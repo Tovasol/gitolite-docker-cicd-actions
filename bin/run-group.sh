@@ -176,7 +176,7 @@ redact_log() {  # <sedscript>
 detect_cgroup_support() {
   [ -n "${_CGROUP_DETECTED:-}" ] && return 0
   _CGROUP_DETECTED=1
-  local info; info="$(docker info 2>/dev/null || true)"
+  local info; info="$(docker info 2>&1 || true)"   # M4: warnings are on STDERR — capture both
   case "$info" in *"No memory limit support"*) CGROUP_MEM=0 ;; *) CGROUP_MEM=1 ;; esac
   case "$info" in *"No pids limit support"*)    CGROUP_PIDS=0 ;; *) CGROUP_PIDS=1 ;; esac
 }
@@ -195,9 +195,10 @@ build_limits() {  # <mem> <pids>
   esac
   [ "$cg_mem" = 1 ]  && _LIMITS+=(--memory "$mem")
   [ "$cg_pids" = 1 ] && _LIMITS+=(--pids-limit "$pids")
-  # ulimit fallback when cgroup pids can't be enforced: cap processes to blunt fork bombs.
-  [ "$cg_pids" = 1 ] || _LIMITS+=(--ulimit "nproc=${ULIMIT_NPROC:-1024}")
-  # always cap single-file size (cgroup-independent) to blunt a disk-fill via one huge file.
+  # M4: nproc + fsize ulimits are ALWAYS applied — cheap, cgroup-independent, and the only
+  # limits that bind if cgroup enforcement is mis-detected (fail-open). nproc blunts fork
+  # bombs, fsize blunts a single-file disk-fill. (Redundant-but-harmless when cgroups work.)
+  _LIMITS+=(--ulimit "nproc=${ULIMIT_NPROC:-1024}")
   _LIMITS+=(--ulimit "fsize=${ULIMIT_FSIZE:-2147483648}")   # 2 GiB
 }
 

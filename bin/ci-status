@@ -130,7 +130,8 @@ else
 fi
 DATA_CTE="WITH data AS (SELECT *, regexp_replace(filename,'/meta\.json\$','') AS dir
   FROM read_json($RUNS_SRC, format='newline_delimited', filename=true, ignore_errors=true, union_by_name=true)
-  WHERE schema IS NOT NULL $REPO_FILTER)"
+  WHERE schema IS NOT NULL $REPO_FILTER
+  AND filename NOT LIKE '%/cicd-out/meta.json')"
 runsql() { duckdb -noheader -list -separator $'\t' -c "$DATA_CTE $1" 2>/dev/null; }  # <query on `data`>
 
 # =============================== render =====================================
