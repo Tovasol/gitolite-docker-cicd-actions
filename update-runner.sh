@@ -121,16 +121,16 @@ sudo -u "$RUNNER_USER" rm -rf -- "$SRC.prev"
 sudo -u "$RUNNER_USER" mv -- "$STAGE" "$SRC"
 
 # H4 leg-2 + deploy-escalation fix: snapshot the files ROOT installs/executes into a ROOT-OWNED
-# dir NOW, straight from the just-extracted (signature-gated) $SRC — before dropping to the
-# cicd-runner user for install.sh, so a cicd-runner foothold during install.sh cannot swap what
-# root installs. This INCLUDES update-runner.sh itself: root must never execute/re-exec the
-# cicd-runner-writable ~/src copy (a CI job could trojan it -> root). ~/src stays cicd-runner-owned
-# (install.sh writes it); these snapshot copies + the installed entrypoint do not.
+# dir, extracted DIRECTLY (as root) from the signature-gated git archive — NOT from the
+# cicd-runner-writable ~/src. Copying out of ~/src had a TOCTOU: a concurrent cicd-runner foothold
+# could swap ~/src/git/ci-job between the tar-extract and the cp, planting code root then installs.
+# Extracting from git removes ~/src from the trust path entirely. This INCLUDES update-runner.sh:
+# root must never execute/re-exec the cicd-runner-writable ~/src copy (a CI job could trojan it).
 ROOTSNAP="$(mktemp -d)"; chmod 700 "$ROOTSNAP"
 trap 'rm -rf "$ROOTSNAP"' EXIT
-cp -f "$SRC/git/ci-job" "$ROOTSNAP/ci-job"
-cp -f "$SRC/init/docker-rootless-cicd-runner.openrc" "$ROOTSNAP/openrc"
-cp -f "$SRC/update-runner.sh" "$ROOTSNAP/update-runner.sh"
+git --git-dir="$RUNNER_REPO" archive "$BRANCH" \
+    git/ci-job init/docker-rootless-cicd-runner.openrc update-runner.sh \
+  | tar -x -C "$ROOTSNAP"
 
 # Refresh the ROOT-OWNED entrypoint from the verified tree — the only copy root should ever run.
 install -Dm755 -o root -g root "$ROOTSNAP/update-runner.sh" "$TRUSTED_ENTRYPOINT"
@@ -163,7 +163,7 @@ echo "→ [4/5] ci-job command (+ enable + sudo grant)"
 # is the canonical source — re-sync the gitolite-admin copy if it ever changes.
 LOCAL_CODE="$(sudo -u "$GIT_USER" gitolite query-rc LOCAL_CODE)"
 # ci-job: the git-side gitolite command (run/status/log over ssh, gitolite-authz, §34).
-install -Dm755 "$ROOTSNAP/ci-job" "$LOCAL_CODE/commands/ci-job"   # from the root-owned snapshot (H4)
+install -Dm755 "$ROOTSNAP/git/ci-job" "$LOCAL_CODE/commands/ci-job"   # from the root-owned git snapshot (H4)
 chown -R "$GIT_USER:$GIT_USER" "$LOCAL_CODE"
 
 # enable ci-job in gitolite.rc (idempotent) so `ssh git@host ci-job …` is allowed
@@ -193,7 +193,7 @@ fi
 rm -f "$_su"
 
 echo "→ [5/5] boot/init service file"
-install -m755 "$ROOTSNAP/openrc" /etc/init.d/docker-rootless-cicd-runner   # from the root-owned snapshot (H4)
+install -m755 "$ROOTSNAP/init/docker-rootless-cicd-runner.openrc" /etc/init.d/docker-rootless-cicd-runner   # root-owned git snapshot (H4)
 
 if [ "$RESTART" -eq 1 ]; then
   echo "→ restart docker-rootless-cicd-runner (bounces docker, KILLS in-flight builds)"

@@ -43,23 +43,25 @@ USER="$(read_var SMTP_USER_NAME SMTP_USER)"
 PASS="$(read_var SMTP_USER_PWD  SMTP_PASS)"
 TO="$(read_var NOTIFY_TO MAILER_EMAIL)"; [ -z "$TO" ] && TO="$USER"
 FROM="$(read_var MAILER_EMAIL NOTIFY_FROM)"; FROM="${FROM:-$USER}"
+TO="$(printf '%s' "$TO" | tr -d '\r\n')"; FROM="$(printf '%s' "$FROM" | tr -d '\r\n')"  # no header injection
 [ -n "$USER" ] && [ -n "$PASS" ] && [ -n "$TO" ] || exit 0   # not configured -> skip silently
 
-# H5 open-relay guard: when the SMTP CREDENTIALS are the operator's (host tier), a repo's secrets
-# MUST NOT steer the authenticated, SPF/DKIM/DMARC-aligned session. That means NONE of these may
-# come from the project tier:
-#   * recipient / From      -> open relay (mail anywhere as the operator)
-#   * SMTP endpoint addr/port-> credential THEFT (curl AUTHs the operator's user+pass to an
-#                               attacker SMTP server before it ever checks where it's sending)
-#   * From display-name / Subject / Body -> aligned-but-spoofed phish (e.g. From: "Google
-#                               Security <no-reply@accounts.google.com>" on operator-DKIM mail)
-# A repo that brings its OWN creds (project tier) may set all of these. Refuse any mix (H3, M1).
-if [ "$(tier SMTP_USER_NAME SMTP_USER)" = host ]; then
-  for pair in NOTIFY_TO:MAILER_EMAIL MAILER_EMAIL:NOTIFY_FROM \
+# H5 open-relay guard: when the SMTP PASSWORD is the operator's (host tier), a repo's secrets MUST
+# NOT steer the authenticated, SPF/DKIM/DMARC-aligned session. The guard keys on the PASSWORD tier,
+# not the username: the username is PUBLIC (it's the From: on every CI mail), so keying on it let a
+# repo supply the operator's public username project-tier to dodge the guard while still borrowing
+# the host PASSWORD. When the host password would be used, NONE of these may come from the project:
+#   * username / recipient / From -> open relay (mail anywhere as the operator)
+#   * SMTP endpoint addr/port      -> credential THEFT (curl AUTHs the operator's user+pass to an
+#                                     attacker SMTP server before it ever checks where it sends)
+#   * From display-name / Subject / Body -> aligned-but-spoofed phish
+# A repo that brings its OWN password (project tier) may set all of these. Refuse any mix (H3, M1).
+if [ "$(tier SMTP_USER_PWD SMTP_PASS)" = host ]; then
+  for pair in SMTP_USER_NAME:SMTP_USER NOTIFY_TO:MAILER_EMAIL MAILER_EMAIL:NOTIFY_FROM \
               SMTP_HOST_ADDR:SMTP_HOST SMTP_HOST_PORT:SMTP_PORT \
               SMTP_FROM_NAME:NOTIFY_FROM_NAME NOTIFY_SUBJECT: NOTIFY_BODY:; do
     if [ "$(tier "${pair%%:*}" "${pair#*:}")" = project ]; then
-      printf 'notify-email: REFUSED — project override of %s with host SMTP creds (open-relay/cred-theft guard, H5)\n' "${pair%%:*}"
+      printf 'notify-email: REFUSED — project override of %s with the operator (host) SMTP password (open-relay/cred-borrow guard, H5)\n' "${pair%%:*}"
       exit 0
     fi
   done
@@ -125,6 +127,13 @@ render() {
 }
 SUBJECT="$(render "$SUBJECT_TMPL")"; SUBJECT="${SUBJECT//$'\n'/ }"
 BODY="$(render "$BODY_TMPL")"
+# SMTP DATA transparency (RFC 5321 §4.5.2): the body carries {{LOGTAIL}} = the CI job's own stdout
+# (attacker-influenced). curl's SMTP uploader forwards the payload VERBATIM — it neither converts
+# bare LF to CRLF nor dot-stuffs — so a log line of exactly "." would end DATA early and ".<verb>"
+# could smuggle SMTP commands into the operator's authenticated session. Normalize: strip CR, dot-
+# stuff any leading '.', and re-terminate every line CRLF. (Headers below are already CRLF + are
+# newline-stripped at their sources, so only the body needs this.)
+BODY="$(printf '%s' "$BODY" | awk '{ sub(/\r$/,""); if (substr($0,1,1)==".") $0="."$0; printf "%s\r\n", $0 }')"
 
 FROM_NAME="$(read_var SMTP_FROM_NAME NOTIFY_FROM_NAME)"; FROM_NAME="${FROM_NAME:-cicd-runner}"
 FROM_NAME="$(printf '%s' "$FROM_NAME" | tr -d '\r\n<>')"   # strip CR/LF + angle-brackets: no header injection / fake-address display name

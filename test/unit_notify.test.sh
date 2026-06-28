@@ -101,10 +101,38 @@ assert_match "From display-name override refused" "$(runne 'SMTP_FROM_NAME=Googl
 assert_match "Subject override refused"          "$(runne 'NOTIFY_SUBJECT=pwn\n')"                     'REFUSED'
 assert_match "Body override refused"             "$(runne 'NOTIFY_BODY=pwn\n')"                        'REFUSED'
 assert_eq    "no curl on any refusal"            "$([ -f "$NG/curl.args" ] && echo sent || echo none)" "none"
+# password-tier split (the survivor): the username is PUBLIC, so a repo supplying the operator's
+# username via the SMTP_USER alias (project tier, no password) must NOT dodge the guard — the
+# decision keys on the PASSWORD tier (host), and a project-tier username is itself refused.
+assert_match "project public-username (host pw) refused" "$(runne 'SMTP_USER=operator-ci@company.com\n')" 'REFUSED'
+assert_match "project username + recipient refused"      "$(runne 'SMTP_USER=operator-ci@company.com\nNOTIFY_TO=attacker@evil.example\n')" 'REFUSED'
 # a benign project that touches NOTHING host-sensitive must still send (no false refusal)
 out_ok="$(runne 'NOTIFY_LOGLINES=10\n')"
 assert_no_match "benign project not refused"     "$out_ok" 'REFUSED'
 assert_eq       "benign project still sends"     "$([ -f "$NG/curl.args" ] && echo sent || echo none)" "sent"
 rm -rf "$NG"
+
+suite "notify-email SMTP DATA transparency (bare-LF / dot-stuffing)"
+DG="$(mktemp -d)"; mkdir -p "$DG/bin"
+cat > "$DG/bin/curl" <<EOF
+#!/usr/bin/env bash
+a=("\$@"); printf '%s\n' "\$@" > "$DG/curl.args"
+for ((i=0;i<\${#a[@]};i++)); do [ "\${a[i]}" = --upload-file ] && cat "\${a[i+1]}" > "$DG/curl.data" 2>/dev/null; done
+exit 0
+EOF
+chmod +x "$DG/bin/curl"
+# all host-tier (guard passes -> curl runs); the LOG TAIL carries attacker-chosen lines
+printf 'SMTP_USER_NAME=op@company.com\nSMTP_USER_PWD=pw\nNOTIFY_TO=ops@company.com\n' > "$DG/host.env"
+printf '{"repo":"x","branch":"main","sha":"d","job":"smoke","event":"push","pusher":"git"}\n' > "$DG/meta.json"
+rl4="$DG/output.log"; printf 'normal line\n.\n.MAIL FROM:<evil@x>\n' > "$rl4"
+PATH="$DG/bin:$PATH" CICD_NOTIFY_ENV="" CICD_NOTIFY_HOST_ENV="$DG/host.env" \
+  bash "$HERE/../bin/notify-email" smoke "error: boom" "$rl4" >/dev/null
+data="$(cat "$DG/curl.data" 2>/dev/null)"
+assert_match    "curl actually invoked"           "$([ -f "$DG/curl.data" ] && echo y || echo n)" "y"
+assert_match    "lone '.' line is dot-stuffed"    "$data" '^\.\.'
+assert_match    "leading-dot SMTP verb stuffed"   "$data" '\.\.MAIL FROM'
+assert_no_match "no bare lone-dot (DATA end) line" "$data" '^\.$'
+assert_match    "body lines are CRLF-terminated"  "$(printf '%s' "$data" | tr '\r' '@' )" 'normal line@'
+rm -rf "$DG"
 
 summary
