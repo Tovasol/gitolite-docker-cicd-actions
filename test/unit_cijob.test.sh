@@ -117,7 +117,7 @@ assert_match "ingest got feature/x branch"       "$(cat "$REC")" 'cicd-ingest to
 suite "ci-job status (access-scoped)"
 : > "$REC"; run_cijob alice status >/dev/null 2>&1
 got="$(grep '^ci-status' "$REC")"
-assert_match "status scopes to readable repos" "$got" 'ci-status --repos .*tovasol/app'
+assert_match "status scopes to readable repos" "$got" 'ci-status .*--repos .*tovasol/app'
 assert_match "status includes lib (readable)"  "$got" 'tovasol/lib'
 assert_no_match "status EXCLUDES secret (no R)" "$got" 'tovasol/secret'
 

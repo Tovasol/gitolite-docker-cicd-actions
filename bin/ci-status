@@ -34,13 +34,14 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # args: [repo-scope] [--color|--no-color] [--repos "<space-separated allowlist>"]
 # --repos is the access-scoped form used by the `ci-job` gitolite command: it restricts
 # the dashboard to exactly the repos gitolite says the user may read.
-SCOPE=""; force_color=auto; REPOS=""
+SCOPE=""; force_color=auto; REPOS=""; show_health=1
 while [ $# -gt 0 ]; do case "$1" in
-  --color)    force_color=on ;;
-  --no-color) force_color=off ;;
-  --repos)    REPOS="${2:-}"; shift ;;
-  -*)         ;;                         # ignore unknown flags
-  *)          SCOPE="$1" ;;
+  --color)     force_color=on ;;
+  --no-color)  force_color=off ;;
+  --repos)     REPOS="${2:-}"; shift ;;
+  --no-health) show_health=0 ;;          # skip the operator health probe (docker info etc.)
+  -*)          ;;                         # ignore unknown flags
+  *)           SCOPE="$1" ;;
 esac; shift; done
 
 # Color decision (glyphs stay ASCII always - multibyte bought nothing but breakage).
@@ -130,15 +131,19 @@ exec 3>&1; _BUF="$(mktemp)"; trap 'cat "$_BUF" >&3 2>/dev/null; rm -f "$_BUF"' E
 
 printf '%s== cicd-runner ==%s  %s%s\n' "$cB" "$c0" "$(_ts)" "${SCOPE:+   scope=$SCOPE}"
 
-rule health
-if [ -s "$SOPS_AGE_KEY_FILE" ]; then ok "age key loaded ($SOPS_AGE_KEY_FILE)"
-else no "age key NOT loaded - run: unlock-ci   (did the box reboot?)"; fi
-[ -n "${DOCKER_HOST:-}" ] && export DOCKER_HOST
-if docker info >/dev/null 2>&1; then ok "docker reachable (rootless)"
-else no "docker NOT reachable (DOCKER_HOST=${DOCKER_HOST:-unset}) - rootless dockerd up?"; fi
-printf '  slots %s/%s free   analytics engine: %s\n' \
-  "$(ls "$RUNNER_BASE/slots" 2>/dev/null | wc -l | tr -d ' ')" "${MAX_JOBS}" \
-  "$([ "$ENGINE" = none ] && echo 'none - install duckdb (run fetch-tools.sh)' || echo "$ENGINE")"
+# Operator health (key/docker/slots). Skipped with --no-health (the `ci-job` proxy path):
+# it costs a `docker info` (~0.1-0.2s) and exposes operator state to any repo reader.
+if [ "$show_health" = 1 ]; then
+  rule health
+  if [ -s "$SOPS_AGE_KEY_FILE" ]; then ok "age key loaded ($SOPS_AGE_KEY_FILE)"
+  else no "age key NOT loaded - run: unlock-ci   (did the box reboot?)"; fi
+  [ -n "${DOCKER_HOST:-}" ] && export DOCKER_HOST
+  if docker info >/dev/null 2>&1; then ok "docker reachable (rootless)"
+  else no "docker NOT reachable (DOCKER_HOST=${DOCKER_HOST:-unset}) - rootless dockerd up?"; fi
+  printf '  slots %s/%s free   analytics engine: %s\n' \
+    "$(ls "$RUNNER_BASE/slots" 2>/dev/null | wc -l | tr -d ' ')" "${MAX_JOBS}" \
+    "$([ "$ENGINE" = none ] && echo 'none - install duckdb (run fetch-tools.sh)' || echo "$ENGINE")"
+fi
 
 # --- jobs: per (repo,job) rollup -------------------------------------------------
 rule "jobs"
