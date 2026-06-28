@@ -35,6 +35,23 @@ AUDIT_LOG="$A2" cicd_audit weird "note=prev=spoof and hash=deadbeef inside a fie
 AUDIT_LOG="$A2" cicd_audit next  ok=1
 assert_ok    "field with prev=/hash= still verifies" cicd_audit_verify "$A2"
 
+# tamper ONLY the prev= field of a middle line (hash= intact) -> the chain-LINK guard must
+# catch it; without the rec_prev!=prev check, the hash still recomputes clean (a survivor).
+sed '2 s/prev=[0-9a-f]*/prev=GENESIS/' "$AUDIT_LOG" > "$T/prevtamper.log"
+assert_fail  "prev-field tamper detected" cicd_audit_verify "$T/prevtamper.log"
+
+# a field containing REAL tabs must be neutralized (collapsed to spaces) so it can't forge
+# extra columns -> the line must stay exactly 5 tab-separated fields (ts ev fields prev hash).
+AUDIT_LOG="$T/tab.log" cicd_audit ev "note=x$(printf '\t')y$(printf '\t')z"
+assert_eq    "tabs in a field neutralized (5 cols)" "$(awk -F'\t' 'NR==1{print NF; exit}' "$T/tab.log")" "5"
+
+# a trailing blank line is tolerated (skipped), not treated as a broken entry
+cp "$AUDIT_LOG" "$T/blank.log"; printf '\n' >> "$T/blank.log"
+assert_ok    "blank line tolerated"       cicd_audit_verify "$T/blank.log"
+
+# a missing log verifies OK (nothing to break)
+assert_ok    "missing log verifies OK"    cicd_audit_verify "$T/does-not-exist.log"
+
 # disabled -> nothing written
 A3="$T/a3.log"
 AUDIT_ENABLED=0 AUDIT_LOG="$A3" cicd_audit ingest repo=x

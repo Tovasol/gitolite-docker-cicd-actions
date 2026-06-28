@@ -25,12 +25,19 @@ assert_json "running: valid json" "$(cat "$TF")"
 assert_match "running: status"    "$(cat "$TF")" '"status":"running"'
 assert_match "running: end null"  "$(cat "$TF")" '"end":null'
 assert_match "running: exit null" "$(cat "$TF")" '"exit":null'
+# pin field VALUES to their keys (valid-JSON alone misses a repo<->branch swap or a zeroed ns)
+assert_match "running: repo value"  "$(cat "$TF")" '"repo":"tovasol/agent-forge"'
+assert_match "running: branch value" "$(cat "$TF")" '"branch":"main"'
+assert_match "running: start_ns"    "$(cat "$TF")" '"start_ns":1781701781000000000'
 
 emit_meta "$TF" exit:0 0 2026-06-23T05:10:00Z 1781701800000000000 19   # 6-arg final form
 assert_json "final: valid json"   "$(cat "$TF")"
 assert_match "final: status"      "$(cat "$TF")" '"status":"exit:0"'
 assert_match "final: duration"    "$(cat "$TF")" '"duration_s":19'
 assert_match "final: exit num"    "$(cat "$TF")" '"exit":0'
+# the final form must actually write end / end_ns (not null) — catches them being dropped
+assert_match "final: end iso"     "$(cat "$TF")" '"end":"2026-06-23T05:10:00Z"'
+assert_match "final: end_ns"      "$(cat "$TF")" '"end_ns":1781701800000000000'
 
 # adversarial: a doublequote in the branch must NOT break JSON
 META_branch='feat/"injected'

@@ -26,6 +26,25 @@ NOTIFY_CMD="$T/notify" cicd_flush_outbox "$T/box" 0 "$DIR" "tovasol/app/smoke" "
 assert_no_match "output.log masks the secret" "$(cat "$DIR/output.log")" 'supersecretvalue123'
 assert_match    "output.log shows [MASKED]"   "$(cat "$DIR/output.log")" 'MASKED'
 assert_no_match "delivered message masked"    "$(cat "$REC")"            'supersecretvalue123'
+# POSITIVELY pin the delivery: the masked BODY (not just absence-of-secret) must be delivered,
+# and REC must be non-empty — "no secret leaked" is otherwise satisfied by delivering nothing.
+assert_ne       "a message was actually delivered" "$(cat "$REC")" ""
+assert_match    "delivered body is the masked message" "$(cat "$REC")" 'success: deployed token=\[MASKED\] ok'
+
+# failure backstop: rc!=0 with an EMPTY box (script emitted no notify) must alert
+DIRf="$T/runf"; mkdir -p "$DIRf"; : > "$DIRf/output.log"; : > "$T/empty"; : > "$REC"
+NOTIFY_CMD="$T/notify" cicd_flush_outbox "$T/empty" 1 "$DIRf" "tovasol/app/smoke" ""
+assert_match    "backstop alerts on silent failure" "$(cat "$REC")" 'job failed .rc=1. with no script notification'
+
+# but NOT when the script already emitted a terminal notify (had_terminal=1 suppresses it)
+DIRt="$T/runt"; mkdir -p "$DIRt"; : > "$DIRt/output.log"; : > "$REC"
+NOTIFY_CMD="$T/notify" cicd_flush_outbox "$T/box" 1 "$DIRt" "tovasol/app/smoke" ""
+assert_no_match "no double-alert when script notified" "$(cat "$REC")" 'with no script notification'
+
+# rc=0 must NOT trigger the backstop even with an empty box
+DIRz="$T/runz"; mkdir -p "$DIRz"; : > "$DIRz/output.log"; : > "$REC"
+NOTIFY_CMD="$T/notify" cicd_flush_outbox "$T/empty" 0 "$DIRz" "tovasol/app/smoke" ""
+assert_no_match "no backstop on success"          "$(cat "$REC")" 'with no script notification'
 
 # no mask file -> message passes through unchanged (back-compat; redaction is opt-in by maskfile)
 DIR2="$T/run2"; mkdir -p "$DIR2"; : > "$DIR2/output.log"

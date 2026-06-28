@@ -36,5 +36,8 @@ assert_fail "extracted: swapped binary rejected"          cache_ok "$T/duckdb" "
 
 # --- missing / non-executable ---
 assert_fail "missing binary -> not cached"                cache_ok "$T/nope" "$T/.nope.sha" deadbeef bin
+# present but NON-EXECUTABLE must not count as cached (catches a -x -> -e weakening)
+printf 'X' > "$T/noexec"; chmod -x "$T/noexec"; printf '%s' "$(sha_of "$T/noexec")" > "$T/.noexec.sha"
+assert_fail "present but non-executable -> not cached"    cache_ok "$T/noexec" "$T/.noexec.sha" "$(sha_of "$T/noexec")" bin
 
 summary

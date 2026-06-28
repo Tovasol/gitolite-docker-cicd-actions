@@ -15,6 +15,7 @@ assert_ok   "** matches direct child"  glob_match "site/scaffold/index.html"  "s
 assert_ok   "* matches one segment"    glob_match "site/x"   "site/*"
 assert_fail "* does NOT cross slash"   glob_match "site/a/b" "site/*"
 assert_ok   "? matches one char"       glob_match "main"     "ma?n"
+assert_fail "? does NOT cross slash"   glob_match "a/b"      "a?b"
 assert_ok   "literal dot is escaped"   glob_match "a.b"      "a.b"
 assert_fail "dot not treated as regex" glob_match "axb"      "a.b"
 assert_fail "regex metachars literal"  glob_match "xxxx"     "a.*"
@@ -40,6 +41,7 @@ suite slugify
 assert_match "lowercases + dashes"   "$(slugify 'feature/Foo Bar')" '^feature-foo-bar-[0-9a-f]{6}$'
 assert_no_match "no slash leaks"     "$(slugify 'a/b/c')"           '/'
 assert_no_match "no traversal dots"  "$(slugify '../../etc')"       '\.\.'
+assert_match "slug starts alnum (no leading dash)" "$(slugify '../../etc')" '^[a-z0-9]'
 assert_no_match "shell metachars gone" "$(slugify '$(rm -rf /)')"   '[$()]'
 assert_match "empty -> safe base"    "$(slugify '')"                '^x-[0-9a-f]{6}$'
 assert_ne    "distinct inputs differ" "$(slugify 'a')" "$(slugify 'b')"

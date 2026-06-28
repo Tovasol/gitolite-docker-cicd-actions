@@ -34,9 +34,15 @@ printf '{"schema":1,"repo":"tovasol/agent-forge","job":"smoke","status":"exit:0"
 printf 'NOT JSON AT ALL {{{\n'                                                                 > "$RD/garbage/meta.json"
 printf '{"schema":1,"repo":"tovasol/agent-forge","job":"trunc'                                  > "$RD/trunc/meta.json"  # truncated, no newline/close
 out="$(CICD_BASE="$TB" bash "$HERE/../bin/ci-runs" 2>/dev/null)"
-assert_eq    "ci-runs emits only the 1 valid line" "$(printf '%s\n' "$out" | grep -c '^{.*}$')" 1
+# count ALL non-empty lines (not just ^{.*}$ — a weakened/removed JSON guard leaks extra
+# lines that don't end in }, which the old anchored count silently ignored).
+assert_eq    "ci-runs emits exactly 1 line total"  "$(printf '%s\n' "$out" | grep -c .)" 1
 assert_match "valid line is the good one"          "$out" '"job":"smoke"'
-assert_no_match "garbage dropped"                  "$out" 'NOT JSON'
+# the emitted line must be VALID JSON — an off-by-one substr ($0,2 -> $0,1) makes it malformed.
+assert_json  "emitted line is valid JSON"          "$out"
+# neither garbage ('NOT JSON...' becomes 'OT JSON...' after substr) nor the truncated meta may
+# leak (the old 'NOT JSON' pattern never matched the post-substr form — it was vacuous).
+assert_no_match "garbage/truncated payload dropped" "$out" 'JSON|trunc'
 # DuckDB (ci-status's engine) reads the same run dirs directly; ignore_errors + the schema
 # filter must drop the garbage/truncated meta and keep exactly the 1 valid row.
 if command -v duckdb >/dev/null 2>&1; then

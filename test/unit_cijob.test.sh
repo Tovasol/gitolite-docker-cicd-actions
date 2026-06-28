@@ -108,6 +108,9 @@ assert_eq    "no ingest on traversal branch"     "$(grep -c cicd-ingest "$REC")"
 # repo with .. is rejected too
 : > "$REC"; out="$(run_cijob alice run 'tovasol/../etc' main 2>&1)"; rc=$?
 assert_ne    "traversal repo rejected"           "$rc" 0
+# message must be the path-guard's, not the W-gate's — else deleting the *..* arm survives
+# (the repo has no W, so `can W` would also reject it; assert the GUARD is what fired).
+assert_match "rejection names invalid repo"      "$out" 'invalid repo'
 assert_eq    "no ingest on traversal repo"       "$(grep -c cicd-ingest "$REC")" 0
 # a normal branch with a slash (feature/x) is still accepted (not over-rejected)
 : > "$REC"; out="$(run_cijob alice run tovasol/app feature/x --job deploy 2>&1)"; rc=$?
@@ -120,10 +123,20 @@ got="$(grep '^ci-status' "$REC")"
 assert_match "status scopes to readable repos" "$got" 'ci-status .*--repos .*tovasol/app'
 assert_match "status includes lib (readable)"  "$got" 'tovasol/lib'
 assert_no_match "status EXCLUDES secret (no R)" "$got" 'tovasol/secret'
+# scoped form `ci-job status <repo>` is its own READ-gated branch — exercise it on an R-ONLY
+# repo so an R->W flip of the gate is visible (tovasol/lib has R but not W).
+: > "$REC"; run_cijob alice status tovasol/lib >/dev/null 2>&1
+assert_match "scoped status (R-only repo) proxies"  "$(cat "$REC")" 'ci-status .*--repos .*tovasol/lib'
+: > "$REC"; out="$(run_cijob alice status tovasol/secret 2>&1)"; rc=$?
+assert_ne    "scoped status on unreadable fails"    "$rc" 0
+assert_eq    "no ci-status call on status denial"   "$(grep -c '^ci-status' "$REC")" 0
 
 suite "ci-job log (access gated)"
 : > "$REC"; run_cijob alice log tovasol/app deploy >/dev/null 2>&1
 assert_match "log proxies ci-log for readable repo" "$(cat "$REC")" 'ci-log tovasol/app deploy'
+# R-only repo: catches an R->W flip of the log gate (tovasol/app has both R+W, hiding it)
+: > "$REC"; run_cijob alice log tovasol/lib deploy >/dev/null 2>&1
+assert_match "log proxies ci-log for R-only repo"   "$(cat "$REC")" 'ci-log tovasol/lib deploy'
 : > "$REC"; out="$(run_cijob alice log tovasol/secret deploy)"; rc=$?
 assert_ne    "log on unreadable repo fails"     "$rc" 0
 assert_eq    "no ci-log call on denial"         "$(grep -c '^ci-log' "$REC")" 0
@@ -135,6 +148,9 @@ out="$(GL_USER=alice PATH="$STUB:$PATH" HOME="$M" CICD_RUNNER_BIN="$RB" \
 assert_match "watch shows 'running' transition"     "$out" 'running'
 assert_match "watch shows terminal 'exit:0'"        "$out" 'exit:0'
 assert_no_match "watch does NOT tail a missing log" "$out" 'No such file'
+# the watcher must RETURN on a terminal status, not poll to the cap — deleting the exit:*
+# arm makes it fall through to this timeout message.
+assert_no_match "watch stops at terminal status"    "$out" 'stopped watching after timeout'
 
 rm -rf "$M"
 summary
