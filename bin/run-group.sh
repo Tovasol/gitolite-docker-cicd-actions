@@ -108,11 +108,21 @@ src_sha() { [ "$1" = delete ] && printf '%s' "$3" || printf '%s' "$2"; }  # even
 # Create a unique, slash-free run dir runs/<repo>/<ts>-<sha8>-<job> (atomic via mkdir;
 # collision on same-second/sha/job retrigger -> -1, -2… suffix). Echoes the dir.
 make_rundir() {  # <ts> <sha8> <job>
-  local base="$RUNS/$1-$2-$3" d="$RUNS/$1-$2-$3" n=1
+  # H3 defense-in-depth: force the job component path-safe (no '/' -> no ENOENT mkdir loop) and
+  # BOUND the collision loop so a pathological component can never spin forever holding a slot.
+  local job; job="$(printf '%s' "$3" | tr -c 'A-Za-z0-9._-' '_')"
+  local base="$RUNS/$1-$2-$job" d="$RUNS/$1-$2-$job" n=1
   mkdir -p "$RUNS"
-  until mkdir "$d" 2>/dev/null; do d="$base-$n"; n=$((n + 1)); done
+  until mkdir "$d" 2>/dev/null; do
+    [ "$n" -gt 1000 ] && { d="$(mktemp -d "$RUNS/$1-$2-$job.XXXXXX")"; break; }
+    d="$base-$n"; n=$((n + 1))
+  done
   printf '%s' "$d"
 }
+# A safe ci.yml job key: an identifier [A-Za-z0-9._-] — no '/', no quote, no '..', no control
+# bytes. Job keys are filesystem path components AND get interpolated into yq queries, so a
+# non-identifier key is rejected at the source (closes H2 yq-injection + H3 mkdir-DoS).
+valid_job() { case "${1:-}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
 
 # JSON string escape (backslash + doublequote) for the hand-rolled meta writer.
 jesc() { printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
@@ -211,6 +221,7 @@ key_loaded()   { [ -s "${SOPS_AGE_KEY_FILE:-}" ]; }
 # Run one matched job inside a hardened, throwaway container.
 execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   local job="$1" event="$2" newrev="$3" pusher="$4" work="$5" manifest="$6"
+  valid_job "$job" || { log "$group: refusing invalid job key '$job'"; return 0; }   # belt: H2/H3
   local image timeout mem pids network runcmd ts dir name envfile rc outdir status_word
   local start_iso start_ns end_iso end_ns dur
   image="$(yq_str "$manifest" ".jobs.\"$job\".image")";     image="${image:-$DEFAULT_IMAGE}"
@@ -303,6 +314,7 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
 persist_env_for_teardown() {  # <work> <manifest> <srctar>
   local work="$1" manifest="$2" srctar="$3" tjob tscript timage
   for tjob in $(yq_keys "$manifest" ".jobs"); do
+    valid_job "$tjob" || continue
     [ -n "$(yq_str "$manifest" ".jobs.\"$tjob\".on.delete")" ] || continue
     tscript="$(yq_str "$manifest" ".jobs.\"$tjob\".run")"
     timage="$(yq_str "$manifest" ".jobs.\"$tjob\".image")"; timage="${timage:-$DEFAULT_IMAGE}"
@@ -321,6 +333,7 @@ persist_env_for_teardown() {  # <work> <manifest> <srctar>
 find_delete_job() {  # <manifest> -> first job whose on.delete matches $branch
   local manifest="$1" job inc ign
   for job in $(yq_keys "$manifest" ".jobs"); do
+    valid_job "$job" || continue
     [ -n "$(yq_str "$manifest" ".jobs.\"$job\".on.delete")" ] || continue
     inc="$(yq_list "$manifest" ".jobs.\"$job\".on.delete.branches")"
     ign="$(yq_list "$manifest" ".jobs.\"$job\".on.delete.\"branches-ignore\"")"
@@ -455,6 +468,7 @@ process_build() {  # <event> <newrev> <oldrev> <pusher> [onlyjob]
 
   local job inc ign pinc pign
   for job in $(yq_keys "$manifest" ".jobs"); do
+    valid_job "$job" || { log "$group: skipping invalid job key '$job' (not [A-Za-z0-9._-])"; continue; }
     if [ -n "$onlyjob" ]; then
       # explicit single job (ci-job run --job): force it, skip trigger/branch/path filters.
       [ "$job" = "$onlyjob" ] || continue

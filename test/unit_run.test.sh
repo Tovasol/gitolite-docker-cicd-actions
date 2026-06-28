@@ -105,5 +105,20 @@ assert_match    "mixed: --memory present"      "$got" '\-\-memory 2g'
 assert_no_match "mixed: no --pids-limit"       "$got" 'pids-limit'
 assert_match    "mixed: nproc fallback"        "$got" 'nproc=1024'
 
+suite "valid_job (job-key validation — H2 yq-inject / H3 mkdir-DoS)"
+assert_ok   "plain job accepted"          valid_job "deploy-site"
+assert_ok   "dots/underscore accepted"    valid_job "build_v1.2"
+assert_fail "slash rejected (mkdir DoS)"  valid_job "build/a"
+assert_fail "yq-injection key rejected"   valid_job 'x" | load_str(env("X")) #'
+assert_fail "quote rejected"              valid_job 'a"b'
+assert_fail "space rejected"              valid_job 'a b'
+assert_fail "empty rejected"              valid_job ''
+
+suite "make_rundir (path-safe + bounded — H3)"
+RUNS="$(mktemp -d)/runs"
+d="$(make_rundir 20260628T000000Z deadbeef 'build/a')"   # slash would ENOENT-loop the old version
+assert_ok       "rundir created despite slash in job" test -d "$d"
+assert_no_match "job component sanitized (no slash in leaf)" "${d##*/}" '/'
+
 rm -rf "$W"
 summary
