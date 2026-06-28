@@ -3,15 +3,18 @@
 ═══════════════════════════════════════════════════════════════════════════════
   All steps run on the VPS:  ssh <you>@git.example.com   (the [tag] says AS WHOM)
 
-  1. [root] update the runner from the RELEASE branch — one command does it all
-            (refreshes ~cicd-runner/src, runs install.sh + crontab + ci-job,
-             dropping to the cicd-runner user internally; in-flight builds survive):
+  1. [root] update the runner from the RELEASE branch — ONE command does it all
+            (refreshes ~cicd-runner/src via atomic swap, runs install.sh + crontab +
+             ci-job; drops to the cicd-runner user internally; in-flight builds survive;
+             SELF-REEXECS if update-runner.sh itself changed — no manual pre-step needed):
 
          sudo env BRANCH=release /home/cicd-runner/src/update-runner.sh \
               tovasol/gitolite-docker-cicd-actions
 
          • add --restart ONLY if init/*.openrc changed (bounces docker, kills builds).
-         • if update-runner.sh ITSELF changed, refresh it first, then re-run step 1:
+         • ONE-TIME BOOTSTRAP ONLY (if the on-box update-runner.sh predates self-reexec —
+           i.e. the first deploy after it was added): refresh ~/src by hand FIRST, then run
+           the command above. Never needed again afterwards:
              git --git-dir=/var/lib/gitolite/repositories/tovasol/gitolite-docker-cicd-actions.git \
                  archive release | sudo -u cicd-runner tar -x -C /home/cicd-runner/src
 
