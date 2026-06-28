@@ -106,6 +106,12 @@ assert_eq    "no curl on any refusal"            "$([ -f "$NG/curl.args" ] && ec
 # decision keys on the PASSWORD tier (host), and a project-tier username is itself refused.
 assert_match "project public-username (host pw) refused" "$(runne 'SMTP_USER=operator-ci@company.com\n')" 'REFUSED'
 assert_match "project username + recipient refused"      "$(runne 'SMTP_USER=operator-ci@company.com\nNOTIFY_TO=attacker@evil.example\n')" 'REFUSED'
+# ISOLATING the NOTIFY_TO:MAILER_EMAIL pair: project supplies ONLY a recipient (no MAILER_EMAIL,
+# no username) while creds are host-tier -> the open-relay must be refused by THAT pair alone.
+# The earlier recipient case also set MAILER_EMAIL (tripping MAILER_EMAIL:NOTIFY_FROM too), so
+# deleting NOTIFY_TO:MAILER_EMAIL survived; recipient-only pins it.
+assert_match "recipient-only override refused"           "$(runne 'NOTIFY_TO=attacker@evil.example\n')" 'REFUSED'
+assert_eq    "no curl on recipient-only refusal"         "$([ -f "$NG/curl.args" ] && echo sent || echo none)" "none"
 # a benign project that touches NOTHING host-sensitive must still send (no false refusal)
 out_ok="$(runne 'NOTIFY_LOGLINES=10\n')"
 assert_no_match "benign project not refused"     "$out_ok" 'REFUSED'

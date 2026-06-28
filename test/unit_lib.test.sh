@@ -45,6 +45,9 @@ assert_match "slug starts alnum (no leading dash)" "$(slugify '../../etc')" '^[a
 assert_no_match "shell metachars gone" "$(slugify '$(rm -rf /)')"   '[$()]'
 assert_match "empty -> safe base"    "$(slugify '')"                '^x-[0-9a-f]{6}$'
 assert_ne    "distinct inputs differ" "$(slugify 'a')" "$(slugify 'b')"
+# the appended sha1 — not the base — must be the discriminator: two inputs that base-slugify to
+# the SAME stem (foo-bar) must still differ, which can ONLY come from the hash suffix.
+assert_ne    "hash disambiguates same-base inputs" "$(slugify 'foo/bar')" "$(slugify 'foo!bar')"
 
 suite clamp_int
 assert_eq "in range"        "$(clamp_int 5 1 10)"   5

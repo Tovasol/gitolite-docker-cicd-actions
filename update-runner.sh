@@ -34,6 +34,10 @@ TRUSTED_ENTRYPOINT=/usr/local/sbin/cicd-update-runner
 # on-disk file root is currently executing (the gate lives INSIDE the file under question). So
 # root must invoke the installed, root-owned copy ($TRUSTED_ENTRYPOINT). Refuse any path whose
 # file or ancestor dirs are non-root-owned or group/other-writable.
+# The trusted owner is uid 0 (root). Factored into its own fn ONLY so the mutation/unit suite can
+# redefine it (after sourcing in LIB mode) to the test's uid — letting the mode-mask, ancestor
+# walk, and canonicalization be exercised on test-owned fixtures without real root. Prod = root.
+_prt_is_trusted_owner() { [ "${1:-}" = 0 ]; }
 path_root_trusted() {  # <path>
   local p; p="$(readlink -f "$1" 2>/dev/null)" || return 1
   [ -n "$p" ] || return 1
@@ -41,7 +45,7 @@ path_root_trusted() {  # <path>
     local own mode
     own="$(stat -c '%u' "$p" 2>/dev/null || stat -f '%u' "$p" 2>/dev/null)" || return 1
     mode="$(stat -c '%a' "$p" 2>/dev/null || stat -f '%Lp' "$p" 2>/dev/null)" || return 1
-    [ "$own" = 0 ] || return 1                       # must be owned by root
+    _prt_is_trusted_owner "$own" || return 1          # must be owned by root
     [ "$(( 8#$mode & 0022 ))" -eq 0 ] || return 1    # reject group/other-writable
     [ "$p" = / ] && break
     p="$(dirname "$p")"

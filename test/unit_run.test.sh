@@ -170,12 +170,13 @@ assert_eq    "temp-name symlink didn't hit victim"        "$(cat "$SP/victim")" 
 rm -rf "$SP"
 
 suite "per-repo cache path flattens '/' (no nesting — H4)"
-flat() { printf '%s' "$1" | tr '/' '%'; }
-assert_eq "team -> team"          "$(flat team)"     "team"
-assert_eq "team/app -> team%app"  "$(flat team/app)" "team%app"
+# assert the PRODUCTION cache_subdir (sourced from run-group.sh), not a local re-impl — so a
+# mutation that no-ops the '/' -> '%' flattening is caught here, not hidden behind a copy.
+assert_eq "team -> team (prod fn)"          "$(cache_subdir team)"     "team"
+assert_eq "team/app -> team%app (prod fn)"  "$(cache_subdir team/app)" "team%app"
 # the parent-named repo's dir must NOT be a path-prefix DIR of the child's (the H4 bug)
-case "$(flat team/app)" in "$(flat team)"/*) nested=yes ;; *) nested=no ;; esac
-assert_eq "team%app is not nested under team" "$nested" "no"
+case "$(cache_subdir team/app)" in "$(cache_subdir team)"/*) nested=yes ;; *) nested=no ;; esac
+assert_eq "team%app is not nested under team (prod fn)" "$nested" "no"
 
 rm -rf "$W"
 summary

@@ -42,7 +42,7 @@ if [ "$_CICD_MAIN" = 1 ]; then
     # of _per-repo/team/app — a 'team' writer's cache subtree overlaps 'team/app' and poisons its
     # CARGO_HOME/GRADLE_USER_HOME (H4). Flatten '/' -> '%' (never in a valid repo name, so the map
     # is injective + non-nesting): each repo gets ONE sibling dir, no prefix overlap.
-    CACHE="$RUNNER_BASE/cache/_per-repo/$(printf '%s' "$repo" | tr '/' '%')"
+    CACHE="$RUNNER_BASE/cache/_per-repo/$(cache_subdir "$repo")"
     mkdir -p "$CACHE" 2>/dev/null || true
   else
     CACHE="$RUNNER_BASE/cache"
@@ -155,6 +155,10 @@ clamp_timeout() {  # <raw> -> echoes a safe integer
 # notify email's log tail (which reads the now-redacted log). Short values (<6) are skipped to
 # avoid masking common tokens and corrupting logs.
 _emit_mask_rule() { printf 's/%s/[MASKED]/g\n' "$(printf '%s' "$1" | sed 's/[][\\/.^$*]/\\&/g')"; }
+# H4: map a (validated) repo name to its per-repo cache subdir, flattening '/' -> '%' so a nested
+# name (team/app) never nests under its parent's subtree (team). '%' can't appear in a valid repo
+# name, so the map is injective. A standalone fn so the suite asserts THIS, not a re-implementation.
+cache_subdir() { printf '%s' "$1" | tr '/' '%'; }
 build_mask_script() {  # <envfile> <out_sedscript>
   : > "$2"
   [ -f "$1" ] || return 0

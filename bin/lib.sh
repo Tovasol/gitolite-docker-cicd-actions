@@ -68,7 +68,7 @@ cicd_audit() {  # <event> [k=v ...]
         rm -rf "$_ld" 2>/dev/null || true; continue          # reclaim a leaked/stale lock
       fi
       _n=$((_n + 1))
-      if [ "$_n" -gt 300 ]; then
+      if [ "$_n" -gt "${AUDIT_LOCK_MAX_SPINS:-300}" ]; then
         _cicd_audit_append "$logf" "$(printf '%s\tserialization=lost' "$payload")"; return 0
       fi
       sleep 0.02 2>/dev/null || sleep 1

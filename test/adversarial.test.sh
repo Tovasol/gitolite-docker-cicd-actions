@@ -38,6 +38,9 @@ out="$(CICD_BASE="$TB" bash "$HERE/../bin/ci-runs" 2>/dev/null)"
 # lines that don't end in }, which the old anchored count silently ignored).
 assert_eq    "ci-runs emits exactly 1 line total"  "$(printf '%s\n' "$out" | grep -c .)" 1
 assert_match "valid line is the good one"          "$out" '"job":"smoke"'
+# the WHOLE POINT of ci-runs is enriching each meta with its run dir — assert the "dir" field
+# actually carries the run's directory (leaf 'good'), not just that the line is valid JSON.
+assert_match "line carries its run dir"            "$out" '"dir":"[^"]*/good"'
 # the emitted line must be VALID JSON — an off-by-one substr ($0,2 -> $0,1) makes it malformed.
 assert_json  "emitted line is valid JSON"          "$out"
 # neither garbage ('NOT JSON...' becomes 'OT JSON...' after substr) nor the truncated meta may
@@ -56,5 +59,12 @@ BY="$(mktemp)"; printf 'jobs:\n  deploy:\n    on: { push:\n  this is : not valid
 assert_ok    "yq_keys does not crash on bad yaml" bash -c "yq_keys '$BY' '.jobs' >/dev/null 2>&1; true"
 assert_eq    "yq_keys returns empty on bad yaml"  "$(yq_keys "$BY" '.jobs' 2>/dev/null)" ""
 rm -f "$BY"
+# POSITIVE case: feeding only malformed yaml lets a gutted yq_keys(){ :; } pass vacuously.
+# Pin that on VALID yaml yq_keys actually returns the keys (build, deploy). Needs yq v4.
+if command -v yq >/dev/null 2>&1; then
+  GY="$(mktemp)"; printf 'jobs:\n  build: {}\n  deploy: {}\n' > "$GY"
+  assert_eq "yq_keys lists keys on valid yaml" "$(yq_keys "$GY" '.jobs' | sort | tr '\n' ',')" "build,deploy,"
+  rm -f "$GY"
+else skip "yq_keys valid yaml" "yq not installed"; fi
 
 summary

@@ -123,6 +123,11 @@ got="$(grep '^ci-status' "$REC")"
 assert_match "status scopes to readable repos" "$got" 'ci-status .*--repos .*tovasol/app'
 assert_match "status includes lib (readable)"  "$got" 'tovasol/lib'
 assert_no_match "status EXCLUDES secret (no R)" "$got" 'tovasol/secret'
+# the SEPARATOR is the contract: ci-status parses `--repos a b c` (one quoted arg, space-joined).
+# Pin space-joining explicitly + forbid a comma-joined list — a `tr '\n' ','` mutation would
+# pass the wildcard asserts above (each repo still appears) but breaks ci-status's parse.
+assert_match "repos are space-separated"       "$got" 'ci-status --repos tovasol/app tovasol/lib( |$)'
+assert_no_match "repos NOT comma-joined"       "$got" 'tovasol/app,tovasol/lib'
 # scoped form `ci-job status <repo>` is its own READ-gated branch — exercise it on an R-ONLY
 # repo so an R->W flip of the gate is visible (tovasol/lib has R but not W).
 : > "$REC"; run_cijob alice status tovasol/lib >/dev/null 2>&1
@@ -150,6 +155,18 @@ assert_eq    "no ci-status call on bad scope"   "$(grep -c '^ci-status' "$REC")"
 : > "$REC"; out="$(run_cijob alice log "tovasol/app')OR(1=1" deploy 2>&1)"; rc=$?
 assert_ne    "SQLi log repo rejected"           "$rc" 0
 assert_eq    "no ci-log call on bad repo"       "$(grep -c '^ci-log' "$REC")" 0
+# CLEAN traversal: 'tovasol/../secret' uses ONLY [A-Za-z0-9._/-], so the charclass arm of
+# valid_repo never fires — only the dedicated `*..*` arm can reject it. Every other payload
+# above also trips the charclass, hiding a deleted `*..*` arm; this isolates it on BOTH read
+# paths (status & log), where `..` would flow into ci-status SQL / a ci-log filesystem path.
+: > "$REC"; out="$(run_cijob alice status 'tovasol/../secret' 2>&1)"; rc=$?
+assert_ne    "clean-traversal status rejected"  "$rc" 0
+assert_match "names invalid repo (status .. )"  "$out" 'invalid repo'
+assert_eq    "no ci-status on clean traversal"  "$(grep -c '^ci-status' "$REC")" 0
+: > "$REC"; out="$(run_cijob alice log 'tovasol/../secret' deploy 2>&1)"; rc=$?
+assert_ne    "clean-traversal log rejected"     "$rc" 0
+assert_match "names invalid repo (log .. )"     "$out" 'invalid repo'
+assert_eq    "no ci-log on clean traversal"     "$(grep -c '^ci-log' "$REC")" 0
 
 suite "ci-job run --watch (polls status, no queue bypass)"
 rm -f "$M/poll.n"

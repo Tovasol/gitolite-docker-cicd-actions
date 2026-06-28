@@ -54,6 +54,14 @@ assert_ok   "first dir created"   test -d "$d1"
 assert_ok   "second dir created"  test -d "$d2"
 assert_ne   "collision -> distinct dirs" "$d1" "$d2"
 assert_match "leaf is slash-free run-id" "$(basename "$d1")" '^20260623T100000Z-deadbeef-smoke'
+# D2: pin the collision-suffix SCHEME — the 2nd dir on a same-id collision must be the 1st's
+# basename + '-1' (not merely distinct). Dropping the `-N` suffix logic breaks this.
+assert_eq   "collision suffix is -1"     "$(basename "$d2")" "$(basename "$d1")-1"
+# D1: an unsafe job component must be sanitized (`tr -c 'A-Za-z0-9._-' '_'`): 'a/b/c' -> 'a_b_c'
+# so it can never become a nested path or escape RUNS. Deleting the tr leaves slashes in.
+d3="$(make_rundir 20260623T100000Z deadbeef 'a/b/c')"
+assert_match "unsafe job sanitized in leaf" "$(basename "$d3")" '^20260623T100000Z-deadbeef-a_b_c$'
+assert_eq    "sanitized dir stays under RUNS" "$(dirname "$d3")" "$RUNS"
 rm -rf "$(dirname "$RUNS")"
 
 summary
