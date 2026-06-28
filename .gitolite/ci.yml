@@ -1,16 +1,16 @@
 version: 1
 jobs:
-  # liveness check — every push to main, no secrets. Proves the pipeline is alive.
+  # liveness check — every push to main/release, no secrets. Proves the pipeline is alive.
   smoke:
-    on: { push: { branches: [main] } }
+    on: { push: { branches: [main, release] } }
     image: alpine
     run: sh ci/smoke.sh
 
   # self-test: lint + unit + adversarial suite for the runner itself. The whole repo
-  # IS the runner, so this fires on every push to main. Self-contained — installs its
-  # own deps (shellcheck, yq, duckdb) in-container; needs no secrets.
+  # IS the runner. Runs on main (integration) AND release (re-confirm the promoted tree
+  # before deploy). Self-contained — installs its own deps in-container; needs no secrets.
   test:
-    on: { push: { branches: [main] } }
+    on: { push: { branches: [main, release] } }
     image: node:lts-bookworm-slim          # bash + node (harness JSON validation)
     timeout: 600
     run: sh ci/test.sh
