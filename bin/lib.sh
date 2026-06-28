@@ -172,6 +172,11 @@ paths_match() {
 
 is_trusted_branch() { matches_any "$1" "${TRUSTED_BRANCHES:-}"; }
 
+# A stored branch name (from the job-controlled /envstate mount) is later used as a queue PATH
+# component and a run-group argv. It's only validated at INGEST (cicd-ingest), so re-validate it
+# before any downstream path/exec use — git's own ref-name rules reject `../` traversal + junk (F3).
+valid_branch() { git check-ref-format "refs/heads/${1:-}" 2>/dev/null; }
+
 # clamp_int <value> <lo> <hi> -> integer in [lo,hi]; non-numeric -> lo
 clamp_int() {
   local v="$1" lo="$2" hi="$3"

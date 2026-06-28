@@ -1,0 +1,5 @@
+jobs:
+  build:
+    env:
+      "$(touch /tmp/PWNED_envkey)": x
+      "`touch /tmp/PWNED_envkey2`": y

@@ -18,6 +18,9 @@ report=$(( ${REPORT_STALE_DAYS:-30} * 86400 ))
 
 find "$RUNNER_BASE/envs" -maxdepth 2 -mindepth 2 -type d 2>/dev/null | while read -r envdir; do
   rel="${envdir#"$RUNNER_BASE"/envs/}"; repo="${rel%/*}"
+  # the branch file lives in the job-controlled /envstate mount: a symlink would make `cat` read a
+  # host file (F1); junk content would traverse out of queue/ when used as a path below (F3).
+  if [ -L "$envdir/branch" ]; then log "reap-envs: $repo branch file is a symlink — skipping (envstate guard)"; continue; fi
   branch="$(cat "$envdir/branch" 2>/dev/null || echo '?')"
   if [ -f "$envdir/teardown-failed" ]; then
     log "reap-envs: $repo/$branch AWAITING OPERATOR (teardown-failed) — ci-teardown retry|abandon"
@@ -26,6 +29,7 @@ find "$RUNNER_BASE/envs" -maxdepth 2 -mindepth 2 -type d 2>/dev/null | while rea
   la="$(stat -c %Y "$envdir" 2>/dev/null || echo "$now")"   # last activity = env dir mtime
   age=$(( now - la ))
   if [ "$auto" -gt 0 ] && [ "$age" -gt "$auto" ]; then
+    valid_branch "$branch" || { log "reap-envs: $repo invalid stored branch '$branch' — skipping AUTO teardown (F3)"; continue; }
     log "reap-envs: AUTO teardown stale env $repo/$branch (idle ${age}s)"
     q="$RUNNER_BASE/queue/$repo/$branch"; mkdir -p "$q"
     printf 'delete %s %s reaper\n' "$ZERO" "$ZERO" > "$q/target.tmp"; mv -f "$q/target.tmp" "$q/target"

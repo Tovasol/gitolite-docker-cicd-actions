@@ -178,5 +178,41 @@ assert_eq "team/app -> team%app (prod fn)"  "$(cache_subdir team/app)" "team%app
 case "$(cache_subdir team/app)" in "$(cache_subdir team)"/*) nested=yes ;; *) nested=no ;; esac
 assert_eq "team%app is not nested under team (prod fn)" "$nested" "no"
 
+suite "safe_write / safe_read — /envstate symlink guards (F1/F2)"
+EV="$(mktemp -d)"
+# F2: a job plants $ENVS/branch -> a host victim; safe_write must NOT write THROUGH the symlink
+printf 'VICTIM-ORIGINAL\n' > "$EV/victim"
+ln -sf "$EV/victim" "$EV/branch"
+printf 'main' | safe_write "$EV/branch"
+assert_eq    "safe_write didn't write through symlink" "$(cat "$EV/victim")" "VICTIM-ORIGINAL"
+assert_fail  "dst is no longer a symlink"              test -L "$EV/branch"
+assert_eq    "dst holds the intended content"          "$(cat "$EV/branch")" "main"
+# F1: a job plants $ENVS/teardown.cmd -> the host master key; safe_read must REFUSE to follow it
+printf 'AGE-SECRET-KEY-MASTER\n' > "$EV/agekey"
+ln -sf "$EV/agekey" "$EV/teardown.cmd"
+got="$(safe_read "$EV/teardown.cmd" 2>/dev/null)"; rc=$?
+assert_ne    "safe_read refused the symlink (nonzero)" "$rc" 0
+assert_no_match "master key NOT returned"              "$got" 'AGE-SECRET-KEY-MASTER'
+# a real regular file reads back fine
+printf 'echo bye\n' > "$EV/real.cmd"
+assert_eq    "safe_read reads a regular file"          "$(safe_read "$EV/real.cmd")" "echo bye"
+rm -rf "$EV"
+
+suite "valid_branch — stored branch re-validation (F3)"
+assert_ok   "normal branch accepted"        valid_branch "main"
+assert_ok   "slashy feature branch accepted" valid_branch "feature/x-1"
+assert_fail "traversal branch rejected"     valid_branch "../../../../ESCAPED/run"
+assert_fail "dotdot component rejected"     valid_branch "a/../../etc"
+assert_fail "empty rejected"                valid_branch ""
+assert_fail "space rejected"                valid_branch "a b"
+
+suite "valid_env_key — custom env-key validation (F4)"
+assert_ok   "plain key accepted"            valid_env_key "API_KEY"
+assert_fail "glob key '*' rejected"         valid_env_key "*"
+assert_fail "space in key rejected"         valid_env_key "MY VAR"
+assert_fail "empty key rejected"            valid_env_key ""
+assert_fail "leading-digit rejected"        valid_env_key "1ABC"
+assert_fail "dash rejected"                 valid_env_key "A-B"
+
 rm -rf "$W"
 summary

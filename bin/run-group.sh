@@ -26,6 +26,9 @@ APT_HARDEN=()   # populated in the main-init block; placeholder so sourced tests
 if [ "$_CICD_MAIN" = 1 ]; then
   cicd_load_config || exit 1
   repo="$1"; branch="$2"
+  # Defense-in-depth (F3): callers (reap-envs/ci-teardown) may pass a branch recovered from the
+  # job-controlled /envstate; re-validate before it becomes the queue path ($Q) below.
+  valid_branch "$branch" || { echo "run-group: invalid branch '$branch'" >&2; exit 1; }
   group="$repo/$branch"
   slug="$(slugify "$branch")"
   Q="$RUNNER_BASE/queue/$group"
@@ -159,6 +162,9 @@ _emit_mask_rule() { printf 's/%s/[MASKED]/g\n' "$(printf '%s' "$1" | sed 's/[][\
 # name (team/app) never nests under its parent's subtree (team). '%' can't appear in a valid repo
 # name, so the map is injective. A standalone fn so the suite asserts THIS, not a re-implementation.
 cache_subdir() { printf '%s' "$1" | tr '/' '%'; }
+# A valid custom-env-var NAME: non-empty, [A-Za-z0-9_] only, not leading-digit. Rejects a key like
+# "*" (which `for ek in $(...)` would glob-expand against CWD) or one with spaces (F4).
+valid_env_key() { case "${1:-}" in ''|*[!A-Za-z0-9_]*|[0-9]*) return 1 ;; *) return 0 ;; esac; }
 build_mask_script() {  # <envfile> <out_sedscript>
   : > "$2"
   [ -f "$1" ] || return 0
@@ -272,10 +278,14 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   # CI_*/cache so it can override them (by design), BEFORE the secrets --env-file so a
   # secret still wins. See DESIGN §4 "Custom job env".
   local jenv=() ek ev
-  for ek in $(yq_keys "$manifest" ".jobs.\"$job\".env"); do
+  # read keys line-by-line (NOT `for ek in $(...)`, which word-splits + GLOB-expands a key like
+  # "*" against the runner CWD, leaking filenames + dropping the real var — F4) and reject any key
+  # that isn't a valid env-var name before it becomes a `-e KEY=VALUE` arg.
+  while IFS= read -r ek; do
+    valid_env_key "$ek" || { [ -n "$ek" ] && log "$group/$job: skipping invalid env key '$ek'"; continue; }
     ev="$(yq_str "$manifest" ".jobs.\"$job\".env.\"$ek\"")"
     jenv+=(-e "$ek=$ev")
-  done
+  done < <(yq_keys "$manifest" ".jobs.\"$job\".env")
   # retry + notify live in the script via /cicd/lib.sh; runner owns safety + delivery.
 
   ts="$(date -u +%Y%m%dT%H%M%SZ)"; start_iso="$(_ts)"; start_ns="$(date +%s%N)"
@@ -356,6 +366,23 @@ safe_persist() {  # <src> <dst>
   rm -f "$tmp" 2>/dev/null || true         # the temp name could be planted too
   cp -f "$src" "$tmp" 2>/dev/null && mv -f "$tmp" "$dst" 2>/dev/null || { rm -f "$tmp"; return 1; }
 }
+# Write stdin to a host path under the job-controlled /envstate mount, refusing to follow a
+# container-planted symlink (F2): a job that plants `branch -> ~cicd-runner/.../reap-containers`
+# would otherwise have a bare `>` write attacker bytes THROUGH the link. lstat-reject, then write a
+# fresh regular file. Use for EVERY $ENVS write (branch/teardown.cmd/teardown.image/meta.json/...).
+safe_write() {  # <dst>   (content on stdin)
+  [ -L "$1" ] && rm -f "$1"
+  cat > "$1"
+}
+# Read a host file under /envstate to stdout, refusing a container-planted symlink (F1): a job
+# plants `teardown.cmd -> /run/ci-keys/age-keys.txt` and a bare `cat` would read the host SOPS age
+# MASTER key (which the per-repo redactor wouldn't mask) into a log the writer can read. Returns
+# nonzero + no output on a symlink or missing file.
+safe_read() {  # <path>
+  [ -L "$1" ] && { log "${group:-?}: $1 is a symlink — refusing to read (envstate guard, F1)"; return 1; }
+  [ -f "$1" ] || return 1
+  cat -- "$1"
+}
 
 # Persist what teardown needs, so a delete (hook OR reaper) can run without repo access.
 persist_env_for_teardown() {  # <work> <manifest> <srctar>
@@ -366,11 +393,13 @@ persist_env_for_teardown() {  # <work> <manifest> <srctar>
     tscript="$(yq_str "$manifest" ".jobs.\"$tjob\".run")"
     timage="$(yq_str "$manifest" ".jobs.\"$tjob\".image")"; timage="${timage:-$DEFAULT_IMAGE}"
     mkdir -p "$ENVS"
-    printf '%s' "$branch"  > "$ENVS/branch"         # EXACT branch (recoverable; §31)
-    printf '%s\n' "$tscript" > "$ENVS/teardown.cmd"
-    printf '%s\n' "$timage"  > "$ENVS/teardown.image"
+    # ALL $ENVS writes go through safe_write — the job controls this mount and can plant a symlink
+    # at any of these names to redirect the write to a host file (F2). EXACT branch recoverable §31.
+    printf '%s' "$branch"    | safe_write "$ENVS/branch"
+    printf '%s\n' "$tscript" | safe_write "$ENVS/teardown.cmd"
+    printf '%s\n' "$timage"  | safe_write "$ENVS/teardown.image"
     printf '{"repo":"%s","branch":"%s","slug":"%s","saved":"%s"}\n' \
-      "$repo" "$branch" "$slug" "$(_ts)" > "$ENVS/meta.json"
+      "$repo" "$branch" "$slug" "$(_ts)" | safe_write "$ENVS/meta.json"
     safe_persist "$srctar" "$ENVS/source.tar"   # latest tree for teardown (symlink-guarded, H1)
     log "$group: persisted teardown plan for $slug (job=$tjob)"
     return 0
@@ -417,8 +446,10 @@ run_teardown() {  # <oldrev> <pusher>
     fi
   fi
   if [ -z "${runcmd:-}" ] && [ -f "$ENVS/teardown.cmd" ]; then   # minimal fallback
-    image="$(cat "$ENVS/teardown.image" 2>/dev/null)"; image="${image:-$DEFAULT_IMAGE}"
-    runcmd="$(cat "$ENVS/teardown.cmd")"
+    # safe_read refuses a container-planted symlink (F1) — a planted teardown.cmd -> host master
+    # key would otherwise be cat'd into the log. A symlink -> empty runcmd -> "nothing to tear down".
+    image="$(safe_read "$ENVS/teardown.image" 2>/dev/null)"; image="${image:-$DEFAULT_IMAGE}"
+    runcmd="$(safe_read "$ENVS/teardown.cmd")"
     mountwork=(-w /envstate)
   fi
   if [ -z "${runcmd:-}" ]; then
@@ -479,8 +510,8 @@ run_teardown() {  # <oldrev> <pusher>
   else
     # KEEP the tree + state for operator retry — copy the delivered tar into the env dir.
     safe_persist "$srctar" "$ENVS/source.tar" || true   # symlink-guarded (H1)
-    printf '%s' "$branch" > "$ENVS/branch"
-    printf 'exit:%s @ %s\nlog: %s\n' "$rc" "$(_ts)" "$dir/output.log" > "$ENVS/teardown-failed"
+    printf '%s' "$branch" | safe_write "$ENVS/branch"
+    printf 'exit:%s @ %s\nlog: %s\n' "$rc" "$(_ts)" "$dir/output.log" | safe_write "$ENVS/teardown-failed"
     cicd_flush_outbox "$outdir/notify" "$rc" "$dir" "$group teardown NEEDS OPERATOR (ci-teardown)" "$envfile" "$maskfile"
     log "$group: teardown FAILED ($rc) — source+state KEPT, no auto-retry"
   fi

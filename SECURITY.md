@@ -83,11 +83,14 @@ These are deliberate trade-offs for a small-scale, trusted-operator tool:
    serves. *Mitigation: pin by digest (`@sha256:…`).*
 6. **Container code runs as root-in-namespace.** Mapped to an unprivileged host uid, but
    a job has root *within* its container. A genuine escape relies on a docker/kernel CVE;
-   keep the host patched. Note the *confused-deputy* path is closed separately: the trusted
-   host code that touches the RW `/envstate` and `/cicd/out` mounts after a container exits
-   (`cp` into `source.tar`, reading the notify outbox) lstat-rejects container-planted
-   symlinks, so a job can't make the runner read/write an attacker-chosen host path without
-   an actual escape.
+   keep the host patched. Note the *confused-deputy* path is closed separately: **all**
+   trusted host I/O on the RW `/envstate` and `/cicd/out` mounts after a container exits goes
+   through symlink-rejecting helpers — `safe_persist` (source.tar), `safe_write` (branch,
+   teardown.cmd/image, meta.json, teardown-failed), `safe_read` (teardown.cmd/image),
+   `cicd_flush_outbox` (notify outbox) — so a job can't make the runner read or write an
+   attacker-chosen host path without an actual escape. State recovered from `/envstate` (the
+   stored branch) is also re-validated with `git check-ref-format` before it is used as a
+   path or argv (so a planted `branch` can't traverse out of `RUNNER_BASE`).
 7. **The runner-repo deploy branch is a ROOT trust boundary.** `update-runner.sh` extracts
    that branch's tree and runs/installs it **as root**, so **whoever can push the deploy
    branch (default `release`) effectively gets root on the runner host** — by design, no
