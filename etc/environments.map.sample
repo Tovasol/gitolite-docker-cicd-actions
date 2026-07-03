@@ -1,0 +1,16 @@
+# environments.map — host-side branch -> environment map (OPERATOR-owned, trusted).
+# Install as $RUNNER_BASE/etc/environments.map (or point CICD_ENV_MAP at it in runner.conf).
+# Lines: <repo-glob>  <branch-glob>  <env>    First match wins. '#' = comment.
+#
+# Purpose: the runner resolves a run's ENVIRONMENT from its (trusted, gitolite-gated)
+# BRANCH, then decrypts ONLY ci/secrets.<env>.enc.yaml. The branch->env binding lives
+# HERE (host-side), NOT in the pushed .gitolite/ci.yml, so a pusher cannot claim another
+# tier's secrets. This file is the equivalent of GitHub "environment protection rules".
+#
+# If NO map is present, env defaults to the sanitized branch name (dev->dev, prod->prod).
+# Only add entries to ALIAS a branch whose name differs from its env (e.g. main->prod).
+
+# repo-glob        branch-glob     env
+# tovasol/*        main            prod
+# tovasol/*        release/*       prod
+# tovasol/*        staging         qa

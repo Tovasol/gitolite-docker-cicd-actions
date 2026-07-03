@@ -263,6 +263,52 @@ emit_meta() {  # <file> <status> [exit] [end_iso] [end_ns] [dur]  (last 4 option
 ready_docker() { docker info >/dev/null 2>&1; }
 key_loaded()   { [ -s "${SOPS_AGE_KEY_FILE:-}" ]; }
 
+# --- per-environment secret scoping (DESIGN: branch-scoped secrets) ---------------
+# A repo may carry per-environment secret files `ci/secrets.<env>.enc.yaml` instead of
+# (or alongside) the legacy single `ci/secrets.enc.yaml`. The runner decrypts ONLY the
+# file for the environment resolved from the TRUSTED branch — never from the pushed
+# manifest — so a pusher who (per gitolite refex ACL) can only push `dev` cannot cause
+# the `prod` secrets to be decrypted. The runner's single master age key is a recipient
+# on every tier file; human read/edit access is tiered via .sops.yaml recipients.
+#
+# resolve_env <repo> <branch> -> env name. Optional host-side map (CICD_ENV_MAP, default
+# $RUNNER_BASE/etc/environments.map) aliases branches -> envs: lines `<repo-glob>
+# <branch-glob> <env>`, first match wins, '#' comments. Default = sanitized branch name.
+resolve_env() {  # <repo> <branch>
+  local r="$1" b="$2" mapf="${CICD_ENV_MAP:-$RUNNER_BASE/etc/environments.map}" rg bg e
+  if [ -f "$mapf" ]; then
+    while read -r rg bg e; do
+      case "$rg" in ''|'#'*) continue ;; esac
+      [ -n "$e" ] || continue
+      # $rg/$bg are intentional globs (the map's whole purpose); pusher can't edit the map.
+      # shellcheck disable=SC2254
+      case "$r" in $rg) case "$b" in $bg) printf '%s\n' "$e"; return 0 ;; esac ;; esac
+    done < "$mapf"
+  fi
+  printf '%s\n' "$(printf '%s' "$b" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-')"
+}
+
+# Does this tree carry any per-env secrets file? (glob, no `ls` — nullglob-safe)
+has_env_secrets() {  # <workdir>
+  local f
+  for f in "$1"/ci/secrets.*.enc.yaml; do [ -e "$f" ] && return 0; done
+  return 1
+}
+# Any secrets at all (legacy single-file OR per-env)?
+has_any_secrets() {  # <workdir>
+  [ -f "$1/ci/secrets.enc.yaml" ] || has_env_secrets "$1"
+}
+# Pick the secrets file this run should use. Echoes a path (or nothing = no secrets).
+# rc 2 = REFUSE: per-env files exist but none for this env (caller must fail the job,
+# NOT silently fall back to a legacy blob that would leak the wrong tier).
+select_secrets_file() {  # <workdir> <env>
+  local work="$1" env="$2" f="$1/ci/secrets.$2.enc.yaml"
+  if [ -n "$env" ] && [ -f "$f" ]; then printf '%s\n' "$f"; return 0; fi
+  has_env_secrets "$work" && return 2
+  [ -f "$work/ci/secrets.enc.yaml" ] && printf '%s\n' "$work/ci/secrets.enc.yaml"
+  return 0
+}
+
 # Run one matched job inside a hardened, throwaway container.
 execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   local job="$1" event="$2" newrev="$3" pusher="$4" work="$5" manifest="$6"
@@ -306,13 +352,34 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
   cicd_audit job-start "repo=$repo" "branch=$branch" "job=$job" "sha=$newrev" "pusher=$pusher"
 
   envfile=""
-  if [ -f "$work/ci/secrets.enc.yaml" ]; then
+  local env_name declared secfile sel_rc
+  # Environment is resolved from the TRUSTED branch, never the pushed manifest.
+  env_name="$(resolve_env "$repo" "$branch")"
+  # A job MAY declare its environment for readability; it must match the branch-resolved
+  # one or we refuse (catches misconfig + any attempt to claim another tier's secrets).
+  declared="$(yq_str "$manifest" ".jobs.\"$job\".environment")"
+  if [ -n "$declared" ] && [ "$declared" != "$env_name" ]; then
+    end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))
+    emit_meta "$dir/meta.json" secrets-decrypt-failed 1 "$(_ts)" "$end_ns" "$dur"
+    notify_failure "$group/$job" secrets "$dir/output.log"
+    log "$group/$job: declared environment '$declared' != branch-resolved '$env_name' — refusing"
+    return 1
+  fi
+  secfile="$(select_secrets_file "$work" "$env_name")"; sel_rc=$?
+  if [ "$sel_rc" -eq 2 ]; then
+    end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))
+    emit_meta "$dir/meta.json" secrets-decrypt-failed 1 "$(_ts)" "$end_ns" "$dur"
+    notify_failure "$group/$job" secrets "$dir/output.log"
+    log "$group/$job: per-env secrets present but none for env '$env_name' — refusing (no legacy fallback)"
+    return 1
+  fi
+  if [ -n "$secfile" ]; then
     envfile="$(mktemp -p "${SHM_DIR:-/dev/shm}" cicd.env.XXXXXX)"
-    if ! sops -d --output-type dotenv "$work/ci/secrets.enc.yaml" > "$envfile" 2>"$dir/secrets.err"; then
+    if ! sops -d --output-type dotenv "$secfile" > "$envfile" 2>"$dir/secrets.err"; then
       end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))
       emit_meta "$dir/meta.json" secrets-decrypt-failed 1 "$(_ts)" "$end_ns" "$dur"; rm -f "$envfile"
       notify_failure "$group/$job" secrets "$dir/output.log"
-      log "$group/$job: secret decrypt failed (key loaded? run unlock-ci) — see $dir/secrets.err"
+      log "$group/$job: secret decrypt failed ($secfile) (key loaded? run unlock-ci) — see $dir/secrets.err"
       return 1
     fi
     rm -f "$dir/secrets.err"
@@ -469,7 +536,10 @@ run_teardown() {  # <oldrev> <pusher>
   fi
 
   secsrc=""
-  [ -n "$work" ] && [ -f "$work/ci/secrets.enc.yaml" ] && secsrc="$work/ci/secrets.enc.yaml"
+  if [ -n "$work" ]; then
+    local tenv; tenv="$(resolve_env "$repo" "$branch")"
+    secsrc="$(select_secrets_file "$work" "$tenv")" || secsrc=""   # rc2 (no tier match) -> no secrets
+  fi
   # DEFER teardown if it needs secrets but the key isn't loaded — don't mark it failed
   # (env-not-ready ≠ code failure); retry once the key is posted.
   if [ -n "$secsrc" ] && ! key_loaded; then
@@ -548,7 +618,7 @@ process_build() {  # <event> <newrev> <oldrev> <pusher> [onlyjob]
 
   # DEFER (don't consume) if this repo needs secrets but the key isn't loaded — e.g.
   # post-reboot before unlock-ci. Keep incoming/<sha>.tar; ci-recover retries when ready.
-  if [ -f "$work/ci/secrets.enc.yaml" ] && ! key_loaded; then
+  if has_any_secrets "$work" && ! key_loaded; then
     log "$group: key not loaded + repo has secrets — DEFERRING $newrev (retry after unlock-ci)"
     rm -rf "$work"; return 2
   fi
