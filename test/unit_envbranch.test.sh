@@ -23,9 +23,16 @@ mk_env() {  # <branch> [content] -> echoes the dir
 }
 
 suite "recover_env_branch — honest env recovers the EXACT branch"
-d="$(mk_env dev)";      assert_eq "dev"        "$(recover_env_branch "$d")" "dev"
-d="$(mk_env prod)";     assert_eq "prod"       "$(recover_env_branch "$d")" "prod"
-d="$(mk_env feat/x_y)"; assert_eq "slash/ref"  "$(recover_env_branch "$d")" "feat/x_y"
+# recover_env_branch validates via valid_branch (git check-ref-format). The CI test container
+# (node:20-alpine) may lack git -> valid_branch fails -> honest recover returns empty. Skip there
+# (in prod git is always present; a missing git makes it fail-SAFE = branch refused, teardown skipped).
+if command -v git >/dev/null 2>&1; then
+  d="$(mk_env dev)";      assert_eq "dev"        "$(recover_env_branch "$d")" "dev"
+  d="$(mk_env prod)";     assert_eq "prod"       "$(recover_env_branch "$d")" "prod"
+  d="$(mk_env feat/x_y)"; assert_eq "slash/ref"  "$(recover_env_branch "$d")" "feat/x_y"
+else
+  skip "honest recover_env_branch" "git not in this environment (valid_branch is host-only)"
+fi
 
 suite "recover_env_branch — REFUSE a job-forged branch (slug mismatch)"
 # dir is slugify(dev) but the job overwrote branch -> 'prod' (a valid ref, wrong dir): the H1/F-A vector
