@@ -12,9 +12,23 @@ GIT_REPO_BASE=/home/git/repositories          # gitolite bare repos live here (<
 LOCAL_BIN=/home/cicd-runner/.local/bin
 
 # --- secrets (sops + age) ---
-# The age private key, decrypted into ramfs by `unlock-ci` (cleared on reboot).
+# LEGACY single key: used for repos still on one ci/secrets.enc.yaml. Decrypted into ramfs by
+# `unlock-ci` when the piped key matches NO AGE_RECIPIENT_* below. Cleared on reboot.
 SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt
 SHM_DIR=/dev/shm                              # tmpfs for transient decrypted env-files
+
+# PER-TIER keys (per-environment secret scoping — docs/per-env-secrets.md). A repo with
+# ci/secrets.<env>.enc.yaml is decrypted with ONLY $AGE_KEY_DIR/<env>.age (the runner never
+# loads a shared master), so a lower tier can't decrypt a higher tier's blob. `unlock-ci`
+# routes each piped key to its slot by IDENTITY: it derives the key's public recipient and
+# matches it against AGE_RECIPIENT_<env> here — so you can't mis-file prod's key as dev's.
+AGE_KEY_DIR=/run/ci-keys                       # ramfs; holds <env>.age (+ the legacy file above)
+AGE_ENVS="dev qa prod"                         # tiers that have their own key
+# Public recipients (age1…) of each tier's key. Fill from `age-keygen -y <key>`. NOT secret —
+# but keep runner.conf write-controlled (operator-owned); a tampered map could mis-route a key.
+AGE_RECIPIENT_dev=age1REPLACE_dev_public_recipient
+AGE_RECIPIENT_qa=age1REPLACE_qa_public_recipient
+AGE_RECIPIENT_prod=age1REPLACE_prod_public_recipient
 
 # --- concurrency ---
 MAX_JOBS=4                                     # global cap on simultaneous docker runs

@@ -52,6 +52,10 @@ if [ "$_CICD_MAIN" = 1 ]; then
   fi
   INC="$RUNNER_BASE/incoming/$group"          # cicd-ingest drops <sha>.tar + <sha>.changed
   export SOPS_AGE_KEY_FILE
+  # per-tier key dir (secrets.<env>.enc.yaml -> $AGE_KEY_DIR/<env>.age). Default to the same
+  # ramfs dir as the legacy key so secrets_keyfile always resolves even on a pre-per-tier conf.
+  AGE_KEY_DIR="${AGE_KEY_DIR:-$(dirname "${SOPS_AGE_KEY_FILE:-/run/ci-keys/age-keys.txt}")}"
+  export AGE_KEY_DIR
   [ -n "${DOCKER_HOST:-}" ] && export DOCKER_HOST
   # detached (no tty, via the hook's setsid+sudo) -> log to the runner log
   [ -t 1 ] || exec >>"$RUNNER_BASE/runner.log" 2>&1
@@ -268,8 +272,11 @@ key_loaded()   { [ -s "${SOPS_AGE_KEY_FILE:-}" ]; }
 # (or alongside) the legacy single `ci/secrets.enc.yaml`. The runner decrypts ONLY the
 # file for the environment resolved from the TRUSTED branch — never from the pushed
 # manifest — so a pusher who (per gitolite refex ACL) can only push `dev` cannot cause
-# the `prod` secrets to be decrypted. The runner's single master age key is a recipient
-# on every tier file; human read/edit access is tiered via .sops.yaml recipients.
+# the `prod` secrets to be decrypted. Each tier file is encrypted to its OWN age recipient
+# (no shared master), and the runner loads ONLY the resolved tier's private key at decrypt
+# ($AGE_KEY_DIR/<env>.age via secrets_keyfile) — so prod ciphertext copied/symlinked under a
+# dev filename still can't be decrypted by the dev key. Human read/edit access is tiered via
+# .sops.yaml PGP recipients. Legacy single-file repos keep the old SOPS_AGE_KEY_FILE key.
 #
 # resolve_env <repo> <branch> -> env name. Optional host-side map (CICD_ENV_MAP, default
 # $RUNNER_BASE/etc/environments.map) aliases branches -> envs: lines `<repo-glob>
@@ -298,16 +305,47 @@ has_env_secrets() {  # <workdir>
 has_any_secrets() {  # <workdir>
   [ -f "$1/ci/secrets.enc.yaml" ] || has_env_secrets "$1"
 }
+# A secret file is decrypted HOST-SIDE (sops runs as the runner) but lives in $work — the attacker-
+# delivered, tar-extracted tree, which can carry planted symlinks (`tar -x` preserves them). Refuse a
+# candidate that is a symlink, or whose REAL directory isn't exactly <work>/ci, so a planted
+# `secrets.<env>.enc.yaml -> /run/ci-keys/…` (or any other host file) can't be read host-side. The age
+# key never enters a container — but the DECRYPT INPUT does, so it needs the same F1-class symlink guard
+# as every $ENVS read (safe_read). pwd -P canonicalizes intermediate symlinks (e.g. a planted ci -> /run).
+secret_in_tree() {  # <workdir> <path>
+  local work="$1" f="$2" fdir wdir
+  [ -f "$f" ] || return 1
+  [ -L "$f" ] && return 1
+  fdir="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || return 1
+  wdir="$(cd "$work" 2>/dev/null && pwd -P)" || return 1
+  [ "$fdir" = "$wdir/ci" ]
+}
 # Pick the secrets file this run should use. Echoes a path (or nothing = no secrets).
 # rc 2 = REFUSE: per-env files exist but none for this env (caller must fail the job,
-# NOT silently fall back to a legacy blob that would leak the wrong tier).
+# NOT silently fall back to a legacy blob that would leak the wrong tier). A candidate that
+# fails secret_in_tree (planted symlink / escapes $work/ci) is treated as absent -> fails safe
+# (per-env present but the match is a bad symlink -> REFUSE rc2, never legacy fallback).
 select_secrets_file() {  # <workdir> <env>
   local work="$1" env="$2" f="$1/ci/secrets.$2.enc.yaml"
-  if [ -n "$env" ] && [ -f "$f" ]; then printf '%s\n' "$f"; return 0; fi
+  if [ -n "$env" ] && secret_in_tree "$work" "$f"; then printf '%s\n' "$f"; return 0; fi
   has_env_secrets "$work" && return 2
-  [ -f "$work/ci/secrets.enc.yaml" ] && printf '%s\n' "$work/ci/secrets.enc.yaml"
+  secret_in_tree "$work" "$work/ci/secrets.enc.yaml" && printf '%s\n' "$work/ci/secrets.enc.yaml"
   return 0
 }
+
+# Which age key decrypts the SELECTED secrets file — the crux of per-tier isolation.
+# A per-tier file (secrets.<env>.enc.yaml) decrypts with ONLY $AGE_KEY_DIR/<env>.age; the runner
+# loads just the resolved tier's key at decrypt, so ciphertext for another tier (even copied under
+# this name) can't be decrypted (that key isn't a recipient). The legacy single file
+# (secrets.enc.yaml) keeps using SOPS_AGE_KEY_FILE (the old shared key), so pre-per-tier repos are
+# untouched. Echoes the key path (empty if unconfigured -> treated as "not loaded" -> DEFER).
+secrets_keyfile() {  # <env> <secfile>
+  local env="$1" secfile="$2" kd="${AGE_KEY_DIR:-}"
+  case "$secfile" in
+    */ci/secrets.enc.yaml) printf '%s' "${SOPS_AGE_KEY_FILE:-}" ;;
+    *)                     [ -n "$kd" ] && [ -n "$env" ] && printf '%s' "${kd%/}/$env.age" ;;
+  esac
+}
+key_present() { [ -s "${1:-}" ]; }   # is an age key file loaded (non-empty)?
 
 # Run one matched job inside a hardened, throwaway container.
 execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
@@ -374,12 +412,15 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
     return 1
   fi
   if [ -n "$secfile" ]; then
+    local keyfile; keyfile="$(secrets_keyfile "$env_name" "$secfile")"
     envfile="$(mktemp -p "${SHM_DIR:-/dev/shm}" cicd.env.XXXXXX)"
-    if ! sops -d --output-type dotenv "$secfile" > "$envfile" 2>"$dir/secrets.err"; then
+    # Decrypt with ONLY the resolved tier's key (command-scoped, never the global export): a
+    # wrong-tier or planted blob under this name has no matching recipient -> sops fails -> refuse.
+    if ! SOPS_AGE_KEY_FILE="$keyfile" sops -d --output-type dotenv "$secfile" > "$envfile" 2>"$dir/secrets.err"; then
       end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))
       emit_meta "$dir/meta.json" secrets-decrypt-failed 1 "$(_ts)" "$end_ns" "$dur"; rm -f "$envfile"
       notify_failure "$group/$job" secrets "$dir/output.log"
-      log "$group/$job: secret decrypt failed ($secfile) (key loaded? run unlock-ci) — see $dir/secrets.err"
+      log "$group/$job: secret decrypt failed ($secfile, key=$keyfile) (loaded? run unlock-ci) — see $dir/secrets.err"
       return 1
     fi
     rm -f "$dir/secrets.err"
@@ -535,21 +576,22 @@ run_teardown() {  # <oldrev> <pusher>
     log "$group: nothing to tear down for $slug"; return 0
   fi
 
-  secsrc=""
+  secsrc=""; local tenv="" tkey=""
   if [ -n "$work" ]; then
-    local tenv; tenv="$(resolve_env "$repo" "$branch")"
+    tenv="$(resolve_env "$repo" "$branch")"
     secsrc="$(select_secrets_file "$work" "$tenv")" || secsrc=""   # rc2 (no tier match) -> no secrets
+    [ -n "$secsrc" ] && tkey="$(secrets_keyfile "$tenv" "$secsrc")"
   fi
-  # DEFER teardown if it needs secrets but the key isn't loaded — don't mark it failed
+  # DEFER teardown if it needs secrets but the tier's key isn't loaded — don't mark it failed
   # (env-not-ready ≠ code failure); retry once the key is posted.
-  if [ -n "$secsrc" ] && ! key_loaded; then
-    log "$group: teardown needs secrets, key not loaded — DEFERRING $slug (retry after unlock-ci)"
+  if [ -n "$secsrc" ] && ! key_present "$tkey"; then
+    log "$group: teardown needs env '$tenv' secrets, key not loaded ($tkey) — DEFERRING $slug (retry after unlock-ci)"
     [ -n "$work" ] && rm -rf "$work"; return 2
   fi
   envfile=""
   if [ -n "$secsrc" ]; then
     envfile="$(mktemp -p "${SHM_DIR:-/dev/shm}" cicd.env.XXXXXX)"
-    sops -d --output-type dotenv "$secsrc" > "$envfile" 2>/dev/null || { rm -f "$envfile"; envfile=""; }
+    SOPS_AGE_KEY_FILE="$tkey" sops -d --output-type dotenv "$secsrc" > "$envfile" 2>/dev/null || { rm -f "$envfile"; envfile=""; }
   fi
   local maskfile=""
   if [ -n "$envfile" ]; then
@@ -616,11 +658,20 @@ process_build() {  # <event> <newrev> <oldrev> <pusher> [onlyjob]
   [ -f "$manifest" ] || { log "$group: no .gitolite/ci.yml at $newrev"; rm -rf "$work"; return 0; }
   changed="$(cat "$INC/$newrev.changed" 2>/dev/null)"   # computed by the hook (git side)
 
-  # DEFER (don't consume) if this repo needs secrets but the key isn't loaded — e.g.
-  # post-reboot before unlock-ci. Keep incoming/<sha>.tar; ci-recover retries when ready.
-  if has_any_secrets "$work" && ! key_loaded; then
-    log "$group: key not loaded + repo has secrets — DEFERRING $newrev (retry after unlock-ci)"
-    rm -rf "$work"; return 2
+  # DEFER (don't consume) if this repo needs secrets but the key for THIS run's tier isn't
+  # loaded — e.g. post-reboot before unlock-ci. Keep incoming/<sha>.tar; ci-recover retries.
+  # Resolve the tier's key from the TRUSTED branch (not the manifest). rc2 (per-env files exist
+  # but none for this env) -> psec empty -> no DEFER; execute_job refuses it per job instead.
+  if has_any_secrets "$work"; then
+    local penv psec pkf; penv="$(resolve_env "$repo" "$branch")"
+    psec="$(select_secrets_file "$work" "$penv")" || psec=""
+    if [ -n "$psec" ]; then
+      pkf="$(secrets_keyfile "$penv" "$psec")"
+      if ! key_present "$pkf"; then
+        log "$group: key for env '$penv' not loaded ($pkf) — DEFERRING $newrev (retry after unlock-ci)"
+        rm -rf "$work"; return 2
+      fi
+    fi
   fi
 
   local job inc ign pinc pign

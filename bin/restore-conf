@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# restore-conf — write runner.conf from stdin, so the reboot-restore ritual is identical for all
+# data points (conf + the 3 tier keys), e.g.:
+#   pass gitolite-ci/runner-conf | ssh cicd-runner@vps restore-conf
+#
+# runner.conf is NOT secret (public age recipients + paths + tunables), but its INTEGRITY matters
+# (a tampered recipient map could mis-route a key). Protection here is write-control: this runs only
+# via ssh + sudo -u cicd-runner (pushers can't reach it), it writes to a fixed operator-owned path
+# on PERSISTENT disk (never ramfs — the conf must survive a reboot so the runner can find its own
+# key dir; see docs/per-env-secrets.md), validates shell syntax, and installs atomically.
+set -euo pipefail
+CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
+DEST="${CICD_CONF:-$CICD_BASE/etc/runner.conf}"     # same path cicd_load_config reads first
+
+[ -d "$(dirname "$DEST")" ] || install -d -m755 "$(dirname "$DEST")"
+tmp="$(mktemp "$DEST.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+cat > "$tmp"
+
+# sanity gates: must be valid shell (it's sourced by every script) and set the load-bearing path.
+bash -n "$tmp"                     || { echo "restore-conf: piped conf has shell syntax errors — refusing" >&2; exit 1; }
+grep -q '^[[:space:]]*RUNNER_BASE=' "$tmp" || { echo "restore-conf: no RUNNER_BASE= line — refusing (not a runner.conf?)" >&2; exit 1; }
+
+chmod 644 "$tmp"
+mv -f "$tmp" "$DEST"
+trap - EXIT
+echo "restore-conf: wrote $DEST ($(grep -c '=' "$DEST") settings)"
