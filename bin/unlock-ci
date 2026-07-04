@@ -8,8 +8,10 @@
 #       unlock-ci            # decrypts $CICD_AGE_ENC if present (legacy single-key path)
 #
 # Routing: derive the pub, match it against AGE_RECIPIENT_<env> (env in AGE_ENVS, from the
-# host-owned runner.conf). Match -> $AGE_KEY_DIR/<env>.age. No match -> the LEGACY slot
-# $SOPS_AGE_KEY_FILE (for repos still on a single secrets.enc.yaml), with a warning.
+# host-owned runner.conf). Match -> $AGE_KEY_DIR/<env>.age. A key that matches the EXPLICIT
+# AGE_LEGACY_RECIPIENT (optional, for repos still on a single secrets.enc.yaml) -> the legacy
+# slot $SOPS_AGE_KEY_FILE. Anything else is REFUSED (no silent fallback) — an unmatched key is
+# almost always a mistyped recipient, which must not silently misfile a tier key.
 set -euo pipefail
 CICD_BASE="${CICD_BASE:-/home/cicd-runner/runner}"
 # shellcheck disable=SC1090
@@ -45,10 +47,13 @@ for e in ${AGE_ENVS:-}; do
 done
 if [ -n "$matched" ]; then
   DEST="$KEYDIR/$matched.age"
+elif [ -n "${AGE_LEGACY_RECIPIENT:-}" ] && [ "$pub" = "$AGE_LEGACY_RECIPIENT" ]; then
+  # legacy single-key slot (pre-per-tier repos), but ONLY for the EXPLICITLY pinned key.
+  DEST="$SOPS_AGE_KEY_FILE"; matched="legacy"
 else
-  # unknown key -> legacy single-key slot (pre-per-tier repos). Loud, since it's not tier-pinned.
-  DEST="$SOPS_AGE_KEY_FILE"
-  log "unlock-ci: pub $pub matches no AGE_RECIPIENT_* — loading as LEGACY ($DEST)"
+  # No silent fallback: an unmatched key is almost always a mistyped AGE_RECIPIENT_* (which would
+  # otherwise misfile a tier key into the legacy slot). Refuse loudly; load nothing.
+  die "unlock-ci: pub $pub matches no AGE_RECIPIENT_* (or AGE_LEGACY_RECIPIENT) — refusing. Check runner.conf recipients; nothing loaded."
 fi
 
 # 3) atomic install into the resolved slot (600, ramfs).

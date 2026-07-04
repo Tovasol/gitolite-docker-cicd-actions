@@ -12,8 +12,8 @@ GIT_REPO_BASE=/home/git/repositories          # gitolite bare repos live here (<
 LOCAL_BIN=/home/cicd-runner/.local/bin
 
 # --- secrets (sops + age) ---
-# LEGACY single key: used for repos still on one ci/secrets.enc.yaml. Decrypted into ramfs by
-# `unlock-ci` when the piped key matches NO AGE_RECIPIENT_* below. Cleared on reboot.
+# LEGACY single key slot: used for repos still on one ci/secrets.enc.yaml. `unlock-ci` writes a
+# piped key here ONLY if its pub equals AGE_LEGACY_RECIPIENT below (explicit — never a fallback).
 SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt
 SHM_DIR=/dev/shm                              # tmpfs for transient decrypted env-files
 
@@ -29,6 +29,10 @@ AGE_ENVS="dev qa prod"                         # tiers that have their own key
 AGE_RECIPIENT_dev=age1REPLACE_dev_public_recipient
 AGE_RECIPIENT_qa=age1REPLACE_qa_public_recipient
 AGE_RECIPIENT_prod=age1REPLACE_prod_public_recipient
+# OPTIONAL legacy key: only set if some repo still uses a single ci/secrets.enc.yaml. `unlock-ci`
+# routes the key with THIS pub to the legacy SOPS_AGE_KEY_FILE slot. A key matching NEITHER a
+# tier recipient NOR this is REFUSED (no silent fallback -> a mistyped recipient can't misfile it).
+#AGE_LEGACY_RECIPIENT=age1REPLACE_legacy_public_recipient
 
 # --- concurrency ---
 MAX_JOBS=4                                     # global cap on simultaneous docker runs

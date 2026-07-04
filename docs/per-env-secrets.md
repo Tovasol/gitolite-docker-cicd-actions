@@ -83,8 +83,9 @@ AGE_RECIPIENT_prod=age1…
 
 **`unlock-ci` is identity-routed:** pipe a key, it derives the pub and files it into the slot
 whose `AGE_RECIPIENT_<env>` matches — so a fat-fingered or omitted name can't put prod's key in
-dev's slot. An unmatched key falls to the **legacy** slot `SOPS_AGE_KEY_FILE` (for repos still on
-one `secrets.enc.yaml`), with a warning. Run once per key per boot:
+dev's slot. A key matching the **explicit** `AGE_LEGACY_RECIPIENT` (optional, for repos still on
+one `secrets.enc.yaml`) goes to `SOPS_AGE_KEY_FILE`. Anything matching neither is **REFUSED** — no
+silent fallback, so a mistyped `AGE_RECIPIENT_*` can't quietly misfile a tier key. Once per key per boot:
 
 ```sh
 pass gitolite-ci/age-key-dev  | ssh cicd-runner@vps unlock-ci   # -> dev.age
