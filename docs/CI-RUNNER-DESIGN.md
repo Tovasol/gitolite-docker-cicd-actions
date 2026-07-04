@@ -130,8 +130,9 @@ jobs:
 injected as `-e K=V` into that job's container — for non-secret build config that you
 want version-controlled and diffable (vs burying it in the encrypted secrets). Scope
 is **per-job only** (no top-level/global block — repeat or compute in `ci/*.sh` if
-shared). Precedence (later wins): `CI_*` → cache vars → **job `env:`** → decrypted
-`ci/secrets.enc.yaml`. Job `env:` is allowed to override `CI_*`/cache (deliberate, by
+shared). Precedence (later wins): `CI_*` → cache vars → **job `env:`** → decrypted secrets
+(`ci/secrets.<env>.enc.yaml` for the resolved tier; legacy single `ci/secrets.enc.yaml`
+still honored). Job `env:` is allowed to override `CI_*`/cache (deliberate, by
 choice — gives full control; the operator owns the manifest). Secrets still win over
 `env:`, so a secret can override a plaintext default. Values are static strings;
 anything dynamic is computed inside the script.
@@ -1072,6 +1073,11 @@ sops exec-env "$work/ci/secrets.enc.yaml" \
 The **age private key on the host is the single root of trust**
 (`~runner/.config/sops/age/keys.txt`, mode 600).
 
+> **(Superseded: now per-tier keys.)** The runner today holds **one age key per tier**
+> (dev/qa/prod) with **no shared master key**, decrypting `ci/secrets.<env>.enc.yaml` with only
+> that tier's key. The single-key / single `ci/secrets.enc.yaml` form used as the illustration
+> throughout §19–25 below remains the **legacy** path (still honored). See `docs/per-env-secrets.md`.
+
 ### What encryption-at-rest actually buys (be honest)
 Protects against: disk backups/snapshots, accidental plaintext git commit,
 non-root users on the box. Does NOT protect against root compromise (root reads
@@ -1527,11 +1533,12 @@ outbox at `/cicd/out`. Scripts `. /cicd/lib.sh` and get:
    notify still alerts (`NOTIFY_BACKSTOP=1`). So you never miss a hard failure.
 
 ### Delivery + per-project creds
-`cicd_flush_outbox` (host) reads the outbox, calls `NOTIFY_CMD` (notify-email) per
-entry, passing the job's decrypted secrets so the notifier uses **per-project SMTP
-creds** (from the repo's sops `ci/secrets.enc.yaml`), falling back to the
-operator-global `/etc/cicd-runner/notify.env`. Success → `[CI OK]`, failure →
-`[CI FAIL]`.
+`cicd_flush_outbox` (host) reads the outbox, calls `NOTIFY_CMD` (`notify-email`; must be
+set — an empty `NOTIFY_CMD` drops all delivery) per entry, passing the job's decrypted
+resolved-tier secrets so the notifier uses **per-tier SMTP creds** (from the repo's sops
+`ci/secrets.<env>.enc.yaml`; legacy single `ci/secrets.enc.yaml` still honored), falling back
+only key-by-key to the **optional** operator-global `/etc/cicd-runner/notify.env`. A repo/tier
+that ships no creds simply doesn't email. Success → `[CI OK]`, failure → `[CI FAIL]`.
 
 ### Net effect
 Manifest shrank back to triggers + image + run + resource bounds. All retry/notify/
@@ -1562,9 +1569,11 @@ For a single-tenant CI box running its own code, that's acceptable: cgroup quota
 matter most for multi-tenant fairness/anti-DoS; here the **wall-clock timeout**
 (hangs) + **host OOM-killer** (memory blowups) are the backstop.
 
-**Runner behavior:** `RESOURCE_LIMITS=0` (runner.conf) makes the runner OMIT the
-`--memory`/`--pids-limit` flags so there's no false impression of enforcement.
-Set `1` only on systemd or rootful docker.
+**Runner behavior:** `RESOURCE_LIMITS` defaults to `auto` — the runner detects whether
+cgroup enforcement is available and, when it isn't (this OpenRC case), automatically falls
+back to POSIX ulimits (`ULIMIT_NPROC`/`ULIMIT_FSIZE`) and omits the (no-op) `--memory`/
+`--pids-limit` flags. Force with `1` (require cgroup, on systemd/rootful docker) or `0`
+(skip the detection probe, no cgroup attempt).
 
 **If you truly need per-container caps on OpenRC:** switch the runtime to **Podman
 rootless** (supports cgroup v2 delegation without systemd) — mostly docker-CLI
@@ -1935,9 +1944,12 @@ A push that lands during a reboot / docker-down / key-not-posted window is now
 - **Readiness gates in `run-group`** (the coalesce loop):
   - `ready_docker()` (`docker info`) gates the *whole* loop — docker down ⇒ defer
     the run (break, don't advance `last`).
-  - `key_loaded()` (`[ -s $SOPS_AGE_KEY_FILE ]`) gates *secret-using* targets only:
-    `process_build` / `run_teardown` return **rc=2 (defer)** if the repo ships
-    `ci/secrets.enc.yaml` but the key isn't loaded. A no-secret build still runs.
+  - `key_loaded()` gates *secret-using* targets only: `process_build` / `run_teardown`
+    return **rc=2 (defer)** if the repo ships an encrypted secrets file but the required
+    key isn't loaded. A no-secret build still runs. (Per-tier: the gate is the resolved
+    tier's key `$AGE_KEY_DIR/<env>.age` for `ci/secrets.<env>.enc.yaml`; the legacy
+    `SOPS_AGE_KEY_FILE`/`ci/secrets.enc.yaml` slot still applies to legacy repos — see
+    per-env-secrets.md.)
 - **Defer = preserve state.** On defer the loop does **not** advance `$Q/last` and
   the `incoming/<sha>.tar` is **kept** (not consumed). So `target != last` stays
   true and the delivered tree is still on disk for the retry. A *code* failure is

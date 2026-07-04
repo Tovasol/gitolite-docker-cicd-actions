@@ -2,10 +2,11 @@
 
 > Copy-paste runbook for the hand-rolled gitolite + docker CI/CD runner.
 > This is the **what to do**; rationale lives in `CI-RUNNER-DESIGN.md` (§ refs).
-> Decisions locked: **ramfs** for the in-RAM key (never swaps), **age** for the
-> unattended runner key, **GPG/pass** for humans, **rootless docker**.
+> Decisions locked: **ramfs** for the in-RAM keys (never swaps), **age** for the
+> unattended runner keys (**one per tier — no shared master key**), **GPG/pass** for
+> humans, **rootless docker**.
 
-Last updated: 2026-06-22
+Last updated: 2026-07-03
 
 ---
 
@@ -16,18 +17,26 @@ Last updated: 2026-06-22
 ssh vps && sudo -iu cicd-runner ci-status     # key loaded? docker up? recent runs?
 ```
 
-**Simple key path (default, §2.3):** the age key persists on disk — **nothing to do
-after a reboot** except make sure rootless dockerd is back up (it's a service). If a
-deploy "silently didn't happen", run `ci-status` and check `runner.log`.
+**Legacy single-key path (on-disk `SOPS_AGE_KEY_FILE`):** if a repo still uses one
+`ci/secrets.enc.yaml` and its key persists on disk, there's **nothing to do after a reboot**
+except make sure rootless dockerd is back up (it's a service). If a deploy "silently didn't
+happen", run `ci-status` and check `runner.log`. (The per-tier model below uses ramfs keys.)
 
-**ramfs key path — after EVERY reboot, re-post the key (CI is paused until you do).**
-From your **Mac** (key streams Mac→VPS RAM; never on disk, never in history):
+**ramfs key path — after EVERY reboot, re-post EACH tier's key (CI is paused until you do).**
+There is now **one age key per tier** (dev/qa/prod) — no shared master key. `unlock-ci` is
+**identity-routed**: pipe a key, it derives the pubkey and files it into the slot whose
+`AGE_RECIPIENT_<env>` matches (`$AGE_KEY_DIR/<env>.age`); a key matching `AGE_LEGACY_RECIPIENT`
+goes to the legacy `SOPS_AGE_KEY_FILE` slot; anything matching neither is **refused**. From your
+**Mac** (keys stream Mac→VPS RAM; never on disk, never in history), one pipe per tier key:
 ```bash
-pass show <your-key-entry> | ssh <user>@vps 'sudo -n -u cicd-runner /home/cicd-runner/runner/bin/unlock-ci'
+pass show gitolite-ci/age-key-dev  | ssh <user>@vps 'sudo -n -u cicd-runner /home/cicd-runner/runner/bin/unlock-ci'   # -> dev.age
+pass show gitolite-ci/age-key-qa   | ssh <user>@vps 'sudo -n -u cicd-runner /home/cicd-runner/runner/bin/unlock-ci'   # -> qa.age
+pass show gitolite-ci/age-key-prod | ssh <user>@vps 'sudo -n -u cicd-runner /home/cicd-runner/runner/bin/unlock-ci'   # -> prod.age
 ```
-Then confirm: `sudo -iu cicd-runner ci-status` → `age key loaded`.
-(GPG-at-rest variant instead: `sudo -iu cicd-runner unlock-ci` decrypts the on-VPS
-`age-key.gpg`, prompting for the GPG passphrase. Use whichever you set up.)
+Then confirm: `sudo -iu cicd-runner ci-status` → each tier's `age key loaded`.
+(`runner.conf` itself survives reboot — it lives on persistent disk; only the ramfs keys need
+re-posting. GPG-at-rest variant: `sudo -iu cicd-runner unlock-ci` per tier decrypts the on-VPS
+`age-key.<env>.gpg`, prompting for the GPG passphrase. Use whichever you set up.)
 
 ---
 
@@ -48,8 +57,10 @@ sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh'
 
 # ── B. point config at your socket (as cicd-runner; user-local, no sudo) ──────
 echo "$DOCKER_HOST"                       # the value that makes `docker info` work
-vi ~/runner/etc/runner.conf               # DOCKER_HOST=<that>  RESOURCE_LIMITS=0  NOTIFY_CMD=""
-                                          # SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt  (ramfs)
+vi ~/runner/etc/runner.conf               # DOCKER_HOST=<that>  RESOURCE_LIMITS=auto  NOTIFY_CMD=<bin>/notify-email
+                                          # AGE_KEY_DIR=/run/ci-keys  AGE_ENVS="dev qa prod"  (ramfs, per tier)
+                                          # AGE_RECIPIENT_dev/_qa/_prod=age1…  (public recipients)
+                                          # SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt  (LEGACY single-key slot only)
 
 # ── C. hook (via gitolite-admin) + sudo bridge ───────────────────────────────
 # The post-receive CI hook is managed DECLARATIVELY in the gitolite-admin repo —
@@ -77,9 +88,9 @@ git add .gitolite ci && git commit -m 'ci: smoke' && git push origin main
 #                  cat /home/cicd-runner/runner/runs/<repo>/main/latest/output.log   # "CI works: …"
 
 # ── E. real deploy (after smoke passes) ──────────────────────────────────────
-#   1) ramfs key + `unlock-ci` (§2.3/§3)   2) .sops.yaml + `sops ci/secrets.enc.yaml`
-#   3) swap smoke for examples/.gitolite/ci.yml + examples/ci/deploy-site.sh
-#   4) NOTIFY_CMD=…/bin/notify-email   5) push -> watch
+#   1) per-tier ramfs keys + `unlock-ci` per key (§2.3/§3)   2) .sops.yaml (per-tier recipients)
+#      + `sops ci/secrets.<env>.enc.yaml`   3) swap smoke for examples/.gitolite/ci.yml +
+#      examples/ci/deploy-site.sh   4) NOTIFY_CMD=…/bin/notify-email   5) push -> watch
 ```
 First-timer gotchas: **`DOCKER_HOST` mismatch** (every job fails instantly) and
 **secret jobs need `unlock-ci`** first (clear "key not loaded" error otherwise).
@@ -101,11 +112,12 @@ First-timer gotchas: **`DOCKER_HOST` mismatch** (every job fails instantly) and
 | Run logs/history | `$RUNNER_BASE/runs/<repo>/<branch>/<ts>-<sha>-<job>/` |
 | Global dep cache (§32) | `$RUNNER_BASE/cache/` (one volume, all repos, all ecosystems) |
 | Ephemeral env state | `$RUNNER_BASE/envs/<repo>/<slug>/` |
-| Runner age key (simple, default) | `~cicd-runner/.config/sops/age/keys.txt` (600, no root) |
-| Runner key encrypted-at-rest (optional §25) | `$RUNNER_BASE/etc/age-key.gpg` (cicd-runner-owned, no root) |
-| Decrypted key in RAM (optional §25) | `/run/ci-keys/age-keys.txt` (ramfs, created+mounted by the boot service start_pre) |
-| Config | `$RUNNER_BASE/etc/runner.conf` (user-local; found via $CICD_BASE, sudo-safe). `/etc/cicd-runner/runner.conf` optional fallback only. Hook does NOT read it. |
-| Per-repo secrets (in git) | `<repo>/ci/secrets.enc.yaml` |
+| Runner age keys — one per tier (in RAM) | `$AGE_KEY_DIR/<env>.age` (default `/run/ci-keys/<env>.age`; ramfs, 600, one per tier — no shared master key) |
+| Legacy single key in RAM (legacy `secrets.enc.yaml` only) | `$SOPS_AGE_KEY_FILE` (default `/run/ci-keys/age-keys.txt`; ramfs) |
+| Runner keys encrypted-at-rest (optional §25) | `$RUNNER_BASE/etc/age-key.<env>.gpg` (one per tier; cicd-runner-owned, no root) |
+| Ramfs key dir (created+mounted by the boot service start_pre) | `$AGE_KEY_DIR` (default `/run/ci-keys`, cleared on reboot) |
+| Config | `$RUNNER_BASE/etc/runner.conf` (user-local; found via $CICD_BASE, sudo-safe). Holds `AGE_KEY_DIR`, `AGE_ENVS`, `AGE_RECIPIENT_<env>` (+ optional `AGE_LEGACY_RECIPIENT`). **Persistent disk — survives reboot** (defines where the ramfs key dir is, so it must); only the keys need re-posting. Restore from stdin via `restore-conf`. `/etc/cicd-runner/runner.conf` optional fallback only. Hook does NOT read it. |
+| Per-repo secrets (in git) | `<repo>/ci/secrets.<env>.enc.yaml` (per-tier; legacy single `<repo>/ci/secrets.enc.yaml` still honored) |
 | sops recipients config (in git) | `<repo>/.sops.yaml` |
 | Hook (gitolite) | Managed in the **gitolite-admin** repo: `local/hooks/repo-specific/cicd`, wired via `option hook.post-receive = echo cicd` (`conf/gitolite.conf`, `repo @all`). Deployed by pushing gitolite-admin; gitolite distributes to all repos. Canonical source = `bin/post-receive` in the runner repo. |
 | Runner scripts | `$RUNNER_BASE/bin/` (`run-group.sh`, `unlock-ci`, `ci-status`, reapers…) |
@@ -152,19 +164,30 @@ sudo -iu cicd-runner bash -lc 'docker info | grep -i rootless'   # → "rootless
 > a placeholder. The real user is **`cicd-runner`**; read every `ci`/`/home/ci/`/
 > `id -u ci` there as `cicd-runner`/`/home/cicd-runner/`/`id -u cicd-runner`.
 
-### 2.3 Runner age key (simple path — default, no root)
-A passphraseless age key sops finds automatically. Protected by file perms + the
-host (the runner user owns it). This is what you set up first.
+### 2.3 Runner age keys — one per tier (no shared master key)
+Generate **one passphraseless age key per tier** (dev/qa/prod). Each tier's secrets
+file is encrypted to only its own key. Record each **public** recipient into
+`runner.conf` (`AGE_RECIPIENT_<env>`) — that's what makes `unlock-ci` route a piped
+key to the right slot (§3). The private keys themselves are loaded into the ramfs
+`$AGE_KEY_DIR` at unlock time, never committed, never on persistent disk.
 ```bash
 su - cicd-runner
 mkdir -p ~/.config/sops/age && chmod 700 ~/.config/sops/age
-age-keygen -o ~/.config/sops/age/keys.txt && chmod 600 ~/.config/sops/age/keys.txt
-age-keygen -y ~/.config/sops/age/keys.txt        # record age1RUNNER… (a .sops.yaml recipient)
+for env in dev qa prod; do
+  age-keygen -o ~/.config/sops/age/$env.age.key && chmod 600 ~/.config/sops/age/$env.age.key
+  echo "$env  recipient: $(age-keygen -y ~/.config/sops/age/$env.age.key)"   # -> AGE_RECIPIENT_$env
+done
 vi ~/runner/etc/runner.conf
-#   SOPS_AGE_KEY_FILE=/home/cicd-runner/.config/sops/age/keys.txt
+#   AGE_KEY_DIR=/run/ci-keys
+#   AGE_ENVS="dev qa prod"
+#   AGE_RECIPIENT_dev=age1DEV_RUNNER…    AGE_RECIPIENT_qa=age1QA_RUNNER…    AGE_RECIPIENT_prod=age1PROD_RUNNER…
+#   # optional, only if a repo still ships the legacy single secrets.enc.yaml:
+#   # AGE_LEGACY_RECIPIENT=age1LEGACY…   (its key lands in SOPS_AGE_KEY_FILE)
 ```
-No backup needed: if the VPS dies, regen + re-add the pubkey to `.sops.yaml` +
-`sops updatekeys`; your human key (the 2nd recipient) keeps you from lockout.
+Store each private key where you post it from (e.g. `pass gitolite-ci/age-key-<env>`,
+§3) — NOT on the VPS disk. No backup drama if the VPS dies: regen a tier's key, swap
+its `age1…` recipient in `.sops.yaml` + `runner.conf`, `sops updatekeys`; your human
+PGP key (the tiered 2nd recipient) keeps you from lockout.
 
 ### 2.4 Runner directories + scripts (via install.sh)
 The runner code is already in gitolite (your push created the bare repo). Bootstrap
@@ -194,8 +217,10 @@ sudo -iu cicd-runner bash -lc 'cd ~/src && ./install.sh'
 `incoming/` + the global `cache/`), seeds slots, writes `runner.conf`. Then review it:
 ```bash
 sudo -iu cicd-runner vi ~/runner/etc/runner.conf
-#   DOCKER_HOST=<your working socket>   RESOURCE_LIMITS=0   NOTIFY_CMD=""
-#   SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt    ← you're using ramfs
+#   DOCKER_HOST=<your working socket>   RESOURCE_LIMITS=auto   NOTIFY_CMD=<bin>/notify-email
+#     (RESOURCE_LIMITS=auto self-detects cgroup support; NOTIFY_CMD must be SET or nothing is delivered)
+#   AGE_KEY_DIR=/run/ci-keys   AGE_ENVS="dev qa prod"   AGE_RECIPIENT_<env>=age1…   (per-tier, §2.3)
+#   SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt    ← LEGACY single-key slot (only for legacy secrets.enc.yaml)
 ```
 `install.sh` creates `queue/ runs/ cache/ envs/ slots/ bin/`, copies all scripts,
 seeds the concurrency slot files (`MAX_JOBS`), fills `DOCKER_HOST` with the user's
@@ -206,22 +231,25 @@ Only if you want the key encrypted at rest + human-gated boot. Skip for first ru
 The encrypted key lives in the runner dir (cicd-runner-owned — no /etc, no root for
 the file). Only the ramfs *mount* needs root.
 ```bash
-# as cicd-runner: GPG-encrypt the key to your GPG (move it out of plaintext keys.txt)
+# as cicd-runner: GPG-encrypt EACH tier key to your GPG (move it out of plaintext)
 su - cicd-runner
-age-keygen -y ~/.config/sops/age/keys.txt    # note pubkey (recipient)
-gpg --encrypt --recipient YOUR_GPG_FP --armor \
-  -o ~/runner/etc/age-key.gpg < ~/.config/sops/age/keys.txt
-shred -u ~/.config/sops/age/keys.txt          # remove the plaintext on-disk copy
+for env in dev qa prod; do
+  age-keygen -y ~/.config/sops/age/$env.age.key       # note pubkey (= AGE_RECIPIENT_$env)
+  gpg --encrypt --recipient YOUR_GPG_FP --armor \
+    -o ~/runner/etc/age-key.$env.gpg < ~/.config/sops/age/$env.age.key
+  shred -u ~/.config/sops/age/$env.age.key            # remove the plaintext on-disk copy
+done
 
-# as root: ramfs for the decrypted key (never swaps). NOT via fstab — /run is tmpfs
+# as root: ramfs for the decrypted keys (never swaps). NOT via fstab — /run is tmpfs
 # (wiped each boot) so the mountpoint won't persist + an fstab entry fails at boot.
 # The boot SERVICE's start_pre creates+mounts+chowns it (Appendix A "Reboot survival").
 # For a one-off now:
 mkdir -p /run/ci-keys && mount -t ramfs ramfs /run/ci-keys
 chown cicd-runner:cicd-runner /run/ci-keys && chmod 700 /run/ci-keys
 
-# point the runner at the ramfs path:
-#   runner.conf: SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt
+# point the runner at the ramfs key dir (per-tier keys land at $AGE_KEY_DIR/<env>.age):
+#   runner.conf: AGE_KEY_DIR=/run/ci-keys   AGE_ENVS="dev qa prod"
+#   (legacy single blob only) SOPS_AGE_KEY_FILE=/run/ci-keys/age-keys.txt
 ```
 No-root alternative to ramfs (if the box has **no swap**): use a `700` subdir of
 `/dev/shm` (tmpfs, already mounted) instead — no fstab, no root. ramfs is only
@@ -337,36 +365,48 @@ install -m755 "$RUN/src/init/docker-rootless-cicd-runner.openrc" \
 ```
 
 > **Server move checklist:** repeat 2.1–2.8 on the new box. Because each host has
-> its OWN runner key, generate a fresh one (2.5) and enroll it; do NOT copy the
-> old host's key. Decommission the old host by removing its `age1vps...` line from
-> every `.sops.yaml` + `sops updatekeys` + rotate secrets (§6 revoke).
+> its OWN per-tier runner keys, generate a fresh key **per tier** (2.3/2.5) and enroll
+> each recipient; do NOT copy the old host's keys. Decommission the old host by removing
+> its `age1…` tier recipients from every `.sops.yaml` + `sops updatekeys` + rotate
+> secrets (§6 revoke).
 
 ---
 
-## 3. After reboot — re-post the ramfs key
+## 3. After reboot — re-post the ramfs keys (one per tier)
 
-The ramfs key is wiped on reboot (RAM-only, by design — §25). Everything else comes
-back automatically (docker service, ramfs mount + chown via `/etc/local.d`,
-`@reboot ci-recover`). You re-supply the key.
+The ramfs keys are wiped on reboot (RAM-only, by design — §25). Everything else comes
+back automatically — including **`runner.conf`** (it lives on **persistent disk**, so its
+`AGE_KEY_DIR`/`AGE_ENVS`/`AGE_RECIPIENT_*` map survives; docker service, ramfs mount + chown
+via `/etc/local.d`, `@reboot ci-recover`). You only re-supply the per-tier keys.
 
 > **Pushes during the reboot window are NOT lost.** A push that lands before you
-> re-post the key is *deferred* (parked, not failed): docker-down or key-not-loaded
-> secret jobs leave their queue target pending. When you run `unlock-ci` below it
+> re-post its tier's key is *deferred* (parked, not failed): docker-down or key-not-loaded
+> secret jobs leave their queue target pending. When you `unlock-ci` that tier below it
 > **auto-triggers `ci-recover`** and the deferred pushes run immediately — you don't
-> re-push. A `*/10 ci-recover` cron is the backstop if the key is posted out-of-band.
+> re-push. A `*/10 ci-recover` cron is the backstop if a key is posted out-of-band.
 > (Deferred-recovery, DESIGN §10.6/§33.)
 
-**Key-in-pass (your setup) — from the Mac, one line (key never on disk/history):**
+**Key-in-pass (your setup) — from the Mac, one pipe per tier (keys never on disk/history):**
 ```bash
-pass show <your-key-entry> | ssh <user>@vps 'sudo -n -u cicd-runner /home/cicd-runner/runner/bin/unlock-ci'
-# → "runner key loaded into /run/ci-keys/age-keys.txt (pub: age1…) — clears on reboot"
-sudo -iu cicd-runner ci-status     # confirm: age key loaded
+pass show gitolite-ci/age-key-dev  | ssh <user>@vps 'sudo -n -u cicd-runner /home/cicd-runner/runner/bin/unlock-ci'
+pass show gitolite-ci/age-key-qa   | ssh <user>@vps 'sudo -n -u cicd-runner /home/cicd-runner/runner/bin/unlock-ci'
+pass show gitolite-ci/age-key-prod | ssh <user>@vps 'sudo -n -u cicd-runner /home/cicd-runner/runner/bin/unlock-ci'
+# each → "runner key loaded into /run/ci-keys/<env>.age (pub: age1…) — clears on reboot"
+sudo -iu cicd-runner ci-status     # confirm: each tier's age key loaded
 ```
-`unlock-ci` reads the key on **stdin** (the piped value), validates it's a real age
-key, writes `600` into the ramfs file. No `-t` on the ssh (a tty breaks the pipe).
+`unlock-ci` reads the key on **stdin**, validates it's a real age key, derives its pubkey, and
+**identity-routes** it: it writes `600` into the slot whose `AGE_RECIPIENT_<env>` matches
+(`$AGE_KEY_DIR/<env>.age`), or into `SOPS_AGE_KEY_FILE` if the pub matches the explicit
+`AGE_LEGACY_RECIPIENT`. A key matching **neither is REFUSED** (no silent fallback — a mistyped
+recipient can't misfile a tier key). No `-t` on the ssh (a tty breaks the pipe).
+
+**Restore `runner.conf` after a rebuild** (fresh disk, not just a reboot): it's not secret but its
+integrity matters (a tampered recipient map could mis-route a key), so keep it in `pass` too and
+restore from stdin — `pass show gitolite-ci/runner-conf | ssh <user>@vps 'sudo -n -u cicd-runner /home/cicd-runner/runner/bin/restore-conf'`.
 
 **GPG-at-rest variant** (if you chose §2.5 instead): `sudo -iu cicd-runner unlock-ci`
-with no stdin → decrypts `$RUNNER_BASE/etc/age-key.gpg` (prompts GPG passphrase).
+with no stdin → decrypts the tier's `$RUNNER_BASE/etc/age-key.<env>.gpg` (prompts GPG passphrase);
+routing to the tier slot is the same, by derived pubkey.
 
 If `/run/ci-keys` is empty after reboot that's expected (ramfs wipes) — just re-post.
 If the mount itself is gone: `sudo mount /run/ci-keys` (then the `/etc/local.d` chown,
@@ -409,7 +449,7 @@ EOF
 
 ### 4.4 Commit + push
 ```bash
-git add ci .gitolite .sops.yaml ci/secrets.enc.yaml
+git add ci .gitolite .sops.yaml ci/secrets.*.enc.yaml   # per-tier files (dev/qa/prod)
 git commit -m "ci: enroll project"
 git push        # first push won't run if hook predates it; subsequent pushes do
 ```
@@ -420,22 +460,29 @@ git push        # first push won't run if hook predates it; subsequent pushes do
 
 On your Mac (you must be a recipient in `.sops.yaml`):
 ```bash
-# .sops.yaml at repo root (once per repo) — humans via pgp, runner via age:
+# .sops.yaml at repo root (once per repo) — PER-TIER recipients: each tier file is
+# encrypted to its OWN runner age key (no shared master key) + your tiered PGP.
+# Higher tiers = superset of humans. (See authoring-ci-jobs.md §15.2 for the full form.)
 cat > .sops.yaml <<'EOF'
 creation_rules:
-  - path_regex: \.enc\.(ya?ml|json|env)$
-    pgp: "YOUR_GPG_FINGERPRINT"
-    age: "age1vps_runner_pubkey"
+  - path_regex: (^|/)secrets\.prod\.enc\.ya?ml$
+    key_groups: [{ age: ["age1PROD_RUNNER"], pgp: ["PROD_FPR"] }]
+  - path_regex: (^|/)secrets\.qa\.enc\.ya?ml$
+    key_groups: [{ age: ["age1QA_RUNNER"],   pgp: ["QA_FPR","PROD_FPR"] }]
+  - path_regex: (^|/)secrets\.dev\.enc\.ya?ml$
+    key_groups: [{ age: ["age1DEV_RUNNER"],  pgp: ["DEV_FPR","QA_FPR","PROD_FPR"] }]
 EOF
 
-sops ci/secrets.enc.yaml      # opens editor; add/edit values; encrypts on save
-# values: cloudflare_api_token, npm_token, etc.
-git add ci/secrets.enc.yaml && git commit -m "ci: update secrets" && git push
+sops ci/secrets.dev.enc.yaml    # opens editor; add/edit values per tier; encrypts on save
+# values: cloudflare_api_token, npm_token, etc. — scope each cred to its tier
+git add ci/secrets.*.enc.yaml && git commit -m "ci: update secrets" && git push
 ```
-**Rotating a leaked token:** change the value in `sops`, push, AND invalidate the
-old token at the provider (e.g. revoke the Cloudflare token in the dashboard).
+**Rotating a leaked token:** change the value in `sops` (in the affected tier's file),
+push, AND invalidate the old token at the provider (e.g. revoke the Cloudflare token in
+the dashboard).
 
-The runner reads these at run time via the §1 host key — no action needed there.
+The runner reads these at run time via the **resolved tier's** key (§1/§3) — no action
+needed there.
 
 ---
 
@@ -463,17 +510,19 @@ out.
 
 ---
 
-## 7. Rotate the runner's age key
+## 7. Rotate a tier's runner age key
 
+Rotate **one tier at a time** — each tier has its own key. `<env>` is the tier (dev/qa/prod).
 ```bash
-# on the VPS, as cicd-runner (simple path):
+# on the VPS, as cicd-runner:
 su - cicd-runner
-age-keygen -o ~/.config/sops/age/keys.txt && chmod 600 ~/.config/sops/age/keys.txt
-age-keygen -y ~/.config/sops/age/keys.txt      # record the NEW age1RUNNER… pubkey
-#   (hardened path instead: gpg-encrypt to ~/runner/etc/age-key.gpg + unlock-ci)
-# on Mac: replace old age1RUNNER… with the new one in every .sops.yaml, then:
-find . -name '*.enc.*' -print0 | xargs -0 -I{} sops updatekeys -y {}
-git commit -am "ci: rotate runner key" && git push
+age-keygen -o ~/.config/sops/age/<env>.age.key && chmod 600 ~/.config/sops/age/<env>.age.key
+age-keygen -y ~/.config/sops/age/<env>.age.key    # record the NEW age1…RUNNER pubkey for this tier
+#   update runner.conf: AGE_RECIPIENT_<env>=<new pub>   (then re-post the new key via unlock-ci, §3)
+#   (hardened path instead: gpg-encrypt to ~/runner/etc/age-key.<env>.gpg + unlock-ci)
+# on Mac: replace this tier's old age1… with the new one in every .sops.yaml (this tier's rule), then:
+sops updatekeys -y ci/secrets.<env>.enc.yaml
+git commit -am "ci: rotate <env> runner key" && git push
 ```
 
 ---
@@ -742,8 +791,9 @@ Rule of thumb: Variant B = no elogind. elogind route = must `enable-linger ci`.
 On OpenRC (no systemd) docker rootless **cannot** use cgroups — you'll see at
 startup: `WARNING: Running in rootless-mode without cgroups`. Expected, NOT fixable.
 The chown/delegation block below is a **Podman** capability (crun + cgroupfs); it
-does NOT make Docker rootless honor limits. For Docker: set `RESOURCE_LIMITS=0` in
-runner.conf so the runner omits those (no-op) flags. All other hardening (cap-drop,
+does NOT make Docker rootless honor limits. For Docker: the default `RESOURCE_LIMITS=auto`
+already detects this and falls back to POSIX ulimits; set `RESOURCE_LIMITS=0` only to skip the
+detection probe and omit the (no-op) cgroup flags outright. All other hardening (cap-drop,
 no-new-privileges, network, wall-clock timeout) still applies; host OOM-killer +
 timeout are the backstop. See DESIGN §29. Need real per-container caps on OpenRC →
 switch the runtime to Podman rootless.

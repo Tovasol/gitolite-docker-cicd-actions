@@ -5,7 +5,8 @@
 # --- identity / paths ---
 RUNNER_USER=cicd-runner
 RUNNER_BASE=/home/cicd-runner/runner          # queue/, runs/, cache/, envs/, slots/
-GIT_REPO_BASE=/home/git/repositories          # gitolite bare repos live here (<repo>.git)
+#GIT_REPO_BASE=/home/git/repositories         # DECLARED BUT INERT — no code reads it today
+                                              #   (documented location of the bare repos only).
 
 # user-local tool dir (sops, yq, age) — ABSOLUTE so the runner finds them under sudo
 # (sudo resets PATH to secure_path; the runner re-prepends this). No /usr/local, no root.
@@ -33,6 +34,14 @@ AGE_RECIPIENT_prod=age1REPLACE_prod_public_recipient
 # routes the key with THIS pub to the legacy SOPS_AGE_KEY_FILE slot. A key matching NEITHER a
 # tier recipient NOR this is REFUSED (no silent fallback -> a mistyped recipient can't misfile it).
 #AGE_LEGACY_RECIPIENT=age1REPLACE_legacy_public_recipient
+
+# Branch -> env resolution. DEFAULT env = sanitized branch name (dev->dev, feat/x->feat-x). Set a
+# host-side map ONLY to ALIAS a branch whose name differs from its env (e.g. main->prod). The map
+# is operator-owned; the pushed tree can't influence it. See etc/environments.map.sample.
+CICD_ENV_MAP=/home/cicd-runner/runner/etc/environments.map   # default: $RUNNER_BASE/etc/environments.map
+# OPTIONAL gpg-at-rest key blob: `unlock-ci` with no piped key decrypts THIS with gpg (§25). Leave
+# unset to only ever load keys via the pipe form (pass ... | unlock-ci).
+#CICD_AGE_ENC=/home/cicd-runner/runner/etc/age-key.gpg        # default: $CICD_BASE/etc/age-key.gpg
 
 # --- concurrency ---
 MAX_JOBS=4                                     # global cap on simultaneous docker runs
@@ -76,9 +85,10 @@ LOG_MAX_BYTES=52428800        # cap per-run output.log bytes (50 MiB). The conta
                               #   for genuinely log-heavy builds. Total disk: use a quota'd FS.
 
 # --- behavior ---
-CANCEL_IN_PROGRESS=0                           # 1 = a new push kills the running job; 0 = coalesce
-LOG_RETENTION_DAYS=30
+#CANCEL_IN_PROGRESS=0                          # DECLARED BUT INERT — runs always coalesce today.
+LOG_RETENTION_DAYS=30                          # delete run logs/metadata older than this (ci-log/status)
 DELETE_SUPERSEDES=1                            # a branch-delete cancels/overrides a pending deploy
+#TRUSTED_BRANCHES=                             # DECLARED BUT INERT — is_trusted_branch is unused today.
 
 # --- ephemeral-env reaper (archive-push: runner has no repo access, §31) ---
 # The git hook tears down on EVERY gitolite branch delete. reap-envs only catches the
@@ -94,6 +104,8 @@ AUTO_REAP_STALE_DAYS=0                          # 0 = report only; >0 = auto-tea
 # tolerates truncating from the FRONT only if you keep the new first line's prev as a new root).
 AUDIT_ENABLED=1                                # 1 = record security events; 0 = off
 AUDIT_LOG=/home/cicd-runner/runner/audit.log   # default: $RUNNER_BASE/audit.log
+#AUDIT_LOCK_MAX_SPINS=300                       # serialization spin cap where flock is absent (tuning)
+#AUDIT_LOCK_STALE_SECS=30                       # reclaim a leaked mkdir-mutex older than this (tuning)
 
 # --- retries + notify are NOT runner concerns ---
 # They live in the ci/*.sh script via the mounted /cicd/lib.sh helpers
@@ -107,8 +119,12 @@ NOTIFY_BACKSTOP=1             # 1 = email on a job FAILURE that emitted no scrip
 DOCKER_HOST=unix:///run/user/__UID__/docker.sock   # install.sh fills __UID__
 
 # --- notifications ---
-# Command run on a job's FINAL failure (after retries); args: <group> <status> <logpath>.
-# The runner also passes the job's decrypted secrets so the notifier can use
-# PER-PROJECT SMTP creds (from the repo's sops ci/secrets.enc.yaml), falling back to
-# the operator-global /etc/cicd-runner/notify.env. Handlers: notify-email, notify-wall.
+# Delivery handler; args: <group> <status> <logpath>. REQUIRED for ANY delivery — if unset, the
+# runner emits NOTHING (notify_*/die + the failure backstop are all silently dropped). The runner
+# passes the job's decrypted (resolved-tier) secrets so the handler can use PER-PROJECT SMTP creds
+# from ci/secrets.<env>.enc.yaml, else the optional host default below. Handlers: notify-email, notify-wall.
 NOTIFY_CMD="/home/cicd-runner/runner/bin/notify-email"
+# OPTIONAL operator-global SMTP fallback file for repos that ship no SMTP creds of their own.
+# notify-email reads project(tier) creds first, then this. Discouraged for multi-repo (each repo
+# should carry its own per-tier creds); a repo with neither simply doesn't email.
+#CICD_NOTIFY_HOST_ENV=/etc/cicd-runner/notify.env    # default shown

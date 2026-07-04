@@ -42,8 +42,8 @@ Per-job fields under `jobs.<name>`:
 | `run` | string | *(none — required)* | Shell command run as `sh -c "<run>"` inside the container, cwd `/work`. If empty/missing, the job is skipped. **This is the only required field.** |
 | `image` | string | `node:20-alpine` | Docker image to run the job in. |
 | `timeout` | int (seconds) | `900` | Wall-clock kill. Exceeding it = status `timeout`. |
-| `memory` | docker mem string (e.g. `2g`) | `2g` | `--memory` limit. **No-op on this runner** (see §9). |
-| `pids` | int | `512` | `--pids-limit`. **No-op on this runner** (see §9). |
+| `memory` | docker mem string (e.g. `2g`) | `2g` | `--memory` limit. Enforced only where the host supports cgroup limits (`RESOURCE_LIMITS`, §9); a **no-op** on a host without cgroup-v2/systemd (the OpenRC-rootless target). |
+| `pids` | int | `512` | `--pids-limit`. Same conditional enforcement as `memory` (§9). |
 | `network` | `bridge` \| `none` | `bridge` | Container network mode. `bridge` = outbound network; `none` = no network. |
 | `env` | map of `KEY: value` | *(none)* | Plaintext env vars injected as `-e KEY=value`. They override the built-in `CI_*`/cache vars; a decrypted secret of the same name still wins over them. |
 | `on.<event>` | map | *(none)* | Trigger config — see below. The matching event key must be present for the job to fire on that event. |
@@ -206,7 +206,7 @@ step "build"
 npm ci && npm run build
 
 step "deploy"
-# CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID come from ci/secrets.enc.yaml (§8.3)
+# CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID come from ci/secrets.<env>.enc.yaml (§8.3)
 if npx wrangler pages deploy ./dist --project-name my-site; then
   notify_success "deployed $CI_BRANCH @ $CI_SHA"
 else
@@ -311,9 +311,9 @@ no curl/credentials/network in the job, and still fire if the job is OOM- or tim
 that exits non-zero without emitting a terminal notification still triggers a failure alert.
 
 > **Want emails (SMTP)?** Emitting notifications is one half; *delivery* (email and how it's sent)
-> is the other. A repo can ship its own SMTP credentials in its encrypted secrets so alerts go to
-> *your* mailbox. See **§13** for the full picture and the exact secret keys (e.g.
-> `SMTP_HOST_ADDR`, `SMTP_USER_PWD`, `NOTIFY_TO`).
+> is the other. A repo can ship its own SMTP credentials in the tier's encrypted secrets
+> (`ci/secrets.<env>.enc.yaml`) so alerts go to *your* mailbox. See **§13** for the full picture and
+> the exact secret keys (e.g. `SMTP_HOST_ADDR`, `SMTP_USER_PWD`, `NOTIFY_TO`).
 
 ---
 
@@ -333,7 +333,7 @@ Injected env vars:
 | `CI_ENV_DIR` | `/envstate` — a persistent per-(repo,branch) state dir, for preview-env bookkeeping/teardown. |
 | `CI_OUTBOX` | `/cicd/out/notify` — the notify outbox (used by the helpers; you don't write it directly). |
 | Cache vars | Many package-manager cache vars are pre-pointed into `/cache` (§7). |
-| Secret vars | If you ship `ci/secrets.enc.yaml`, each decrypted key appears as an env var (§8.3). |
+| Secret vars | If you ship `ci/secrets.<env>.enc.yaml` (per-env; legacy `ci/secrets.enc.yaml` still ok), each decrypted key of the resolved tier appears as an env var (§8.3). |
 | `env:` vars | Any `jobs.<name>.env` map entries. |
 
 Filesystem:
@@ -395,76 +395,93 @@ apk add --no-cache curl jq
 
 Install your repo's build dependencies in the job container with apt/apk/npm/etc. as shown.
 
-### 8.3 Secrets (sops + age)
+### 8.3 Secrets (sops + age) — per-environment
 
 Secrets are sops-encrypted files committed **in your repo** (ciphertext only — never plaintext).
-The runner decrypts them and injects each key as an env var into your job container. There is **no
-`secrets:` manifest field**; the runner keys off the *presence* of the encrypted file (see §10).
+The runner resolves an **environment** from the (gitolite-gated, trusted) branch, decrypts **only
+that tier's** file with **only that tier's key**, and injects each key as an env var into your job
+container. There is **no `secrets:` manifest field**; the runner keys off the *presence* of the
+encrypted files (see §10). Full model + operator key management: **`docs/per-env-secrets.md`**.
 
 #### Where the files go (exact paths)
 
 ```
 <repo root>/
-├── .sops.yaml                 # sops recipients (who can decrypt). Repo root. REQUIRED to encrypt.
+├── .sops.yaml                    # sops recipients per tier (who may decrypt). REQUIRED to encrypt.
 └── ci/
-    ├── secrets.enc.yaml       # the ENCRYPTED secrets (committed). The runner reads THIS path exactly.
-    └── secrets.example.yaml   # optional plaintext TEMPLATE for humans (never the real secret)
+    ├── secrets.dev.enc.yaml      # dev-tier secrets   (decrypted for env "dev")
+    ├── secrets.qa.enc.yaml       # qa-tier secrets    (env "qa")
+    ├── secrets.prod.enc.yaml     # prod-tier secrets  (env "prod")
+    └── secrets.example.yaml      # optional plaintext TEMPLATE for humans (never the real secret)
 ```
 
-The runner reads only **`ci/secrets.enc.yaml`**. The `.sops.yaml` and the example template are
-conveniences.
+The runner reads **`ci/secrets.<env>.enc.yaml`** for the resolved env. A **legacy single
+`ci/secrets.enc.yaml`** is still supported for repos that don't need tiers — but if ANY
+`ci/secrets.*.enc.yaml` exists, the per-env files are authoritative (a run whose env has no
+matching file is **refused**, never silently handed the legacy blob).
 
-#### Step 1 — `.sops.yaml` at the repo root (declares who may decrypt)
+#### Which env? (branch → env)
 
-This tells `sops` which recipients to encrypt to: a human GPG key (you, for editing) and the **CI
-runner's age public key** (passphraseless, so the runner decrypts unattended). Either can decrypt.
-Get the runner's age public key (an `age1…` string) and confirm your own GPG fingerprint from your
-operator. Copy this file and replace the two placeholders:
+- Default: **env = the sanitized branch name** (`dev`→`dev`, `prod`→`prod`, `feat/x`→`feat-x`).
+- The operator may alias branches → envs host-side (`environments.map`) — e.g. `main`→`prod`. The
+  binding lives on the host, **never in your pushed tree**, so you can't claim another tier.
+- A job may optionally declare `jobs.<name>.environment: <env>` for readability; it must **equal**
+  the branch-resolved env or the job is refused.
+
+#### Step 1 — `.sops.yaml` at the repo root (per-tier recipients)
+
+Each tier file is encrypted to **its own** runner age key (there is **no shared master key**), plus
+your GPG key for editing. Human read/edit access narrows as you climb tiers. Get each tier's runner
+age public key + confirm your GPG fingerprint from your operator:
 
 ```yaml
-# sops recipients for this repo. Humans decrypt via GPG (pass/YubiKey); the CI
-# runner decrypts via its passphraseless age key (unattended). Either decrypts.
-# Replace the placeholders. Add a recipient -> `sops updatekeys ci/secrets.enc.yaml`.
+# Per-tier recipients. Runner: one age key PER TIER (dev/qa/prod). Humans: GPG, tiered.
 creation_rules:
-  - path_regex: \.enc\.(ya?ml|json|env)$
-    pgp: "REPLACE_WITH_YOUR_GPG_FINGERPRINT"
-    age: "age1replace_with_cicd_runner_public_key"
+  - path_regex: (^|/)secrets\.prod\.enc\.ya?ml$
+    key_groups: [{ age: ["age1PROD_RUNNER"], pgp: ["YOUR_GPG_FPR"] }]
+  - path_regex: (^|/)secrets\.qa\.enc\.ya?ml$
+    key_groups: [{ age: ["age1QA_RUNNER"],   pgp: ["YOUR_GPG_FPR"] }]
+  - path_regex: (^|/)secrets\.dev\.enc\.ya?ml$
+    key_groups: [{ age: ["age1DEV_RUNNER"],  pgp: ["YOUR_GPG_FPR"] }]
 ```
 
-#### Step 2 — write, encrypt, commit `ci/secrets.enc.yaml`
+#### Step 2 — write, encrypt, commit each tier file
 
-Each top-level key becomes an **env var** inside your job. Keep it flat (`key: value`, scalars
-only). A minimal file:
-
-```yaml
-# ci/secrets.enc.yaml — flat key: value; each key becomes an env var in the job.
-CLOUDFLARE_API_TOKEN: cf-token-with-Account.Cloudflare-Pages.Edit-permission
-CLOUDFLARE_ACCOUNT_ID: your-cloudflare-account-id
-```
-
-Encrypt it in place with `sops` — it routes `*.enc.yaml` to the right recipients automatically via
-`.sops.yaml`, so you edit plaintext and it saves ciphertext:
+Each top-level key becomes an **env var** inside your job (flat `key: value`, scalars only). `sops`
+routes each file to the right recipients by name via `.sops.yaml`, so you edit plaintext, it saves
+ciphertext:
 
 ```sh
-sops ci/secrets.enc.yaml                              # opens $EDITOR; on save writes ENCRYPTED
-grep -q ENC ci/secrets.enc.yaml && echo "encrypted ✓" # sanity-check before committing
-git add ci/secrets.enc.yaml && git commit && git push # ciphertext only
+sops ci/secrets.dev.enc.yaml                          # opens $EDITOR; on save writes ENCRYPTED
+sops ci/secrets.qa.enc.yaml
+sops ci/secrets.prod.enc.yaml
+grep -L sops: ci/secrets.*.enc.yaml || echo "all encrypted ✓"   # none listed = all ciphertext
+git add ci/secrets.*.enc.yaml && git commit && git push          # ciphertext only
 ```
 
-> **For the full, copy-paste template that documents *every* key** — deploy creds, the complete
-> email/SMTP block (with custom subject/body), and arbitrary build secrets — see **§15.3**. That is
-> the comprehensive one to start from.
+> **For the full copy-paste template that documents *every* key** — deploy creds, the complete
+> email/SMTP block, arbitrary build secrets — see **§15.3**.
 
 #### Behavior
 
-- **Trigger = file presence.** `ci/secrets.enc.yaml` exists → the runner decrypts + injects. No
-  manifest field opts in.
-- **Each key → one env var** in the `run:` script's environment (`CLOUDFLARE_API_TOKEN`, etc.).
-- **Key not loaded → deferred, not failed.** If the file is present but the runner's age key isn't
-  unlocked on the host, the run is held pending and auto-runs once the operator unlocks it.
-- **Decrypt failure → status `secrets-decrypt-failed`** (e.g. you encrypted to the wrong recipient
-  — re-run `sops updatekeys ci/secrets.enc.yaml`).
-- Decrypted values exist only for the container's lifetime; the age key never enters the container.
+- **Trigger = file presence.** Any `ci/secrets.*.enc.yaml` (or legacy `secrets.enc.yaml`) → the
+  runner decrypts the resolved tier + injects. No manifest field opts in.
+- **Only the resolved tier is decrypted, with only that tier's key.** A higher tier's file sits in
+  `/work` as ciphertext the job can't read — and because tier selection is enforced by the **key**
+  (not the filename), copying/symlinking another tier's ciphertext under this tier's name still
+  **fails to decrypt** (the loaded key isn't a recipient). A planted decrypt-input symlink is refused.
+- **Each key → one env var** in the `run:` script's environment.
+- **Key not loaded → deferred, not failed.** If the resolved tier's key isn't unlocked on the host,
+  the run is held pending and auto-runs once the operator unlocks it.
+- **No tier for this env → refused** (status `secrets-decrypt-failed`) when per-env files exist but
+  none matches — never a silent fallback to another tier.
+- **Decrypt failure → status `secrets-decrypt-failed`** (e.g. encrypted to the wrong recipient —
+  re-run `sops updatekeys ci/secrets.<env>.enc.yaml`).
+- Decrypted values exist only for the container's lifetime; the age keys never enter the container.
+
+> **Whoever can push a tier's branch can read that tier's secrets** (they run its jobs). So scope
+> every credential to its tier — and never put a personal-identity credential (a Gmail app-password,
+> your API key) in a tier that others can push. See §13 for the notification consequence.
 
 ---
 
@@ -476,8 +493,10 @@ git add ci/secrets.enc.yaml && git commit && git push # ciphertext only
   docker socket. There is no docker binary or socket in the container.
 - **Jobs must be self-contained.** Assume only what the base image ships. Install your own deps
   (§8).
-- **`memory` and `pids` are no-ops on this runner.** Set them if you like; they're ignored here.
-  `timeout`, `network`, and the cap/no-new-privileges hardening always apply.
+- **`memory`/`pids` are enforced only where the host supports cgroup limits.** `RESOURCE_LIMITS=auto`
+  (default) applies `--memory`/`--pids-limit` on a cgroup-v2/systemd host, else falls back to POSIX
+  ulimits (`nproc`/`fsize`). On the OpenRC-rootless target they're a **no-op** — don't rely on them
+  there. `timeout`, `network`, and the cap/no-new-privileges hardening always apply.
 - **Network modes:** `bridge` (outbound) or `none`. Default `bridge`. Use `none` for offline jobs.
 - **Path filters apply to real pushes only.** A manual `ci-job run` skips path filters (and
   `ci-job run --job <name>` skips branch *and* path filters).
@@ -492,7 +511,8 @@ git add ci/secrets.enc.yaml && git commit && git push # ciphertext only
 Older example manifests show fields the runner does **not** read. Don't rely on them:
 - **`version:`** — appears at the top of examples; it does nothing.
 - **`secrets: [ ... ]`** — appears under jobs in some examples; it has no effect. Secrets are
-  driven entirely by the presence of `ci/secrets.enc.yaml` (§8.3).
+  driven entirely by the presence of the per-env `ci/secrets.<env>.enc.yaml` files (legacy single
+  `ci/secrets.enc.yaml` still honored) (§8.3).
 
 ---
 
@@ -544,9 +564,9 @@ gitolite against your ssh key.)
 - [ ] **First push to a new branch.** That's a `create` event, not `push`. Add `on.create` or use
       `ci-job run`.
 - [ ] **`run:` is `sh`, not bash.** Use a bash image + `bash script.sh` if you need bash.
-- [ ] **Counting on `memory`/`pids` limits.** No-op on this runner.
-- [ ] **Using a `secrets:` or `version:` field.** Ignored. Secrets = presence of
-      `ci/secrets.enc.yaml`.
+- [ ] **Counting on `memory`/`pids` limits.** Enforced only with cgroup support (`RESOURCE_LIMITS`); a no-op on the OpenRC-rootless host.
+- [ ] **Using a `secrets:` or `version:` field.** Ignored. Secrets = presence of the per-env
+      `ci/secrets.<env>.enc.yaml` files (legacy single `ci/secrets.enc.yaml` still honored).
 - [ ] **Privileged operations.** `cap-drop ALL` + `no-new-privileges` forbid mounting, setcap,
       sudo-up, raw sockets, etc.
 - [ ] **Relying on path filters via manual run.** `ci-job run` skips path filters.
@@ -555,58 +575,75 @@ gitolite against your ssh key.)
 
 ## 13. Notifications & email (SMTP)
 
-Notifications have two halves: you **emit** them from your job; the operator configures **delivery**
-(how/where they're sent). A repo can supply its own SMTP credentials so alerts go to its own mailbox.
+Notifications are **opt-in per repo (per tier)**: you **emit** them from your job into the outbox;
+the **runner delivers** them host-side after the job, using the **resolved tier's** decrypted SMTP
+creds (`ci/secrets.<env>.enc.yaml`). A repo/env that sets no SMTP creds simply **doesn't notify** —
+there is no required host fallback. Give a tier email creds and its alerts go to your mailbox.
 
 ```
- YOU (in your repo)                            OPERATOR (host config)
- ──────────────────                            ──────────────────────
- emit from your run: script                    configure DELIVERY
-   . /cicd/lib.sh                                NOTIFY_CMD  -> email handler (default) or wall
-   notify "deploy starting"                      + a default SMTP server in /etc/cicd-runner/notify.env
-   notify_success "deployed ok"
-   notify_error  "deploy failed"               YOU can override SMTP per-repo via your
-   die "fatal"                                  encrypted secrets (§13.2)
+ YOU (in your repo, per tier)                  RUNNER (host-side, AFTER the job)
+ ────────────────────────────                  ─────────────────────────────────
+ emit into the outbox                          deliver with the TIER's decrypted creds
+   . /cicd/lib.sh                                reads ci/secrets.<env>.enc.yaml SMTP keys
+   notify "deploy starting"                      (per §13.3) — no creds set → no email
+   notify_success "deployed ok"                  crash-proof BACKSTOP even if the job
+   notify_error  "deploy failed"                 was OOM/timeout-killed and wrote nothing
+   die "fatal"                                  optional host last-resort: /etc/cicd-runner/notify.env
 ```
 
 - **You** only call the `/cicd/lib.sh` helpers (`notify`, `notify_success`, `notify_error`, `die`)
-  from §5. Nothing is sent from inside your container.
-- **After the container exits**, the runner delivers each notification through the operator's
-  configured handler, plus a **backstop** alert if the job failed and emitted no terminal
-  `notify_success`/`notify_error` (catches OOM/SIGKILL and scripts that forgot to notify).
+  from §5. Nothing is sent from inside your container — the helpers write to the outbox.
+- **After the container exits**, the runner delivers each queued notification host-side using the
+  resolved tier's decrypted creds, plus a **backstop** alert if the job failed and emitted no
+  terminal `notify_success`/`notify_error`. This path is **crash-proof**: the backstop fires even
+  when the job is OOM/SIGKILL/timeout-killed and wrote nothing to the outbox.
+- **A direct `curl` from inside the job is unreliable on crash** — a killed job never reaches it.
+  Use the `notify_*`/`die` outbox for anything you must not miss; keep direct calls for best-effort
+  extras only.
+- **Scope creds per tier.** Whoever can push a tier's branch runs its jobs and can read that tier's
+  secrets. **Never** put a personal-identity credential (a Gmail app-password, your personal API
+  key) in a tier others can push — its leak lets them *impersonate you*. A personal-identity SMTP
+  login is acceptable **only** in a tier restricted to one person (e.g. `prod`, where gitolite
+  `@prod` = you). For a **shared** tier, use a **send-only provider key** (SES `ses:SendEmail`, a
+  Postmark server/send token, Resend) whose leak = "send as the CI bot", not "impersonate a human".
 
 ### 13.1 Delivery handlers
 
-The operator picks the handler (`NOTIFY_CMD`). Two ship with the runner:
+The operator picks the handler by setting `NOTIFY_CMD` (it has no code-level default — if unset,
+nothing is delivered). Two handlers ship with the runner; the shipped `runner.conf.sample` points
+`NOTIFY_CMD` at the email one:
 
 | Handler | What it does |
 |---|---|
-| email handler | Emails the alert over SMTP. The default. |
-| wall handler | Broadcasts to logged-in terminals. |
+| `notify-email` | Emails the alert over SMTP. The handler the shipped config selects. |
+| `notify-wall` | Broadcasts to logged-in terminals. |
 
 The email handler emails **terminal** events by default — `notify_success` (`[CI OK]`),
 `notify_error`/`die` (`[CI FAIL]`), and the failure backstop. Plain `notify` (info) is **not**
 mailed unless `NOTIFY_INFO=1` is set (§13.4).
 
-### 13.2 SMTP credentials in `ci/secrets.enc.yaml` — yes, supported
+### 13.2 SMTP credentials in `ci/secrets.<env>.enc.yaml` — per tier, opt-in
 
-The email handler reads SMTP config from **your repo's decrypted secrets first**, then falls back
-to an operator-global file (`/etc/cicd-runner/notify.env`). So a repo gets **its own** email
-destination/credentials just by putting the keys below into `ci/secrets.enc.yaml` — no manifest
-field, no operator change (as long as the operator left the default email handler in place). Each
-variable resolves independently: supply only `NOTIFY_TO` and inherit the host's SMTP server, or
-supply everything.
+The email handler reads SMTP config from **the resolved tier's decrypted secrets first**, then, only
+if a key is still unset, from an **optional** operator-global file (`/etc/cicd-runner/notify.env`).
+The reliable, recommended path for multi-repo is to put each repo's own creds in **its tier's**
+secrets — no host file needed, no manifest field, no operator change (as long as the operator left
+the shipped email handler in place). Each variable resolves independently: supply only `NOTIFY_TO`
+and inherit the (optional) host SMTP server, or supply everything. **Set nothing → the tier simply
+doesn't notify** (`notify-email` no-ops silently).
 
-> The handler runs host-side, so it uses your *decrypted* secrets at delivery time — which means
-> the host's age key must be loaded (the same key that gates secret-using jobs, §8.3). These
-> credentials are read at delivery time; they are not exposed to your job's env unless you also
-> reference them in `run:`.
+> The handler runs host-side, so it uses the *decrypted* tier secrets at delivery time — which means
+> that tier's age key must be loaded (the same per-tier key that gates its secret-using jobs, §8.3).
+> These credentials are read at delivery time; they are not exposed to your job's env unless you
+> also reference them in `run:`. Because delivery is host-side and post-job, it survives a job
+> crash (the crash-proof backstop, §13) — unlike a `curl` from inside a killed container.
 
 ### 13.3 SMTP / email variable reference
 
-These go in **`ci/secrets.enc.yaml`** (per-repo) and/or **`/etc/cicd-runner/notify.env`**
-(operator-global). The primary names match **Plausible CE**'s SMTP config so you can reuse the same
-values; a generic alias is accepted for each (the primary is tried first, then the alias):
+These go in the resolved tier's **`ci/secrets.<env>.enc.yaml`** (per-repo, recommended) and/or the
+**optional** **`/etc/cicd-runner/notify.env`** (operator-global last resort). The primary names match
+**Plausible CE**'s SMTP config so you can reuse the same values; a generic alias is accepted for each
+(the primary is tried first, then the alias):
 
 | Primary key | Alias | Default (if unset) | Meaning |
 |---|---|---|---|
@@ -639,7 +676,8 @@ Template tokens (literal `{{...}}` substitution; message/log are treated as untr
 ### 13.5 Checklist for "email me on CI failure"
 
 1. Keep `notify_error`/`die` (or rely on the failure backstop) in your `run:` script — §5.
-2. Add SMTP keys to `ci/secrets.enc.yaml`, e.g.:
+2. Add SMTP keys to the tier's `ci/secrets.<env>.enc.yaml` — put them in **each tier** you want mail
+   from, e.g.:
    ```yaml
    SMTP_HOST_ADDR: smtp.gmail.com
    SMTP_HOST_PORT: "587"
@@ -650,10 +688,12 @@ Template tokens (literal `{{...}}` substitution; message/log are treated as untr
    # SMTP_FROM_NAME: my-project-ci
    # NOTIFY_LOGLINES: "50"
    ```
-   (sops-encrypt against the runner's age recipient — §8.3.) Quote numeric values so they stay
-   strings.
-3. That's it — the default email handler picks these up. You do not edit any host config. If the
-   operator changed the default handler, ask them.
+   (sops-encrypt against that tier's age recipient — §8.3.) Quote numeric values so they stay
+   strings. **Credential scope:** a personal-identity login like the Gmail app-password above is
+   safe **only** in a tier restricted to you (e.g. `prod`). In any tier others can push, use a
+   send-only provider key (SES/Postmark/Resend) instead, or omit email for that tier.
+3. That's it — the shipped email handler picks these up per tier. You do not edit any host config.
+   If the operator changed the default handler, ask them.
 
 ---
 
@@ -673,7 +713,7 @@ else is ignored (`version:`, `secrets:` — §10).
 | Path | Purpose |
 |---|---|
 | `.gitolite/ci.yml` | The manifest. Its presence is the opt-in gate (§2). |
-| `ci/secrets.enc.yaml` | Encrypted secrets → injected as env vars; also the source of per-repo SMTP creds (§13.2). Its presence is the secrets trigger; there is no `secrets:` field. |
+| `ci/secrets.<env>.enc.yaml` | Per-env encrypted secrets → the resolved tier's file is decrypted and injected as env vars; also the source of that tier's SMTP creds (§13.2). Presence of any `secrets.*.enc.yaml` is the secrets trigger (legacy single `ci/secrets.enc.yaml` still honored); there is no `secrets:` field. |
 
 There are no other magic repo paths. (`ci/*.sh` scripts only matter because *your* `run:` calls
 them.)
@@ -744,8 +784,14 @@ its defaults. "Affects authors?" flags what changes your jobs' behavior or limit
 
 | Key | Default | Controls | Affects authors? |
 |---|---|---|---|
-| `SOPS_AGE_KEY_FILE` | `/run/ci-keys/age-keys.txt` | Path to the decrypted age key. Its presence gates secret-using jobs and the email handler. | Yes — if unloaded, secret jobs **defer** and per-repo SMTP creds can't be read. |
+| `AGE_KEY_DIR` | `/run/ci-keys` | Ramfs dir holding one decrypted **per-tier** private key at `<env>.age`. Presence of the resolved tier's key gates that tier's secret-using jobs and its email delivery. | Yes — if that tier's key is unloaded, its secret jobs **defer** and its SMTP creds can't be read. |
+| `AGE_ENVS` | *(unset)* | Space-separated list of tiers the runner knows (e.g. `"dev qa prod"`). | Indirectly — an env not listed has no key slot. |
+| `AGE_RECIPIENT_<env>` | *(unset)* | The PUBLIC age recipient of each tier's key; `unlock-ci` routes a piped key to `<env>.age` by matching its derived pubkey here. | No (operator wiring). |
+| `AGE_LEGACY_RECIPIENT` | *(unset)* | Optional PUBLIC recipient for the legacy single `secrets.enc.yaml`; a piped key matching it goes to `SOPS_AGE_KEY_FILE`. | No. |
+| `SOPS_AGE_KEY_FILE` | `/run/ci-keys/age-keys.txt` | **LEGACY single-key slot** — the decrypted key used only for the legacy `ci/secrets.enc.yaml` path. Per-tier files use `AGE_KEY_DIR/<env>.age` instead. | Yes — for legacy-secrets repos, if unloaded those jobs **defer**. |
 | `SHM_DIR` | `/dev/shm` | tmpfs where decrypted env-files are written transiently. | No. |
+| `CICD_ENV_MAP` | `$RUNNER_BASE/etc/environments.map` | Host-side branch→env map (first match wins) used to resolve the secrets tier; no map → env = sanitized branch name. Operator-owned; the pushed tree can't influence it. | Indirectly — decides which tier your branch resolves to (§8.3). |
+| `CICD_AGE_ENC` | `$CICD_BASE/etc/age-key.gpg` | Optional gpg-at-rest key blob `unlock-ci` decrypts when no key is piped. Leave unset to only load keys via the pipe form. | No (operator wiring). |
 
 **Concurrency:**
 
@@ -760,10 +806,12 @@ its defaults. "Affects authors?" flags what changes your jobs' behavior or limit
 |---|---|---|---|
 | `DEFAULT_IMAGE` | `node:20-alpine` | Image when `image` is unset. | Yes. |
 | `DEFAULT_TIMEOUT` | `900` | Wall-clock kill (s) when `timeout` unset; also the max age before runaway containers are killed. | Yes. |
-| `DEFAULT_MEMORY` | `2g` | `--memory` default (only if `RESOURCE_LIMITS=1`). | Yes (when enforced). |
-| `DEFAULT_PIDS` | `512` | `--pids-limit` default (only if `RESOURCE_LIMITS=1`). | Yes (when enforced). |
+| `DEFAULT_MEMORY` | `2g` | `--memory` default (applied only when `RESOURCE_LIMITS` enforces cgroup limits). | Yes (when enforced). |
+| `DEFAULT_PIDS` | `512` | `--pids-limit` default (applied only when `RESOURCE_LIMITS` enforces cgroup limits). | Yes (when enforced). |
 | `DEFAULT_NETWORK` | `bridge` | `--network` default. | Yes. |
-| `RESOURCE_LIMITS` | `0` | `1` ⇒ apply `--memory`/`--pids-limit`; `0` ⇒ omit them. | **Yes** — at `0`, `memory`/`pids` are no-ops (§9). |
+| `TIMEOUT_MAX` | `86400` | Hard ceiling (s) a per-job `timeout` is clamped to; `0`/garbage falls back to `DEFAULT_TIMEOUT`. | Yes — caps very long `timeout` values. |
+| `RESOURCE_LIMITS` | `auto` | `auto` ⇒ detect cgroup-v2/systemd support → apply `--memory`/`--pids-limit`, else fall back to POSIX ulimits (`ULIMIT_NPROC`/`ULIMIT_FSIZE`); `1` ⇒ force cgroup limits; `0` ⇒ no cgroup attempt (ulimits only). | **Yes** — governs whether `memory`/`pids` are enforced (§9). |
+| `ULIMIT_NPROC` / `ULIMIT_FSIZE` | `1024` / `2147483648` | POSIX ulimit fallbacks (process cap; single-file byte cap = 2 GiB) applied when no cgroup pids/memory limit is available. | Marginally. |
 
 **Dependency cache reaper:**
 
@@ -771,7 +819,10 @@ its defaults. "Affects authors?" flags what changes your jobs' behavior or limit
 |---|---|---|---|
 | `CACHE_MAX_AGE_DAYS` | `30` | Delete `/cache` entries untouched this long. | Yes — old caches expire (cold rebuild). |
 | `CACHE_MAX_GB` | `20` | Then size-cap the whole cache (LRU eviction). | Yes — caches may be evicted under pressure. |
+| `CACHE_ISOLATION` | `shared` | `shared` = one global cache; `per-repo` gives each repo its own cache subtree (closes cross-repo exec via shared tool config, at the cost of dedup). | Marginally. |
 | `LOG_RETENTION_DAYS` | `30` | Delete run logs/metadata older than this. | Yes — old run logs disappear from `ci-job log`/`status`. |
+| `LOG_MAX_BYTES` | `52428800` | Cap per-run `output.log` bytes (50 MiB); output past the cap is dropped (the append runs host-side, so the container fsize ulimit doesn't bound it). | Yes — a log-flooding job is truncated. |
+| `MASK_MAX_RULES` | `500` | Cap on secret-redaction rules per job (bounds a pathological secrets file from forking the mask builder thousands of times). | No. |
 
 **Behavior:**
 
@@ -780,7 +831,8 @@ its defaults. "Affects authors?" flags what changes your jobs' behavior or limit
 | `CANCEL_IN_PROGRESS` | `0` | **Declared but has no effect today** — runs always coalesce. Don't rely on it. | No (no-op). |
 | `DELETE_SUPERSEDES` | `1` | `1` = a branch-delete cancels a pending build for that branch. | Yes — a delete can pre-empt your queued build. |
 | `NOTIFY_BACKSTOP` | `1` | `1` = email on a job failure that emitted no `notify_*` (catches OOM/SIGKILL). | Indirectly (you still get failure alerts). |
-| `NOTIFY_CMD` | email handler | Which delivery handler runs per notification (§13). | Yes — determines whether/how your `notify_*` reach a human. |
+| `NOTIFY_CMD` | *(unset — must be set)* | Path to the delivery handler run per notification (§13). **Must be set explicitly** — if empty, ALL delivery (every `notify_*`/`die` and the failure backstop) is silently dropped. The shipped handler you point it at is `notify-email` (SMTP); `notify-wall` also ships. | Yes — determines whether/how your `notify_*` reach a human. |
+| `CICD_NOTIFY_HOST_ENV` | `/etc/cicd-runner/notify.env` | Path to the **optional** operator-global SMTP fallback file (§13.2). Read only for keys a repo's tier secrets leave unset. Discouraged for multi-repo. | No. |
 
 **Ephemeral-env reaper:**
 
@@ -788,6 +840,14 @@ its defaults. "Affects authors?" flags what changes your jobs' behavior or limit
 |---|---|---|---|
 | `REPORT_STALE_DAYS` | `30` | Log preview envs idle this long for operator attention. | Marginally. |
 | `AUTO_REAP_STALE_DAYS` | `0` | `0` = report only; `>0` = auto-teardown after N idle days. | Yes if `>0` — abandoned preview envs get torn down. |
+
+**Audit log (append-only, hash-chained):**
+
+| Key | Default | Controls | Affects authors? |
+|---|---|---|---|
+| `AUDIT_ENABLED` | `1` | `1` = record security events (ingest/job-start/job-end/key-unlock); `0` = off. | No. |
+| `AUDIT_LOG` | `$RUNNER_BASE/audit.log` | Path of the tamper-evident audit log (`ci-audit verify`/`tail`). | No. |
+| `AUDIT_LOCK_MAX_SPINS` / `AUDIT_LOCK_STALE_SECS` | `300` / `30` | Lock-contention tuning where `flock` is absent (spin cap; stale-mutex reclaim seconds). | No. |
 
 **Docker context:**
 
@@ -801,9 +861,10 @@ its defaults. "Affects authors?" flags what changes your jobs' behavior or limit
 |---|---|---|
 | `TRUSTED_BRANCHES` | *(unset)* | **Declared but has no effect today.** Don't rely on it. |
 
-**Operator-global SMTP fallback file** — `/etc/cicd-runner/notify.env`: holds the same keys as
-§13.3/§13.4 as a default for repos that don't ship their own SMTP creds. Operator-only; per-repo
-`ci/secrets.enc.yaml` overrides it key-by-key.
+**Optional operator-global SMTP fallback file** — `/etc/cicd-runner/notify.env`: holds the same keys
+as §13.3/§13.4 as a last-resort default for repos that don't ship their own SMTP creds. No longer
+recommended for multi-repo (each repo should put its own creds in its tier secrets). Operator-only;
+per-tier `ci/secrets.<env>.enc.yaml` overrides it key-by-key.
 
 ### (e) Bootstrap / wrapper env vars (rarely relevant to authors)
 
@@ -866,50 +927,66 @@ jobs:
     run: sh ci/preview-teardown.sh
 ```
 
-### 15.2 `.sops.yaml` — full file
+### 15.2 `.sops.yaml` — full file (per-tier recipients)
 
-Save at your repo root. Replace both placeholders (your GPG fingerprint; the runner's age public
-key from your operator).
+Save at your repo root. Each tier file is encrypted to **its own** runner age key (there is **no
+shared master key**) plus your GPG key for editing; human read/edit access narrows as you climb
+tiers (higher tiers = superset of humans). Replace the placeholders with each tier's runner age
+public key (from your operator) and your GPG fingerprint(s). Add a recipient →
+`sops updatekeys ci/secrets.<env>.enc.yaml`.
 
 ```yaml
-# sops recipients for this repo. Humans decrypt via GPG (pass/YubiKey); the CI
-# runner decrypts via its passphraseless age key (unattended). Either decrypts.
-# Replace the placeholders. Add a recipient -> `sops updatekeys ci/secrets.enc.yaml`.
+# Per-tier recipients. Runner: one age key PER TIER (dev/qa/prod) — NO shared master key.
+# Humans: GPG, tiered (prod ⊇ qa ⊇ dev). Either an age or a PGP recipient can decrypt a file.
 creation_rules:
-  - path_regex: \.enc\.(ya?ml|json|env)$
-    pgp: "REPLACE_WITH_YOUR_GPG_FINGERPRINT"
-    age: "age1replace_with_cicd_runner_public_key"
+  - path_regex: (^|/)secrets\.prod\.enc\.ya?ml$
+    key_groups: [{ age: ["age1PROD_RUNNER"], pgp: ["PROD_FPR"] }]
+  - path_regex: (^|/)secrets\.qa\.enc\.ya?ml$
+    key_groups: [{ age: ["age1QA_RUNNER"],   pgp: ["QA_FPR","PROD_FPR"] }]
+  - path_regex: (^|/)secrets\.dev\.enc\.ya?ml$
+    key_groups: [{ age: ["age1DEV_RUNNER"],  pgp: ["DEV_FPR","QA_FPR","PROD_FPR"] }]
 ```
 
-### 15.3 `ci/secrets.enc.yaml` — full template (documents every key)
+### 15.3 `ci/secrets.<env>.enc.yaml` — full template (documents every key)
 
-The comprehensive secrets template. Save it, keep only the sections you need, fill real values, then
-encrypt it in place (`sops ci/secrets.enc.yaml`). Only the deploy creds are required; everything else
-is optional. Every top-level key becomes an env var inside the job container, and the same decrypted
-set is what supplies the email/SMTP config (§13).
+The comprehensive **per-env** secrets template — one file per tier (`ci/secrets.dev.enc.yaml`,
+`ci/secrets.qa.enc.yaml`, `ci/secrets.prod.enc.yaml`); the runner decrypts only the resolved tier's
+file (§8.3). Save it under the tier name, keep only the sections you need, fill real values, then
+encrypt it in place (`sops ci/secrets.<env>.enc.yaml`). Only the deploy creds are required;
+everything else is optional. Every top-level key becomes an env var inside the job container, and the
+same decrypted set is what supplies that tier's email/SMTP config (§13).
 
 ```yaml
-# ci/secrets.enc.yaml — TEMPLATE (documents every key the CI may use).
+# ci/secrets.<env>.enc.yaml — PER-TIER TEMPLATE (documents every key the CI may use).
 # ─────────────────────────────────────────────────────────────────────────────
-# Do NOT put real values here and do NOT rename this file. Create the real
-# ENCRYPTED file with sops (it routes *.enc.yaml to the runner's age key via
-# .sops.yaml automatically):
+# Do NOT put real values in a template. Create the real ENCRYPTED file per tier with
+# sops (it routes secrets.<env>.enc.yaml to THAT tier's own age key via .sops.yaml
+# automatically — §15.2). Repeat per tier you deploy (dev/qa/prod):
 #
-#     sops ci/secrets.enc.yaml        # opens $EDITOR; on save writes ENCRYPTED
-#     grep -q ENC ci/secrets.enc.yaml && echo "encrypted ✓"   # before committing
+#     sops ci/secrets.dev.enc.yaml    # opens $EDITOR; on save writes ENCRYPTED
+#     grep -q ENC ci/secrets.dev.enc.yaml && echo "encrypted ✓"   # before committing
 #
-# HOW IT REACHES THE JOB: at run time the runner decrypts this host-side into a
-# tmpfs file and injects it as `--env-file` into the build container. So EVERY key
-# below becomes an ENV VAR inside the container — and the same decrypted set is what
+# HOW IT REACHES THE JOB: at run time the runner resolves the ENV from the (trusted)
+# branch and decrypts ONLY that tier's file host-side into a tmpfs file, with ONLY
+# that tier's key, then injects it as `--env-file` into the build container. So EVERY
+# key below becomes an ENV VAR inside the container — and the same decrypted set is what
 # the email handler reads for SMTP. Keep it FLAT (key: value); only scalars.
 #
 # Only include the sections you need. All keys are optional except the deploy creds.
+# REMEMBER: whoever can push this tier's branch can read this file's secrets.
 
 # ── (A) REQUIRED — Cloudflare Pages deploy (ci/deploy-site.sh) ────────────────
 CLOUDFLARE_API_TOKEN: cf-token-with-Account.Cloudflare-Pages.Edit-permission
 CLOUDFLARE_ACCOUNT_ID: your-cloudflare-account-id
 
-# ── (B) EMAIL NOTIFICATIONS (Gmail SMTP) ─────────────────────────────────────
+# ── (B) EMAIL NOTIFICATIONS (SMTP) ───────────────────────────────────────────
+# CREDENTIAL SCOPE (read before pasting a login here): whoever can push THIS tier's
+# branch can read this file. A personal-identity login (the Gmail App Password below,
+# a personal API key) is safe ONLY in a tier restricted to one person — e.g. prod,
+# where gitolite @prod = you. In any SHARED tier (dev/qa others can push), do NOT use
+# a personal login: use a SEND-ONLY provider key (SES ses:SendEmail, a Postmark send
+# token, Resend) whose leak = "send as the CI bot", not "impersonate you" — or omit
+# email for that tier entirely.
 # Two accepted naming styles per field (first found wins): the Plausible-CE style
 # (SMTP_*_ADDR / _PORT / _NAME / _PWD, MAILER_EMAIL) OR the generic aliases. Pick one.
 #   host:    SMTP_HOST_ADDR   | SMTP_HOST          (default smtp.gmail.com)
@@ -950,23 +1027,26 @@ NOTIFY_BODY: |
 # GOOGLE_SA_KEY: "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
 #
 # NOTE: these become visible INSIDE the build container. If SMTP creds (section B)
-# should NOT be exposed to the build, put them ONLY in the operator-global
-# /etc/cicd-runner/notify.env (§15.4) instead — the email handler falls back to that
-# file and it is never mounted into a container.
+# should NOT be exposed to the build, you may instead put them ONLY in the optional
+# operator-global /etc/cicd-runner/notify.env (§15.4) — the email handler falls back
+# to that file and it is never mounted into a container. (Host file is discouraged for
+# multi-repo; it's the one case where it earns its keep.)
 ```
 
-### 15.4 `/etc/cicd-runner/notify.env` — operator-global email fallback (operator-only)
+### 15.4 `/etc/cicd-runner/notify.env` — OPTIONAL operator-global email fallback (operator-only)
 
-You normally don't touch this — it's the host-wide default SMTP config the operator installs, used
-for repos that don't ship their own email block (§15.3 B). Per-repo secrets override it key-by-key.
-Included so you know what the fallback looks like.
+You normally don't touch this, and it's **discouraged for multi-repo** — prefer per-tier creds in
+each repo's `ci/secrets.<env>.enc.yaml` (§15.3 B). It's an optional host-wide last-resort SMTP
+default the operator may install for repos that ship no email block. Per-tier secrets override it
+key-by-key. Included so you know what the fallback looks like.
 
 ```sh
-# OPERATOR-GLOBAL email fallback for CI failure alerts (optional).
+# OPTIONAL operator-global email fallback for CI failure alerts.
+# Discouraged for multi-repo — prefer per-tier creds in each repo's secrets.
 # Install as /etc/cicd-runner/notify.env  (chmod 640, root:cicd-runner).
-# Simple KEY=VAL only (no shell features). Per-project secrets (repo's sops
-# ci/secrets.enc.yaml) OVERRIDE these, so this is just the default for projects
-# that don't bring their own.
+# Simple KEY=VAL only (no shell features). Per-tier secrets (repo's sops
+# ci/secrets.<env>.enc.yaml) OVERRIDE these key-by-key, so this is just a last-resort
+# default for projects that don't bring their own.
 SMTP_HOST_ADDR=smtp.gmail.com
 SMTP_HOST_PORT=587
 SMTP_USER_NAME=you@gmail.com
