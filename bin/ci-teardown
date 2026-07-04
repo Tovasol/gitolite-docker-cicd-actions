@@ -35,12 +35,12 @@ case "$cmd" in
   retry)
     repo="${2:?repo}"; key="${3:?branch-or-slug}"
     env="$(resolve_env "$repo" "$key")" || die "no env for $repo / $key"
-    # branch file is in the job-controlled /envstate mount — refuse a symlink (F1) and re-validate
-    # the content before it becomes a queue path component + run-group argv (F3).
-    [ -L "$env/branch" ] && die "branch file in $env is a symlink — refusing (envstate guard)"
-    branch="$(cat "$env/branch" 2>/dev/null)" || die "no stored branch in $env — cannot recover exact name"
-    [ -n "$branch" ] || die "empty branch file in $env"
-    valid_branch "$branch" || die "stored branch '$branch' is not a valid ref name — refusing (F3)"
+    # branch file is in the job-controlled /envstate mount. recover_env_branch refuses a symlink (F1),
+    # invalid refs, AND any value whose slugify() != this env dir's name — content a job forged to
+    # redirect the teardown at a DIFFERENT env/tier (F3). Dir name = slugify(trusted branch) set at
+    # create, not job-writable → the trust anchor. This is the EXACT-branch source of truth (§31).
+    branch="$(recover_env_branch "$env")" \
+      || die "branch file in $env is missing, a symlink, invalid, or tampered (slug mismatch) — refusing (envstate guard, F3)"
     rm -f "$env/teardown-failed"                 # clear the marker so the runner acts
     q="$RUNNER_BASE/queue/$repo/$branch"; mkdir -p "$q"
     printf 'delete 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 manual\n' \

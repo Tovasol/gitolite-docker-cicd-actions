@@ -195,6 +195,24 @@ slugify() {
   printf '%s-%s' "${base:-x}" "$h"
 }
 
+# Recover the EXACT branch for an env from its <envdir>/branch file, REFUSING any value a job could
+# have forged to redirect a teardown at a DIFFERENT env dir/tier. A running job has the env's $ENVS
+# mounted RW at /envstate, so it can overwrite `branch` with an arbitrary (still ref-valid) name —
+# e.g. a victim env's branch. valid_branch alone can't catch that (`prod`, `main` are valid refs).
+# Trust anchor: the env dir's basename IS slugify(original_branch), fixed by the runner at CREATE
+# and NOT job-writable (a job writes INSIDE the mount; it cannot rename the dir). So a branch file
+# whose slugify() != the dir basename was tampered to point elsewhere -> reject (F3). Symlink -> also
+# reject (F1/F2). Echoes the validated branch on success; returns 1 (no output) otherwise.
+recover_env_branch() {  # <envdir>
+  local envdir="$1" b
+  [ -L "$envdir/branch" ] && return 1
+  [ -f "$envdir/branch" ] || return 1
+  b="$(cat -- "$envdir/branch" 2>/dev/null)" || return 1
+  valid_branch "$b" || return 1
+  [ "$(slugify "$b")" = "$(basename "$envdir")" ] || return 1
+  printf '%s' "$b"
+}
+
 # --- yaml field helpers (require yq v4 / mikefarah) ---------------------------
 yq_str()  { yq -r "$2 // \"\"" "$1" 2>/dev/null; }
 yq_list() { yq -r "$2 // [] | join(\" \")" "$1" 2>/dev/null; }   # array -> space list

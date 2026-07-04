@@ -18,10 +18,14 @@ report=$(( ${REPORT_STALE_DAYS:-30} * 86400 ))
 
 find "$RUNNER_BASE/envs" -maxdepth 2 -mindepth 2 -type d 2>/dev/null | while read -r envdir; do
   rel="${envdir#"$RUNNER_BASE"/envs/}"; repo="${rel%/*}"
-  # the branch file lives in the job-controlled /envstate mount: a symlink would make `cat` read a
-  # host file (F1); junk content would traverse out of queue/ when used as a path below (F3).
-  if [ -L "$envdir/branch" ]; then log "reap-envs: $repo branch file is a symlink — skipping (envstate guard)"; continue; fi
-  branch="$(cat "$envdir/branch" 2>/dev/null || echo '?')"
+  # The branch file lives in the job-controlled /envstate mount, so a job can forge it. recover_env_branch
+  # refuses a symlink (F1) AND any content whose slugify() != this env dir's name — i.e. a value forged
+  # to redirect the teardown at a DIFFERENT env/tier (F3). The dir name = slugify(trusted branch), set
+  # at create, not job-writable — the trust anchor. A tampered env is skipped (it only harms its own cleanup).
+  if ! branch="$(recover_env_branch "$envdir")"; then
+    log "reap-envs: $rel branch file missing/symlink/invalid/tampered (slug mismatch) — skipping (envstate guard, F3)"
+    continue
+  fi
   if [ -f "$envdir/teardown-failed" ]; then
     log "reap-envs: $repo/$branch AWAITING OPERATOR (teardown-failed) — ci-teardown retry|abandon"
     continue
