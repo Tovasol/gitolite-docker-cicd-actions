@@ -179,5 +179,27 @@ assert_no_match "watch does NOT tail a missing log" "$out" 'No such file'
 # arm makes it fall through to this timeout message.
 assert_no_match "watch stops at terminal status"    "$out" 'stopped watching after timeout'
 
+# Re-run collision: a PRIOR run of the same sha is already exit:0. sha is not per-run
+# unique, so watch must NOT latch onto the stale terminal row and return instantly — it
+# must ignore run dirs that predate this queue and follow the NEW run through running->exit.
+# Mock: the stale row (dir=/runs/old, exit:0) is ALWAYS present; the new run (dir=/runs/new)
+# only starts a couple polls in. Without the baseline filter, poll 1 sees the stale exit:0
+# and returns before 'running' ever appears — so asserting 'running' pins the fix.
+suite "ci-job run --watch (re-run of same sha ignores the prior terminal run)"
+rm -f "$M/poll.n"
+cat > "$RB/ci-runs" <<EOF
+#!/usr/bin/env bash
+c="$M/poll.n"; n=\$(( \$(cat "\$c" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "\$c"
+echo '{"schema":1,"dir":"/runs/old","repo":"tovasol/app","job":"deploy","sha":"$SHA","status":"exit:0"}'
+if   [ "\$n" -ge 5 ]; then echo '{"schema":1,"dir":"/runs/new","repo":"tovasol/app","job":"deploy","sha":"$SHA","status":"exit:0"}'
+elif [ "\$n" -ge 3 ]; then echo '{"schema":1,"dir":"/runs/new","repo":"tovasol/app","job":"deploy","sha":"$SHA","status":"running"}'
+fi
+EOF
+chmod +x "$RB/ci-runs"
+out="$(GL_USER=alice PATH="$STUB:$PATH" HOME="$M" CICD_RUNNER_BIN="$RB" \
+       CIJOB_POLL=0 CIJOB_POLL_MAX=20 bash "$CIJOB" run tovasol/app main --job deploy --watch 2>&1)"
+assert_match    "watch follows the NEW run's 'running'" "$out" 'running'
+assert_match    "watch reports the NEW run's 'exit:0'"  "$out" 'exit:0'
+
 rm -rf "$M"
 summary

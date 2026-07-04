@@ -89,11 +89,20 @@ cmd_run() {
     || die "bad ref '${ref:-$branch}' in $repo"
   # Frame for cicd-ingest: line 1 = base64(changed-files) [EMPTY = manual run, no path
   # filtering], then the raw tar. Event 'run' = manual. onlyjob is the 7th ingest arg.
+  # Snapshot the run dirs that ALREADY exist for this (sha[,job]) BEFORE we queue. A manual
+  # re-run of the same source sha collides with prior runs (sha is not per-run unique), so
+  # watch must adopt only a run dir absent from this baseline — never a stale terminal one.
+  local baseline=""
+  if [ "$watch" -eq 1 ]; then
+    baseline="$(proxy ci-runs "$repo" 2>/dev/null | grep -F "\"sha\":\"$sha\"" \
+                | { if [ -n "$job" ]; then grep -F "\"job\":\"$job\""; else cat; fi; } \
+                | sed -n 's/.*\("dir":"[^"]*"\).*/\1/p')" || true  # empty on first-ever run; don't let set -e kill us
+  fi
   { printf '\n'; git --git-dir="$gd" archive "$sha"; } \
     | proxy cicd-ingest "$repo" "$branch" run "$sha" "$ZERO" "$GL_USER" "$job" \
     || die "ingest failed (is the git->cicd-ingest sudo grant in place?)"
   echo "ci-job: queued run $repo/$branch @ ${sha:0:8}${job:+ job=$job}${ref:+ ref=$ref}"
-  [ "$watch" -eq 1 ] && watch_status "$repo" "$sha" "$job"
+  [ "$watch" -eq 1 ] && watch_status "$repo" "$sha" "$job" "$baseline"
   return 0
 }
 
@@ -102,12 +111,16 @@ cmd_run() {
 # exist yet — and may never, if deferred (docker down / key not loaded). We poll ci-runs
 # for this sha and print STATUS transitions (queued -> running -> exit:N) until terminal.
 # To tail the actual LOG, use `ci-job log <repo> <job> -f` (tail -F waits for the file).
-watch_status() {  # <repo> <sha> [job]
-  local repo="$1" sha="$2" job="${3:-}" last="" row st i
+watch_status() {  # <repo> <sha> [job] [baseline-dir-tokens]
+  local repo="$1" sha="$2" job="${3:-}" baseline="${4:-}" last="" row st i
   echo "-- watching ${sha:0:8}${job:+ ($job)} (Ctrl-C stops watching; the run keeps going) --"
   for ((i=0; i<${CIJOB_POLL_MAX:-300}; i++)); do
+    # Drop rows for run dirs that predate this queue (baseline) so a re-run of the same sha
+    # can't latch onto a prior terminal run and return immediately. tail -1 of what remains.
     row="$(proxy ci-runs "$repo" 2>/dev/null | grep -F "\"sha\":\"$sha\"" \
-           | { if [ -n "$job" ]; then grep -F "\"job\":\"$job\""; else cat; fi; } | tail -1 || true)"
+           | { if [ -n "$job" ]; then grep -F "\"job\":\"$job\""; else cat; fi; } \
+           | { if [ -n "$baseline" ]; then grep -Fv -f <(printf '%s\n' "$baseline"); else cat; fi; } \
+           | tail -1 || true)"
     if [ -n "$row" ]; then
       st="$(printf '%s' "$row" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
       [ "$st" != "$last" ] && { printf '  %s  %s\n' "$(date -u +%H:%M:%SZ)" "$st"; last="$st"; }
