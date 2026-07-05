@@ -204,9 +204,20 @@ build_mask_script() {  # <envfile> <out_sedscript>
     esac
   done < "$1"
 }
+# `ci-log -f` streams a LIVE run only if every stage of the log pipeline flushes as it
+# goes. GNU sed/head block-buffer stdout when it's a pipe/file, so without this the whole
+# run's output lands in output.log in one burst at container exit (looks like nothing, then
+# all-at-once). stdbuf forces flushing; no-op (old buffered behaviour) if stdbuf is absent.
+if command -v stdbuf >/dev/null 2>&1; then
+  linebuf() { stdbuf -oL "$@"; }   # flush per line  (redactor)
+  nobuf()   { stdbuf -o0 "$@"; }   # flush per write (byte cap -> file)
+else
+  linebuf() { "$@"; }
+  nobuf()   { "$@"; }
+fi
 # Redact stdin -> stdout via a mask script; passthrough (cat) when there are no secrets.
 redact_log() {  # <sedscript>
-  if [ -s "${1:-}" ]; then sed -f "$1"; else cat; fi
+  if [ -s "${1:-}" ]; then linebuf sed -f "$1"; else cat; fi
 }
 
 # Probe ONCE whether the (rootless) daemon can actually ENFORCE cgroup memory/pids limits.
@@ -458,7 +469,7 @@ execute_job() {  # <job> <event> <newrev> <pusher> <workdir> <manifest>
       -v "$CACHE:/cache" -v "$work:/work" -w /work \
       ${envfile:+--env-file "$envfile"} \
       "$image" sh -c "$runcmd" 2>&1 \
-    | redact_log "$maskfile" | head -c "${LOG_MAX_BYTES:-52428800}" >>"$dir/output.log"
+    | redact_log "$maskfile" | nobuf head -c "${LOG_MAX_BYTES:-52428800}" >>"$dir/output.log"
   rc=${PIPESTATUS[0]}
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; rc=124; fi
   if [ "$rc" -eq 124 ]; then status_word=timeout; else status_word="exit:$rc"; fi
@@ -617,7 +628,7 @@ run_teardown() {  # <oldrev> <pusher>
       "${mountwork[@]}" \
       ${envfile:+--env-file "$envfile"} \
       "$image" sh -c "$runcmd" 2>&1 \
-    | redact_log "$maskfile" | head -c "${LOG_MAX_BYTES:-52428800}" >>"$dir/output.log"
+    | redact_log "$maskfile" | nobuf head -c "${LOG_MAX_BYTES:-52428800}" >>"$dir/output.log"
   rc=${PIPESTATUS[0]}
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; rc=1; fi
   end_ns="$(date +%s%N)"; dur=$(( (end_ns - start_ns) / 1000000000 ))
