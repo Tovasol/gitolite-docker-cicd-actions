@@ -2,8 +2,8 @@
 
 Bone-simple, filesystem-transparent CI/CD for gitolite + rootless docker on a
 single VPS. No DB, no forge, no daemon — host bash + `docker run` + cron + flock.
-The filesystem is the dashboard. Rationale: `../docs/CI-RUNNER-DESIGN.md`.
-Operations: `../docs/CI-RUNNER-SOP.md`.
+The filesystem is the dashboard. Rationale: [docs/CI-RUNNER-DESIGN.md](docs/CI-RUNNER-DESIGN.md).
+Operations: [docs/CI-RUNNER-SOP.md](docs/CI-RUNNER-SOP.md).
 
 ## How it works (archive-push, §31)
 ```
@@ -41,7 +41,7 @@ git push ──▶ post-receive (runs as git)
 `lib/cicd.sh` is mounted read-only into every job at **`/cicd/lib.sh`**. Scripts
 `. /cicd/lib.sh` to get `retry`, `notify_success`/`notify_error`, `wait_all`
 (fan-in), `step`, `die`. Retry + notify are the SCRIPT's job, not manifest fields
-(DESIGN §28). See `examples/ci/pipeline-dag.sh` for a full fan-out/fan-in pipeline.
+(DESIGN §28). See [examples/ci/pipeline-dag.sh](examples/ci/pipeline-dag.sh) for a full fan-out/fan-in pipeline.
 
 ## Dependencies (on the VPS)
 User-local in `~cicd-runner/.local/bin` (via `bin/fetch-tools.sh` — no root, no

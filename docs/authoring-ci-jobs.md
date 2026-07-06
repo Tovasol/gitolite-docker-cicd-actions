@@ -401,7 +401,7 @@ Secrets are sops-encrypted files committed **in your repo** (ciphertext only —
 The runner resolves an **environment** from the (gitolite-gated, trusted) branch, decrypts **only
 that tier's** file with **only that tier's key**, and injects each key as an env var into your job
 container. There is **no `secrets:` manifest field**; the runner keys off the *presence* of the
-encrypted files (see §10). Full model + operator key management: **`docs/per-env-secrets.md`**.
+encrypted files (see §10). Full model + operator key management: **[docs/per-env-secrets.md](per-env-secrets.md)**.
 
 #### Where the files go (exact paths)
 

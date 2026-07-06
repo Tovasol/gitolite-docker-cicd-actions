@@ -1076,7 +1076,7 @@ The **age private key on the host is the single root of trust**
 > **(Superseded: now per-tier keys.)** The runner today holds **one age key per tier**
 > (dev/qa/prod) with **no shared master key**, decrypting `ci/secrets.<env>.enc.yaml` with only
 > that tier's key. The single-key / single `ci/secrets.enc.yaml` form used as the illustration
-> throughout §19–25 below remains the **legacy** path (still honored). See `docs/per-env-secrets.md`.
+> throughout §19–25 below remains the **legacy** path (still honored). See [docs/per-env-secrets.md](per-env-secrets.md).
 
 ### What encryption-at-rest actually buys (be honest)
 Protects against: disk backups/snapshots, accidental plaintext git commit,
@@ -1949,7 +1949,7 @@ A push that lands during a reboot / docker-down / key-not-posted window is now
     key isn't loaded. A no-secret build still runs. (Per-tier: the gate is the resolved
     tier's key `$AGE_KEY_DIR/<env>.age` for `ci/secrets.<env>.enc.yaml`; the legacy
     `SOPS_AGE_KEY_FILE`/`ci/secrets.enc.yaml` slot still applies to legacy repos — see
-    per-env-secrets.md.)
+    [per-env-secrets.md](per-env-secrets.md).)
 - **Defer = preserve state.** On defer the loop does **not** advance `$Q/last` and
   the `incoming/<sha>.tar` is **kept** (not consumed). So `target != last` stays
   true and the delivered tree is still on disk for the retry. A *code* failure is
